@@ -80,6 +80,7 @@ from claude_agent_sdk import (
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
+    query as _sdk_query,
 )
 
 try:  # Extended-thinking blocks — present on recent SDKs.
@@ -105,10 +106,13 @@ EFFORT_LEVELS = ("low", "medium", "high", "max")
 EFFORT_CHOICES = ("auto",) + EFFORT_LEVELS
 
 CONTINUE_PROMPT = (
-    'If you need input from me before continuing, pause and include the literal '
-    'token "[WAITING]" in your reply; otherwise, continue working.'
+    'If you need input from me before continuing, pause and include the '
+    'literal token "[WAITING]" in your reply. If you are finished with '
+    'all your tasks, include the literal token "[DONE]" instead. '
+    'Otherwise, continue working.'
 )
 WAITING_SENTINEL = "[WAITING]"
+DONE_SENTINEL = "[DONE]"
 
 DEFAULT_COMPACT_THRESHOLD = 160_000
 # Compact threshold for 1M-context models — leave headroom for the reply.
@@ -185,6 +189,7 @@ SLASH_COMMANDS = [
     "/background",
     "/show",
     "/think",
+    "/btw",
     "/autocompact",
     "/max-context",
     "/todos",
@@ -332,9 +337,10 @@ def _detect_subscription() -> bool:
 
 
 def _detect_subscription_plan() -> str | None:
-    """Read the plan name ("pro", "max", ...) from Claude Code's OAuth
-    credentials file. Returns None if the file isn't present (e.g. creds
-    live in a system keychain) or can't be parsed."""
+    """Read the plan name from Claude Code's OAuth credentials file,
+    distinguishing Max 5x vs Max 20x by pulling the tier suffix from
+    `rateLimitTier` (e.g. `default_claude_max_20x` → "max 20x"). Returns
+    None if the file isn't present or can't be parsed."""
     base = os.environ.get("CLAUDE_CONFIG_DIR")
     path = Path(base if base else Path.home() / ".claude") / ".credentials.json"
     try:
@@ -346,7 +352,19 @@ def _detect_subscription_plan() -> str | None:
     if not isinstance(oauth, dict):
         return None
     plan = oauth.get("subscriptionType")
-    return plan if isinstance(plan, str) and plan else None
+    if not isinstance(plan, str) or not plan:
+        return None
+    # Max plans come in 5x / 20x tiers (different monthly cost + rate
+    # budget). The tier name is embedded in `rateLimitTier` — append it
+    # to the plan label so the toolbar can distinguish them.
+    tier = oauth.get("rateLimitTier")
+    if isinstance(tier, str) and plan.lower() == "max":
+        # Patterns we've seen: "default_claude_max_20x", "default_claude_max_5x".
+        import re as _re
+        m = _re.search(r"(\d+x)$", tier)
+        if m:
+            return f"{plan} {m.group(1)}"
+    return plan
 
 _RL_TYPE_LABEL = {
     "five_hour": "5h",
@@ -434,6 +452,10 @@ def classify(line: str) -> tuple[str, str]:
         return "show", arg  # "" = last few; "N [N2 N3 ...]" = those entries
     if cmd in ("think", "thinking", "thought"):
         return "think", arg  # "" = last few; "N [N2 ...]" = those thinking blocks
+    if cmd == "btw":
+        if not arg:
+            return "error", "usage: /btw <question>"
+        return "btw", arg  # side question; doesn't enter main session history
     if cmd in ("autocompact", "auto-compact"):
         return "autocompact", arg  # "" = show; "on"/"off" = toggle; "N" = set threshold
     if cmd in ("max-context", "maxcontext", "max-ctx"):
@@ -520,7 +542,7 @@ def render_unknown_message(msg: Any, state: "State | None" = None) -> None:
     tool_name = getattr(msg, "tool_name", None)
     elapsed = getattr(msg, "elapsed_time_seconds", None)
     if tool_name and isinstance(elapsed, (int, float)):
-        print(f"\033[33m  [... {tool_name} running for {elapsed:.1f}s]\033[0m")
+        print(f"\033[33m  [... {tool_name} running for {_fmt_duration(elapsed)}]\033[0m")
         return
     # partial assistant message (streaming chunk) — suppress to avoid duplicate text
     raw_type = getattr(msg, "type", None)
@@ -638,7 +660,11 @@ def _emit_bg_completion(
         print(f"    \033[90moutput: {out_file}\033[0m")
     if usage:
         dur = usage.get("duration_ms")
-        dur_s = f" {dur / 1000:.1f}s" if isinstance(dur, (int, float)) else ""
+        dur_s = (
+            f" {_fmt_duration(dur / 1000)}"
+            if isinstance(dur, (int, float))
+            else ""
+        )
         print(
             f"    \033[90musage: {usage.get('total_tokens', '?')} tok, "
             f"{usage.get('tool_uses', '?')} tool uses{dur_s}\033[0m"
@@ -861,6 +887,7 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
 # Matches the CLI's habit of surfacing transport/API errors as assistant
@@ -875,8 +902,11 @@ _ASSISTANT_API_ERROR_RE = re.compile(
 
 
 def _visible_len(s: str) -> int:
-    """Length of `s` after stripping ANSI color/formatting escapes."""
-    return len(_ANSI_RE.sub("", s))
+    """Length of `s` after stripping both ANSI color escapes and
+    prompt_toolkit HTML markup (`<b>`, `<ansibrightcyan>`, ...). Toolbar
+    sections use HTML; inline scrollback uses ANSI. Both produce zero
+    visible columns and need to be excluded from width calculations."""
+    return len(_HTML_TAG_RE.sub("", _ANSI_RE.sub("", s)))
 
 
 def _cmd_size_hint(cmd: str) -> str:
@@ -982,19 +1012,19 @@ def render_tool_use(
         added = len(new.splitlines()) or (1 if new else 0)
         if effective_edits == "compact":
             print(
-                f"  {seq_prefix}\033[34mtool \033[1m{tag}\033[0m {path}  "
+                f"{seq_prefix}\033[34mtool \033[1m{tag}\033[0m {path}  "
                 f"\033[90m(\033[32m+{added}\033[0m \033[31m-{removed}\033[0m"
                 f"\033[90m lines)\033[0m"
             )
         else:
-            print(f"  {seq_prefix}\033[34mtool \033[1m{tag}\033[0m {path}")
+            print(f"{seq_prefix}\033[34mtool \033[1m{tag}\033[0m {path}")
             _print_unified_diff(old, new)
     elif name == "Write":
         path = inp.get("file_path", "?")
         content = inp.get("content", "") or ""
         line_count = len(content.splitlines())
         print(
-            f"  {seq_prefix}\033[34mtool \033[1mWrite\033[0m {path} "
+            f"{seq_prefix}\033[34mtool \033[1mWrite\033[0m {path} "
             f"\033[90m({line_count} lines, {len(content)} chars)\033[0m"
         )
         preview = content.splitlines()[:10]
@@ -1006,7 +1036,7 @@ def render_tool_use(
         path = inp.get("notebook_path", "?")
         cell_id = inp.get("cell_id", "")
         mode = inp.get("edit_mode", "replace")
-        print(f"  {seq_prefix}\033[34mtool \033[1mNotebookEdit\033[0m {path} cell={cell_id} mode={mode}")
+        print(f"{seq_prefix}\033[34mtool \033[1mNotebookEdit\033[0m {path} cell={cell_id} mode={mode}")
         src = inp.get("new_source", "") or ""
         for ln in src.splitlines()[:12]:
             print(f"    \033[32m+{ln}\033[0m")
@@ -1015,7 +1045,7 @@ def render_tool_use(
         bg = bool(inp.get("run_in_background"))
         desc = inp.get("description", "")
         tag = "Bash (background)" if bg else "Bash"
-        base = f"  {seq_prefix}\033[34mtool \033[1m{tag}\033[0m"
+        base = f"{seq_prefix}\033[34mtool \033[1m{tag}\033[0m"
         if desc:
             base += f" \033[90m— {desc}\033[0m"
         # Inline the command itself when it's a single line that fits on
@@ -1046,13 +1076,13 @@ def render_tool_use(
                 print(f"    \033[36m$\033[0m {ln}")
     elif name == "BashOutput":
         shell_id = inp.get("bash_id") or inp.get("shell_id") or "?"
-        print(f"  {seq_prefix}\033[34mtool \033[1mBashOutput\033[0m shell={shell_id}")
+        print(f"{seq_prefix}\033[34mtool \033[1mBashOutput\033[0m shell={shell_id}")
     elif name == "KillShell":
         shell_id = inp.get("shell_id") or inp.get("bash_id") or "?"
-        print(f"  {seq_prefix}\033[34mtool \033[1mKillShell\033[0m shell={shell_id}")
+        print(f"{seq_prefix}\033[34mtool \033[1mKillShell\033[0m shell={shell_id}")
     elif name == "TodoWrite":
         todos = inp.get("todos", []) or []
-        print(f"  {seq_prefix}\033[34mtool \033[1mTodoWrite\033[0m \033[90m({len(todos)} items)\033[0m")
+        print(f"{seq_prefix}\033[34mtool \033[1mTodoWrite\033[0m \033[90m({len(todos)} items)\033[0m")
         markers = {"completed": "\033[32m✓\033[0m", "in_progress": "\033[33m→\033[0m", "pending": "\033[90m·\033[0m"}
         for t in todos:
             m = markers.get(t.get("status", "pending"), "?")
@@ -1061,29 +1091,29 @@ def render_tool_use(
     elif name == "Task":
         desc = inp.get("description", "")
         subtype = inp.get("subagent_type", "general-purpose")
-        print(f"  {seq_prefix}\033[34mtool \033[1mTask\033[0m \033[90m[{subtype}]\033[0m {desc}")
+        print(f"{seq_prefix}\033[34mtool \033[1mTask\033[0m \033[90m[{subtype}]\033[0m {desc}")
     elif name == "Read":
         path = inp.get("file_path", "?")
         offset = inp.get("offset")
         limit = inp.get("limit")
         tail = f" offset={offset} limit={limit}" if offset or limit else ""
-        print(f"  {seq_prefix}\033[34mtool \033[1mRead\033[0m {path}{tail}")
+        print(f"{seq_prefix}\033[34mtool \033[1mRead\033[0m {path}{tail}")
     elif name == "Grep":
         pattern = inp.get("pattern", "")
         path = inp.get("path", ".")
-        print(f"  {seq_prefix}\033[34mtool \033[1mGrep\033[0m /{pattern}/ in {path}")
+        print(f"{seq_prefix}\033[34mtool \033[1mGrep\033[0m /{pattern}/ in {path}")
     elif name == "Glob":
         pattern = inp.get("pattern", "")
         path = inp.get("path", ".")
-        print(f"  {seq_prefix}\033[34mtool \033[1mGlob\033[0m {pattern} in {path}")
+        print(f"{seq_prefix}\033[34mtool \033[1mGlob\033[0m {pattern} in {path}")
     elif name == "WebFetch":
         url = inp.get("url", "?")
-        print(f"  {seq_prefix}\033[34mtool \033[1mWebFetch\033[0m {url}")
+        print(f"{seq_prefix}\033[34mtool \033[1mWebFetch\033[0m {url}")
     elif name == "WebSearch":
         q = inp.get("query", "?")
-        print(f"  {seq_prefix}\033[34mtool \033[1mWebSearch\033[0m {q!r}")
+        print(f"{seq_prefix}\033[34mtool \033[1mWebSearch\033[0m {q!r}")
     else:
-        print(f"  {seq_prefix}\033[34mtool \033[1m{name}\033[0m({brief_args(inp)})")
+        print(f"{seq_prefix}\033[34mtool \033[1m{name}\033[0m({brief_args(inp)})")
 
 
 def summarize_tool_result(block: ToolResultBlock) -> str:
@@ -1165,20 +1195,20 @@ def _render_tool_result(
         )
         lines = text.splitlines() or [text]
         if not lines or (len(lines) == 1 and not lines[0].strip()):
-            print(f"  {seq_prefix}{marker} (empty)")
+            print(f"{seq_prefix}{marker} (empty)")
             return
-        print(f"  {seq_prefix}{marker} {lines[0]}")
+        print(f"{seq_prefix}{marker} {lines[0]}")
         for ln in lines[1:]:
             print(f"     {ln}")
         return
     size = _humanize_size(text)
     if is_error:
         print(
-            f"  {seq_prefix}\033[31m✗ tool error\033[0m  "
+            f"{seq_prefix}\033[31m✗ tool error\033[0m  "
             f"\033[90m({size}; rerun with --show-tool-output to see)\033[0m"
         )
     else:
-        print(f"  {seq_prefix}\033[90m→ {size}\033[0m")
+        print(f"{seq_prefix}\033[90m→ {size}\033[0m")
 
 
 # ----------------------------------------------------------------------------
@@ -2158,7 +2188,7 @@ def _format_session_age(mtime: float) -> str:
 # line. Adding a new live indicator = define a panel function and append it
 # to the layout. Panels returning "" are dropped from the line.
 
-PanelFn = Callable[["State"], str]
+PanelFn = Callable[["State"], "str | list[str]"]
 
 
 def _panel_session(state: "State") -> str:
@@ -2166,6 +2196,8 @@ def _panel_session(state: "State") -> str:
         busy = "<b><ansigreen>● WORKING</ansigreen></b>"
     elif state.needs_user_attention == "waiting":
         busy = "<b><ansired>● WAITING</ansired></b>"
+    elif state.needs_user_attention == "done":
+        busy = "<b><ansibrightcyan>● DONE</ansibrightcyan></b>"
     elif state.needs_user_attention == "burst":
         busy = "<b><ansibrightmagenta>● STALLED</ansibrightmagenta></b>"
     elif state.needs_user_attention == "api-error":
@@ -2220,14 +2252,19 @@ def _panel_session(state: "State") -> str:
         ctx = f"ctx: ~{_fmt_tok(resident)}/{window_str} tok"
     else:
         ctx = f"ctx: ~?/{window_str} tok"
-    return (
-        f"session: <b>{sid}</b>{title_part}  |  {busy}  |  "
-        f"{ctx}  |  "
-        f"turns: {state.turns}  |  {plan_field}  |  "
-        f"model: <ansibrightcyan>{_tb_escape(model_part)}</ansibrightcyan>  |  "
-        f"effort: {_tb_escape(effort_part)}  |  "
-        f"think: {think_part}"
-    )
+    # Returned as a list of self-contained sections so the toolbar
+    # renderer can wrap section-by-section when the terminal is narrower
+    # than one full line.
+    return [
+        f"session: <b>{sid}</b>{title_part}",
+        busy,
+        ctx,
+        f"turns: {state.turns}",
+        plan_field,
+        f"model: {_tb_escape(model_part)}",
+        f"effort: {_tb_escape(effort_part)}",
+        f"think: {think_part}",
+    ]
 
 
 def _panel_tools(state: "State") -> str:
@@ -2314,13 +2351,12 @@ def _describe_current_sub(info: dict[str, Any]) -> str:
 
 _LIVE_TASKS_CAP = 20  # max top-level tasks shown in the panel before overflow
 
-_PANEL_HEADER_WIDTH = 50  # total chars in section headers, padded with "-"
-
-
 def _panel_header(title: str) -> str:
-    """Center a section title inside a row of `-`s, padded to
-    _PANEL_HEADER_WIDTH chars so every section header lines up."""
-    return f" {title} ".center(_PANEL_HEADER_WIDTH, "-")
+    """Center a section title inside a row of `-`s spanning the full
+    terminal width (minus the 2-char padding the toolbar adds on each
+    side). Makes the whole header line visually centered in the window."""
+    width = max(20, _term_width(default=100) - 2)
+    return f" {title} ".center(width, "-")
 
 
 def _panel_live_tasks(state: "State") -> list[str]:
@@ -2484,7 +2520,9 @@ def _panel_live_bg(state: "State") -> list[str]:
     now = time.monotonic()
     out: list[str] = [
         _panel_header("background tasks"),
-        "(`/bg`: list, `/bg N`: detail, `/bg N K`: tail K lines of output)",
+        "<style bg='#111111'>"
+        "(`/bg`: list, `/bg N`: detail, `/bg N K`: tail K lines of output)"
+        "</style>",
     ]
     overflow = 0
     rendered = 0
@@ -2494,15 +2532,26 @@ def _panel_live_bg(state: "State") -> list[str]:
             continue
         rendered += 1
         elapsed = now - info.get("started_at", now)
-        task_type = _tb_escape(str(info.get("task_type", "?")))
+        raw_type = str(info.get("task_type", "?"))
+        task_type = _tb_escape(raw_type)
         raw_name = str(info.get("name") or "(unnamed)").replace("\n", " ")
-        if len(raw_name) > 40:
-            raw_name = raw_name[:37] + "..."
-        name = _tb_escape(raw_name)
         seq = info.get("seq")
         seq_tag = f"[<b>#{seq}</b>] " if isinstance(seq, int) else ""
+        # Fit the name to the remaining terminal width instead of a fixed
+        # 40-char cap. Accounts for the seq tag, task type, and elapsed
+        # suffix; toolbar padding eats 2 cols, leave a small safety
+        # margin beyond that.
+        seq_visible = f"[#{seq}] " if isinstance(seq, int) else ""
+        elapsed_str = f" ({_fmt_duration(elapsed)})"
+        fixed_visible_len = (
+            len(seq_visible) + len(raw_type) + 2 + len(elapsed_str)
+        )  # "<type>: " contributes type + ": "
+        name_budget = max(10, _term_width(default=100) - 4 - fixed_visible_len)
+        if len(raw_name) > name_budget:
+            raw_name = raw_name[: max(1, name_budget - 3)] + "..."
+        name = _tb_escape(raw_name)
         out.append(
-            f"{seq_tag}<b>{task_type}</b>: {name} ({elapsed:.0f}s)"
+            f"{seq_tag}<b>{task_type}</b>: {name}{elapsed_str}"
         )
     if overflow > 0:
         out.append(
@@ -2513,16 +2562,43 @@ def _panel_live_bg(state: "State") -> list[str]:
 
 
 def _render_toolbar(state: "State") -> str:
-    # Fixed status rows at the top, dynamic panels below. The terminal's
-    # very-bottom row is whatever panel row happens to be last; the fixed
-    # session/tools rows stay visually anchored at the top of the toolbar
-    # block.
+    # Fixed status rows at the top, dynamic panels below. Fixed-row
+    # sections flow section-at-a-time across however many lines are
+    # needed to fit the terminal width — `_TOOLBAR_LAYOUT`'s two rows
+    # worth of sections (session-line sections + tools/bg/todos) end up
+    # flattened into one sequence and greedy-wrapped.
     lines: list[str] = []
+    width = _term_width(default=100)
+    usable = max(20, width - 2)  # leave the leading+trailing padding space
+    sep = "  |  "
+    # Flatten every fixed panel into a single ordered list of sections.
+    all_sections: list[str] = []
     for panels in _TOOLBAR_LAYOUT:
-        parts = [p(state) for p in panels]
-        parts = [s for s in parts if s]
-        if parts:
-            lines.append(" " + "  |  ".join(parts) + " ")
+        for p in panels:
+            out = p(state)
+            if isinstance(out, list):
+                all_sections.extend(s for s in out if s)
+            elif out:
+                all_sections.append(out)
+    # Greedy word-wrap (section-wrap) to the terminal's visible width.
+    cur: list[str] = []
+    cur_len = 0
+    for sec in all_sections:
+        sec_len = _visible_len(sec)
+        if not cur:
+            cur.append(sec)
+            cur_len = sec_len
+            continue
+        nxt = cur_len + len(sep) + sec_len
+        if nxt > usable:
+            lines.append(" " + sep.join(cur) + " ")
+            cur = [sec]
+            cur_len = sec_len
+        else:
+            cur.append(sec)
+            cur_len = nxt
+    if cur:
+        lines.append(" " + sep.join(cur) + " ")
     for row in _panel_live_tasks(state):
         lines.append(" " + row + " ")
     for row in _panel_live_bg(state):
@@ -2652,6 +2728,32 @@ class Orchestrator:
         def _(event):  # type: ignore[no-untyped-def]
             event.current_buffer.insert_text("\n")
 
+        # Escape alone clears the whole input buffer. Non-eager so the
+        # longer `escape enter` (Alt-Enter) binding above still wins when
+        # Enter follows within the key-sequence timeout.
+        @kb.add("escape")
+        def _(event):  # type: ignore[no-untyped-def]
+            event.current_buffer.reset()
+
+        # Up / Down: move the cursor between lines of a multi-line input
+        # when such lines exist; fall through to history search when the
+        # cursor is already on the first / last line.
+        @kb.add("up")
+        def _(event):  # type: ignore[no-untyped-def]
+            buf = event.current_buffer
+            if buf.document.cursor_position_row > 0:
+                buf.cursor_up()
+            else:
+                buf.history_backward()
+
+        @kb.add("down")
+        def _(event):  # type: ignore[no-untyped-def]
+            buf = event.current_buffer
+            if buf.document.cursor_position_row < buf.document.line_count - 1:
+                buf.cursor_down()
+            else:
+                buf.history_forward()
+
         return kb
 
     def _bottom_toolbar(self):  # returns HTML; multi-line per the layout
@@ -2680,6 +2782,7 @@ class Orchestrator:
         print("  /bg  /background                list background shells / Task subagents still running")
         print("  /show [N ...]                   expand collapsed tool calls by their [#N] tag")
         print("  /think [N ...]                  show full thinking blocks by their [#N] tag")
+        print("  /btw <question>                 ask a side question (doesn't enter main session history)")
         print("  /autocompact [on|off|N]         enable/disable/set auto-compact threshold")
         print("  /max-context [off|N]            cap context at N tokens (rolling-window trim)")
         print("  /todos  /plan                   show Claude's current TodoWrite plan")
@@ -3055,6 +3158,67 @@ class Orchestrator:
             f"window={self.args.continue_burst_window:.0f}s]\033[0m"
         )
 
+    async def ask_btw(self, prompt_text: str) -> None:
+        """One-shot side question — matches Claude Code's /btw. Uses the
+        SDK's stateless `query()` path so nothing is written to the main
+        session's JSONL. The main client/session stays untouched; after
+        /btw finishes, your next turn continues from where it left off."""
+        prompt_text = prompt_text.strip()
+        if not prompt_text:
+            print("\033[31m[error: usage /btw <question>]\033[0m")
+            return
+        # Build fresh options: no resume, no continue. Inherit cwd,
+        # permission mode, model, effort, tool allow/deny lists.
+        kwargs: dict[str, Any] = {
+            "permission_mode": self.args.permission_mode,
+            "cwd": self.args.cwd,
+            "setting_sources": ["user", "project", "local"],
+        }
+        m = self.state.model or self.state.active_model
+        if m:
+            kwargs["model"] = m
+        if self.state.effort:
+            kwargs["effort"] = self.state.effort
+        if self.args.allowed_tool:
+            kwargs["allowed_tools"] = list(self.args.allowed_tool)
+        if self.args.disallowed_tool:
+            kwargs["disallowed_tools"] = list(self.args.disallowed_tool)
+        if self.args.append_system_prompt:
+            kwargs["append_system_prompt"] = self.args.append_system_prompt
+        options = ClaudeAgentOptions(**kwargs)
+        print()
+        print(f"\033[36m> btw:\033[0m {prompt_text}")
+        print()
+        in_text = False
+        try:
+            async for msg in _sdk_query(prompt=prompt_text, options=options):
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            if not in_text:
+                                sys.stdout.write(
+                                    "\033[32mclaude (btw):\033[0m "
+                                )
+                                in_text = True
+                            # Continuation lines line up under the text
+                            # after "claude (btw): " (14 visible chars).
+                            sys.stdout.write(
+                                block.text.replace("\n", "\n" + " " * 14)
+                            )
+                            sys.stdout.flush()
+                elif isinstance(msg, ResultMessage):
+                    if in_text:
+                        print()
+                        in_text = False
+                    break
+        except Exception as e:  # noqa: BLE001
+            if in_text:
+                print()
+            print(f"\033[31m[btw failed: {e}]\033[0m")
+            return
+        if in_text:
+            print()
+
     def set_autocompact(self, payload: str) -> None:
         p = payload.strip().lower()
         if not p:
@@ -3363,12 +3527,12 @@ class Orchestrator:
             is_err = h.get("is_error")
             if ended is None:
                 elapsed = now - h.get("started_at", now)
-                status = f"\033[33m… running {elapsed:.1f}s\033[0m"
+                status = f"\033[33m… running {_fmt_duration(elapsed)}\033[0m"
             elif is_err:
                 status = "\033[31m✗ error\033[0m"
             else:
                 dur = ended - h.get("started_at", ended)
-                status = f"\033[32m✓\033[0m \033[90m{dur:.1f}s\033[0m"
+                status = f"\033[32m✓\033[0m \033[90m{_fmt_duration(dur)}\033[0m"
             summary = _task_summary_line(name, inp)
             print(f"  [\033[90m#{seq}\033[0m] {status}  \033[34m{name}\033[0m  {summary}")
         print()
@@ -3461,7 +3625,7 @@ class Orchestrator:
             ended = info.get("ended_at")
             if ended is None:
                 elapsed = now - started
-                status = f"\033[33m… {elapsed:.0f}s\033[0m"
+                status = f"\033[33m… {_fmt_duration(elapsed)}\033[0m"
             else:
                 dur = ended - started
                 st = info.get("status") or "completed"
@@ -3470,7 +3634,7 @@ class Orchestrator:
                     "failed": "\033[31m✗\033[0m",
                     "stopped": "\033[33m⏹\033[0m",
                 }.get(st, f"\033[90m[{st}]\033[0m")
-                status = f"{marker} \033[90m{dur:.0f}s\033[0m"
+                status = f"{marker} \033[90m{_fmt_duration(dur)}\033[0m"
             carry = " \033[90m(carryover)\033[0m" if info.get("carryover") else ""
             short_name = name.replace("\n", " ")
             if len(short_name) > 60:
@@ -3528,17 +3692,23 @@ class Orchestrator:
                     break
         if started is not None:
             if ended is None:
-                print(f"  status: \033[33mrunning {now - started:.1f}s\033[0m")
+                print(
+                    f"  status: \033[33mrunning {_fmt_duration(now - started)}\033[0m"
+                )
             else:
                 st = info.get("status") or "completed"
                 print(
                     f"  status: \033[34m{st}\033[0m "
-                    f"\033[90m({ended - started:.1f}s)\033[0m"
+                    f"\033[90m({_fmt_duration(ended - started)})\033[0m"
                 )
         usage = info.get("usage") or {}
         if usage:
             dur = usage.get("duration_ms")
-            dur_s = f" {dur / 1000:.1f}s" if isinstance(dur, (int, float)) else ""
+            dur_s = (
+                f" {_fmt_duration(dur / 1000)}"
+                if isinstance(dur, (int, float))
+                else ""
+            )
             print(
                 f"  usage: {usage.get('total_tokens', '?')} tok, "
                 f"{usage.get('tool_uses', '?')} tool uses{dur_s}"
@@ -3592,7 +3762,7 @@ class Orchestrator:
                     desc = inp.get("description", "")
                     head = (
                         f"  \033[34m[{tu_id[:8]}]\033[0m{seq_tag} Bash{bg_tag}  "
-                        f"\033[90m-- {elapsed:.1f}s\033[0m"
+                        f"\033[90m-- {_fmt_duration(elapsed)}\033[0m"
                     )
                     if desc:
                         head += f"\n    \033[90m{desc}\033[0m"
@@ -3603,7 +3773,7 @@ class Orchestrator:
                     url = inp.get("url", "")
                     print(
                         f"  \033[34m[{tu_id[:8]}]\033[0m{seq_tag} WebFetch  "
-                        f"\033[90m-- {elapsed:.1f}s\033[0m"
+                        f"\033[90m-- {_fmt_duration(elapsed)}\033[0m"
                     )
                     print(f"    \033[36m→\033[0m {url}")
                     prompt_str = inp.get("prompt", "")
@@ -3613,14 +3783,14 @@ class Orchestrator:
                     q = inp.get("query", "")
                     print(
                         f"  \033[34m[{tu_id[:8]}]\033[0m{seq_tag} WebSearch  "
-                        f"\033[90m-- {elapsed:.1f}s\033[0m"
+                        f"\033[90m-- {_fmt_duration(elapsed)}\033[0m"
                     )
                     print(f"    \033[36m?\033[0m {q!r}")
                 else:
                     inp_brief = brief_args(inp, limit=200)
                     print(
                         f"  \033[34m[{tu_id[:8]}]\033[0m{seq_tag} {name}({inp_brief})  "
-                        f"\033[90m-- {elapsed:.1f}s\033[0m"
+                        f"\033[90m-- {_fmt_duration(elapsed)}\033[0m"
                     )
         else:
             print("Active tool calls: \033[90mnone\033[0m")
@@ -3633,7 +3803,7 @@ class Orchestrator:
                     f"  \033[35m[{tid[:8]}]\033[0m "
                     f"{info.get('task_type', '?')}: "
                     f"{info.get('name') or '(unnamed)'}  "
-                    f"\033[90m-- running {elapsed:.1f}s\033[0m"
+                    f"\033[90m-- running {_fmt_duration(elapsed)}\033[0m"
                 )
         else:
             print("Background tasks: \033[90mnone\033[0m")
@@ -4013,7 +4183,8 @@ class Orchestrator:
                 self.state.active_model = m
             for block in msg.content:
                 if isinstance(block, TextBlock):
-                    print(f"\033[32mclaude (async):\033[0m {block.text}")
+                    indented = block.text.replace("\n", "\n" + " " * 16)
+                    print(f"\033[32mclaude (async):\033[0m {indented}")
                 elif isinstance(block, ToolUseBlock):
                     render_tool_use(
                         block,
@@ -4150,7 +4321,14 @@ class Orchestrator:
                             if not in_text:
                                 sys.stdout.write("\033[32mclaude:\033[0m ")
                                 in_text = True
-                            sys.stdout.write(block.text)
+                            # Continuation lines indent to line up with the
+                            # text after "claude: " (8 visible chars). The
+                            # end-of-message `\n` flush below moves the
+                            # cursor back to column 0 regardless of any
+                            # trailing indent emitted here.
+                            sys.stdout.write(
+                                block.text.replace("\n", "\n" + " " * 8)
+                            )
                             sys.stdout.flush()
                             assistant_parts.append(block.text)
                         elif isinstance(block, ToolUseBlock):
@@ -4233,16 +4411,17 @@ class Orchestrator:
                             )
                             if self.args.show_thinking:
                                 print(
-                                    f"\033[90m  [#{seq} -- /think {seq}] "
-                                    f"think: {full_text.strip()}\033[0m"
+                                    f"\033[90m[#{seq} -- /think {seq}]\033[0m  "
+                                    f"\033[96m(thinking)\033[0m  "
+                                    f"\033[90m{full_text.strip()}\033[0m"
                                 )
                             else:
                                 # No snippet in the compact form — leave it to
                                 # /think N to fetch the full text, same way
                                 # Bash gets its command body via /show N.
                                 print(
-                                    f"\033[90m  [#{seq} -- /think {seq}] "
-                                    f"(thinking)\033[0m"
+                                    f"\033[90m[#{seq} -- /think {seq}]\033[0m  "
+                                    f"\033[96m(thinking)\033[0m"
                                 )
                     # End-of-AssistantMessage: flush a newline if we left
                     # an unterminated streamed-text line, otherwise
@@ -4518,6 +4697,8 @@ class Orchestrator:
                 self.show_tool_detail(payload)
             elif kind == "think":
                 self.show_thinking_detail(payload)
+            elif kind == "btw":
+                await self.ask_btw(payload)
             elif kind == "autocompact":
                 self.set_autocompact(payload)
             elif kind == "max-context":
@@ -4584,6 +4765,8 @@ class Orchestrator:
                 self.show_tool_detail(payload)
             elif kind == "think":
                 self.show_thinking_detail(payload)
+            elif kind == "btw":
+                await self.ask_btw(payload)
             elif kind == "autocompact":
                 self.set_autocompact(payload)
             elif kind == "max-context":
@@ -4735,25 +4918,42 @@ class Orchestrator:
                     continue
 
                 self._record_turn_end()
-                burst = self._is_continue_burst() and WAITING_SENTINEL not in text
-                if WAITING_SENTINEL in text or burst:
+                done_emitted = DONE_SENTINEL in text
+                waiting_emitted = WAITING_SENTINEL in text
+                burst = (
+                    self._is_continue_burst()
+                    and not waiting_emitted
+                    and not done_emitted
+                )
+                if waiting_emitted or done_emitted or burst:
                     if burst:
                         print(
                             f"\033[33m[continue burst limit hit "
                             f"({self.args.continue_burst_limit} turns within "
-                            f"{self.args.continue_burst_window:.0f}s without [WAITING]); "
+                            f"{self.args.continue_burst_window:.0f}s without [WAITING]/[DONE]); "
                             f"backing off]\033[0m"
                         )
                         self.state.needs_user_attention = "burst"
+                        msg_line = (
+                            "\033[36m[Claude is waiting -- your turn "
+                            "(or async wakeup on bg-task / requires-action)]\033[0m"
+                        )
+                    elif done_emitted:
+                        self.state.needs_user_attention = "done"
+                        msg_line = (
+                            "\033[32m[Claude marked the project DONE -- "
+                            "your turn to send a new project or /quit]\033[0m"
+                        )
                     else:
                         self.state.needs_user_attention = "waiting"
+                        msg_line = (
+                            "\033[36m[Claude is waiting -- your turn "
+                            "(or async wakeup on bg-task / requires-action)]\033[0m"
+                        )
                     self.state.recent_turn_ends.clear()
                     sys.stdout.write("\a")
                     sys.stdout.flush()
-                    print(
-                        "\033[36m[Claude is waiting -- your turn "
-                        "(or async wakeup on bg-task / requires-action)]\033[0m"
-                    )
+                    print(msg_line)
                     next_prompt = await self._await_user_or_quit()
                     continue
 
@@ -4820,6 +5020,27 @@ class Orchestrator:
             multiline=True,  # Alt-Enter newline, Enter submit (see keybindings)
             refresh_interval=0.5,  # keep toolbar's busy/ctx/cost fields fresh
         )
+
+        # Force a layout invalidation only when the buffer's line count
+        # *shrinks*. Without this, prompt_toolkit doesn't always reduce
+        # its rendered footprint after a deletion — the toolbar visibly
+        # stays at the deeper position until the next external event.
+        # Per-keystroke invalidation isn't needed: typing/expanding lines
+        # already triggers prompt_toolkit's own redraw path.
+        try:
+            buf = self.session.default_buffer
+            self._last_input_line_count = buf.document.line_count
+            def _invalidate_on_shrink(_buf):  # type: ignore[no-untyped-def]
+                lc = _buf.document.line_count
+                prev = getattr(self, "_last_input_line_count", lc)
+                self._last_input_line_count = lc
+                if lc < prev:
+                    app = self.session.app if self.session else None
+                    if app is not None:
+                        app.invalidate()
+            buf.on_text_changed += _invalidate_on_shrink
+        except Exception:  # noqa: BLE001
+            pass  # buffer not available yet on this prompt_toolkit version
 
         # Set the terminal title so long sessions are easy to find.
         try:
