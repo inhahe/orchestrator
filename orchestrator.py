@@ -6663,6 +6663,32 @@ class Orchestrator:
                 if reconnect_needed:
                     await self._reconnect()
 
+                # Interrupt takes priority over EVERYTHING pre-existing:
+                # queued prompts, pending /compact, auto-continue. The
+                # user hit Ctrl-C to change direction, so every intent
+                # expressed before that moment is likely stale. Drop
+                # the queue and await fresh input. (Message signals
+                # still sitting in event_queue are harmless —
+                # _drain_between_turns dropped them above.)
+                if interrupted:
+                    _ring_bell(self.state, "interrupt")
+                    if self.state.queued_prompts:
+                        n = len(self.state.queued_prompts)
+                        self.state.queued_prompts.clear()
+                        print(
+                            f"{_C_DIM}[queue cleared ({n} prompt"
+                            f"{'s' if n != 1 else ''} dropped on interrupt)]"
+                            f"{_C_RESET}"
+                        )
+                    if has_compact:
+                        print(
+                            f"{_C_DIM}[pending /compact dropped on "
+                            f"interrupt]{_C_RESET}"
+                        )
+                    print(f"{_C_YELLOW}(interrupted -- your turn){_C_RESET}")
+                    next_prompt = await self._await_user_or_quit()
+                    continue
+
                 # /compact takes priority over any queued prompts — the
                 # user's latest intent is to shrink context before
                 # continuing. Queued prompts remain queued for the
@@ -6677,25 +6703,6 @@ class Orchestrator:
                 # and a separate JSONL record, not a \n-joined blob.
                 if self.state.queued_prompts:
                     next_prompt = self.state.queued_prompts.popleft()
-                    continue
-
-                if interrupted:
-                    _ring_bell(self.state, "interrupt")
-                    # Interrupt means the user is redirecting; drop any
-                    # queued prompts since they're likely stale. (The
-                    # matching message signals still sitting in
-                    # event_queue are harmless — _drain_between_turns
-                    # drops them next turn.)
-                    if self.state.queued_prompts:
-                        n = len(self.state.queued_prompts)
-                        self.state.queued_prompts.clear()
-                        print(
-                            f"{_C_DIM}[queue cleared ({n} prompt"
-                            f"{'s' if n != 1 else ''} dropped on interrupt)]"
-                            f"{_C_RESET}"
-                        )
-                    print(f"{_C_YELLOW}(interrupted -- your turn){_C_RESET}")
-                    next_prompt = await self._await_user_or_quit()
                     continue
 
                 # API-stall mode: wait for the status poller to push a
