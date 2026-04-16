@@ -3366,7 +3366,6 @@ def _panel_session(state: "State") -> str:
     )
     model_part = short_model if short_model else "(auto)"
     effort_part = state.effort if state.effort else "auto"
-    think_part = "on" if state.show_thinking else "off"
     # Approximate "current resident context": cap the last turn's cumulative
     # input-tokens figure at the model's actual window. Window is shown as
     # "?" when we haven't identified the model yet (no --model pinned and
@@ -3395,7 +3394,6 @@ def _panel_session(state: "State") -> str:
     sections.extend([
         f"model: {_tb_escape(model_part)}",
         f"effort: {_tb_escape(effort_part)}",
-        f"think: {think_part}",
     ])
     return sections
 
