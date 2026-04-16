@@ -122,6 +122,15 @@ CONTINUE_PROMPT = (
 WAITING_SENTINEL = "[WAITING]"
 DONE_SENTINEL = "[DONE]"
 
+
+def _bg_waiting_msg(n: int) -> str:
+    """Standard status line for when a turn has ended but background
+    tasks are still running. Used regardless of auto-continue mode."""
+    return (
+        f"\033[90m[bg tasks running ({n}); "
+        f"will wake on bg completion or your input]\033[0m"
+    )
+
 DEFAULT_COMPACT_THRESHOLD = 160_000
 # Compact threshold for 1M-context models — leave headroom for the reply.
 DEFAULT_COMPACT_THRESHOLD_1M = 950_000
@@ -5344,6 +5353,10 @@ class Orchestrator:
         (background-task completion, requires_action), push a 'wakeup' onto
         event_queue so any pending wait returns CONTINUE_PROMPT."""
         if isinstance(msg, SystemMessage):
+            # Snapshot bg-count BEFORE rendering so we can tell if this
+            # particular message is the one that emptied the list (used
+            # below to queue a `bg-all-done` wakeup).
+            had_bg = bool(self.state.background_tasks)
             render_system_message(msg, self.state)
             if msg.subtype == "api_retry":
                 d = _msg_fields(msg)
@@ -5351,6 +5364,14 @@ class Orchestrator:
                     error_status=d.get("error_status"),
                     error_info=d.get("error"),
                 )
+            # If this message emptied the bg-task dict, signal the worker
+            # loop. Works in both auto-continue and interactive modes —
+            # the wakeup handler decides what to do with it.
+            if had_bg and not self.state.background_tasks:
+                try:
+                    self.event_queue.put_nowait(("wakeup", "bg-all-done"))
+                except asyncio.QueueFull:
+                    pass
         elif isinstance(msg, AssistantMessage):
             m = getattr(msg, "model", None)
             if m:
@@ -6099,16 +6120,16 @@ class Orchestrator:
             if kind == "compact":
                 return "/compact"
             if kind == "wakeup":
-                # Fires for `requires-action`, `api-status-recovered`,
-                # and `rate-limit reset`. Bg-task completions are
-                # handled by the SDK directly (no orchestrator-level
-                # wakeup). If this is a capacity-restored event AND
-                # auto-continue is on, resume the driver loop. Otherwise
-                # just notify and keep waiting for user input.
+                # Fires for: requires-action, api-status-recovered,
+                # rate-limit reset, bg-all-done (last bg task finished).
+                # For the "capacity restored" subset — rate-limit,
+                # api-status, bg-all-done — resume the auto-continue
+                # driver loop if it's on. Otherwise just notify.
                 print(f"\033[36m[wakeup -- {payload}]\033[0m")
                 resumable = (
                     payload.startswith("rate-limit")
                     or payload.startswith("api-status")
+                    or payload == "bg-all-done"
                 )
                 if resumable and self.args.auto_continue:
                     return self.state.continue_prompt
@@ -6296,6 +6317,17 @@ class Orchestrator:
                         next_prompt = "/compact"
                         continue
 
+                # Unified "wait for bg tasks" path — same behavior
+                # regardless of --auto-continue. If the last bg task
+                # completes while we're here, `_handle_async_message`
+                # queues a `bg-all-done` wakeup that unblocks this await;
+                # the wakeup handler then either sends the continue
+                # prompt (auto-continue on) or just notifies (off).
+                if self.state.background_tasks:
+                    print(_bg_waiting_msg(len(self.state.background_tasks)))
+                    next_prompt = await self._await_user_or_quit()
+                    continue
+
                 # Without --auto-continue, the orchestrator just waits for
                 # your input after every turn (like a normal interactive
                 # session). The [WAITING] / burst-limit / response-delay
@@ -6303,12 +6335,6 @@ class Orchestrator:
                 # autonomously.
                 if not self.args.auto_continue:
                     _ring_bell(self.state, "turn-done")
-                    if self.state.background_tasks:
-                        print(
-                            f"\033[90m[bg tasks running "
-                            f"({len(self.state.background_tasks)}); "
-                            f"will wake on bg completion or your input]\033[0m"
-                        )
                     next_prompt = await self._await_user_or_quit()
                     continue
 
@@ -6351,19 +6377,6 @@ class Orchestrator:
                     self.state.recent_turn_ends.clear()
                     _ring_bell(self.state, _bell_event)
                     print(msg_line)
-                    next_prompt = await self._await_user_or_quit()
-                    continue
-
-                # Don't nudge Claude with the continue prompt while bg
-                # tasks are still running — wait for them to finish (or
-                # for you to interject). The async wakeup that fires on
-                # task_notification will land here and re-evaluate.
-                if self.state.background_tasks:
-                    print(
-                        f"\033[90m[bg tasks running "
-                        f"({len(self.state.background_tasks)}); waiting -- "
-                        f"will wake on bg completion or your input]\033[0m"
-                    )
                     next_prompt = await self._await_user_or_quit()
                     continue
 
