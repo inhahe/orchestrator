@@ -137,14 +137,12 @@ DEFAULT_COMPACT_THRESHOLD_1M = 950_000
 
 
 def _cmd_hint(text: str) -> str:
-    """Render an inline slash-command hint (e.g. /show 17 [-tail N]).
-    Bold + 256-color gray (index 248). Using `90` (bright black) with
-    bold is a visual no-op on Windows Terminal with the default
-    `intenseTextStyle=bright` setting — WT maps bold onto the "bright"
-    variant of the base color, and there's no brighter variant of an
-    already-bright 90–97 color. 256-color indices aren't in that
-    mapping, so bold stacks normally."""
-    return f"\033[0;1;38;5;240m{text}\033[0m"
+    """Render an inline slash-command hint (e.g. /show 17 [-tail N])
+    in the same dim gray as the surrounding bracket text. No bold —
+    it's a no-op on Windows Terminal with default intenseTextStyle,
+    and matching the surrounding color looked cleaner than using a
+    distinct 256-color shade."""
+    return f"\033[90m{text}\033[0m"
 
 
 # Valid event names for --bell-on / /bell. Frozenset so typos don't silently
@@ -6584,7 +6582,7 @@ class Orchestrator:
         # syscall so the terminal doesn't appear to scroll line-by-line
         # while we're populating it.
         if history_jsonl is not None:
-            n, history_text, orphan_bg = render_session_history_text(
+            n, history_text, _orphan_bg = render_session_history_text(
                 history_jsonl,
                 show_tool_output=self.args.show_tool_output,
             )
@@ -6593,14 +6591,11 @@ class Orchestrator:
                 f"{history_text}"
                 f"\033[90m[end of history -- {n} message(s)]\033[0m\n"
             )
-            if orphan_bg:
-                buffered += (
-                    f"\033[33m[orchestrator: {len(orphan_bg)} background "
-                    f"task(s) from the previous session did not finish — "
-                    f"their processes are no longer running]\033[0m\n"
-                )
-                for entry in orphan_bg:
-                    buffered += f"\033[90m    - {entry}\033[0m\n"
+            # Orphan-bg detection was unreliable: the JSONL often lacks
+            # task-notifications for bg bash tasks that were killed via
+            # KillShell or terminated without the CLI emitting a
+            # notification. We can't distinguish "killed" from "still
+            # running" from the JSONL alone, so we don't report on it.
             sys.stdout.write(buffered)
             sys.stdout.flush()
 
