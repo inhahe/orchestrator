@@ -120,11 +120,69 @@ DEFAULT_COMPACT_THRESHOLD_1M = 950_000
 
 
 def _cmd_hint(text: str) -> str:
-    """Render an inline slash-command hint (e.g. /show 17 [-K]) in
+    """Render an inline slash-command hint (e.g. /show 17 [-tail N]) in
     scrollback output. Bare dim-gray text — bold doesn't render on
     Windows Terminal with default intenseTextStyle=bright, and other
     decorations (underline, italic) were visually distracting."""
     return f"\033[90m{text}\033[0m"
+
+
+# Valid event names for --bell-on / /bell. Frozenset so typos don't silently
+# expand to something else.
+_BELL_EVENT_NAMES = frozenset({
+    "turn-done", "waiting", "done", "stalled",
+    "api-stall", "api-ok", "interrupt", "bg-done", "requires-action",
+})
+
+
+def _parse_bell_spec(spec: str) -> "str | dict[str, bool]":
+    """Parse a bell spec string. Returns:
+      - the literal string `"all"` or `"none"` for those keywords
+      - a dict[event_name, bool] for a list like `turn-done off,waiting on`
+        (True = enable, False = disable; no suffix defaults to True).
+    Unknown event names are silently dropped."""
+    spec = (spec or "").strip().lower()
+    if not spec:
+        return {}
+    if spec in ("all", "none"):
+        return spec
+    out: dict[str, bool] = {}
+    for part in spec.split(","):
+        tokens = part.strip().split()
+        if not tokens:
+            continue
+        name = tokens[0]
+        if name not in _BELL_EVENT_NAMES:
+            continue
+        enable = True
+        if len(tokens) > 1:
+            suffix = tokens[1]
+            if suffix == "off":
+                enable = False
+            elif suffix == "on":
+                enable = True
+        out[name] = enable
+    return out
+
+
+def _parse_bell_events(spec: str) -> set[str]:
+    """Full-replacement parse (for --bell-on startup flag). Returns the
+    final set of enabled events. `off`-suffixed entries are dropped
+    since the initial set is empty."""
+    result = _parse_bell_spec(spec)
+    if result == "all":
+        return set(_BELL_EVENT_NAMES)
+    if result == "none":
+        return set()
+    assert isinstance(result, dict)
+    return {k for k, v in result.items() if v}
+
+
+def _ring_bell(state: "State", event: str) -> None:
+    """Ring the terminal bell (\\a) if `event` is enabled by --bell-on."""
+    if event in state.bell_events:
+        sys.stdout.write("\a")
+        sys.stdout.flush()
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -210,6 +268,7 @@ SLASH_COMMANDS = [
     "/autocompact",
     "/max-context",
     "/continue-prompt",
+    "/bell",
     "/todos",
     "/plan",
     "/quit",
@@ -368,6 +427,8 @@ class State:
     completed_panel_tools: dict[str, dict[str, Any]] = field(default_factory=dict)
     # Same for background tasks.
     completed_panel_bg: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Mirror of --bell-on — set of event names that trigger a \a bell.
+    bell_events: set[str] = field(default_factory=set)
     rate_limit_util: float | None = None
     rate_limit_label: str | None = None
 
@@ -521,6 +582,8 @@ def classify(line: str) -> tuple[str, str]:
         return "max-context", arg  # "" = show; "off" = unlimited; "N" = set cap
     if cmd in ("continue-prompt", "cprompt"):
         return "continue-prompt", arg  # "" = show; "default" = reset; anything else = set
+    if cmd == "bell":
+        return "bell", arg  # "" = show; "all"/"none"; else comma-list with on/off suffixes
     if cmd == "clear":
         return "clear-context", ""
     if cmd == "cls":
@@ -724,7 +787,7 @@ def _emit_bg_completion(
     color = _BG_STATUS_COLORS.get(status, "\033[35m")
     marker = _BG_STATUS_MARKERS.get(status, "•")
     seq_tag = (
-        f"[#{seq} -- {_cmd_hint(f'/bg {seq} [-K]')}] "
+        f"[#{seq} -- {_cmd_hint(f'/bg {seq} [-tail N]')}] "
         if isinstance(seq, int)
         else ""
     )
@@ -967,8 +1030,7 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
     if sub == "session_state_changed":
         state_val = d.get("state")
         if state_val == "requires_action":
-            sys.stdout.write("\a")
-            sys.stdout.flush()
+            _ring_bell(state, "requires-action")
             print("\033[33m[session requires action]\033[0m")
         # 'idle' and 'running' are too chatty; skip
         return
@@ -1203,7 +1265,7 @@ def render_tool_use(
     if seq is not None:
         seq_prefix = (
             f"\033[90m[#{seq} -- "
-            f"{_cmd_hint(f'/show {seq} [-K]')}"
+            f"{_cmd_hint(f'/show {seq} [-tail N]')}"
             f"\033[90m]\033[0m "
         )
     else:
@@ -1468,7 +1530,7 @@ def _render_tool_result(
     on error — full content lives in the JSONL transcript and /export.
     `seq` (when provided) prints `[#N]` so the user can `/show N` later."""
     seq_prefix = (
-        f"\033[90m[#{seq} -- {_cmd_hint(f'/show {seq} [-K]')}]\033[0m "
+        f"\033[90m[#{seq} -- {_cmd_hint(f'/show {seq} [-tail N]')}]\033[0m "
         if seq is not None
         else ""
     )
@@ -2266,21 +2328,29 @@ def _wrap_text(text: str, indent: int, start_col: int = 0) -> str:
 
 def render_session_history_text(
     jsonl: Path, *, show_tool_output: bool = False
-) -> tuple[int, str]:
+) -> tuple[int, str, list[str]]:
     """Build the ANSI-colored backscroll for a session JSONL transcript.
-    Returns (message_count, rendered_text). The caller is expected to write
-    the whole string in one shot so the terminal doesn't scroll line-by-line
-    while history is being assembled."""
+    Returns (message_count, rendered_text, orphan_bg_tool_ids). The last
+    element is the list of background-Bash tool_use_ids that were started
+    but never got a matching task-notification — these were in-flight when
+    the previous orchestrator run exited and are no longer running."""
     import io
+    import re as _re
 
     rendered = 0
     buf = io.StringIO()
     write = buf.write
+    # Track bg bash starts and their completions to detect orphans.
+    bg_started: dict[str, str] = {}  # tool_use_id → short cmd preview
+    _notif_re = _re.compile(
+        r"<task-notification>.*?<tool-use-id>([^<]+)</tool-use-id>",
+        _re.DOTALL,
+    )
 
     try:
         f = jsonl.open(encoding="utf-8", errors="replace")
     except OSError as e:
-        return 0, f"\033[31m[history: failed to open {jsonl.name}: {e}]\033[0m\n"
+        return 0, f"\033[31m[history: failed to open {jsonl.name}: {e}]\033[0m\n", []
 
     with f:
         for line in f:
@@ -2319,6 +2389,11 @@ def render_session_history_text(
                         wrapped = _wrap_text(text, indent=5, start_col=5)
                         write(f"\033[36myou:\033[0m {wrapped}\n")
                         rendered += 1
+                    # Match bg task completions to their starts.
+                    if text.startswith("<task-notification"):
+                        m = _notif_re.search(text)
+                        if m:
+                            bg_started.pop(m.group(1), None)
                 elif isinstance(content, list):
                     for block in content:
                         if not isinstance(block, dict):
@@ -2410,11 +2485,25 @@ def render_session_history_text(
                         name = block.get("name", "?")
                         inp = block.get("input") or {}
                         write(f"{_format_tool_header(name, inp)}\n")
+                        # Track bg Bash starts for orphan detection.
+                        if (
+                            name == "Bash"
+                            and isinstance(inp, dict)
+                            and inp.get("run_in_background")
+                        ):
+                            tid = block.get("id")
+                            if tid:
+                                cmd = (inp.get("command") or "").splitlines()
+                                head = (cmd[0] if cmd else "")[:60]
+                                bg_started[tid] = head
                     # thinking blocks intentionally skipped
                 if started:
                     write("\n")
                 rendered += 1
-    return rendered, buf.getvalue()
+    # Anything still in bg_started = started but never completed in the
+    # transcript = orphaned when the orchestrator last quit.
+    orphan_cmds = [f"{tid[:8]}: {cmd}" for tid, cmd in bg_started.items()]
+    return rendered, buf.getvalue(), orphan_cmds
 
 
 def _render_session_markdown(jsonl: Path) -> str:
@@ -2799,7 +2888,7 @@ def _panel_live_tasks(state: "State") -> list[str]:
     header_lines = [
         _panel_header("tasks"),
         "<panel-hint>"
-        "(`/tasks`: list, `/show N`: detail, `/show N -K`: tail K lines of output)"
+        "(`/tasks`: list, `/show N`: detail, `/show N -tail K`: last K lines of output)"
         "</panel-hint>",
     ]
     for tid, info in state.active_tools.items():
@@ -3074,7 +3163,7 @@ def _panel_live_bg(state: "State") -> list[str]:
         out[0:0] = [
             _panel_header("background tasks"),
             "<panel-hint>"
-            "(`/bg`: list, `/bg N`: detail, `/bg N -K`: tail K lines of output)"
+            "(`/bg`: list, `/bg N`: detail, `/bg N -tail K`: last K lines of output)"
             "</panel-hint>",
         ]
     return out
@@ -3219,6 +3308,7 @@ class Orchestrator:
             show_tasks=getattr(args, "show_tasks", "compact") or "compact",
             panel_delay=float(getattr(args, "panel_delay", 0.0)),
             panel_grace=float(getattr(args, "panel_grace", 10.0)),
+            bell_events=_parse_bell_events(getattr(args, "bell_on", "")),
         )
         self.event_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self.turn_msg_queue: asyncio.Queue[Any] = asyncio.Queue()
@@ -3468,6 +3558,7 @@ class Orchestrator:
         print("  /autocompact [on|off|N]         enable/disable/set auto-compact threshold")
         print("  /max-context [off|N]            cap context at N tokens (rolling-window trim)")
         print("  /continue-prompt [text|default] view/set/reset the auto-continue prompt")
+        print("  /bell [all|none|EVENTS]       view/change bell events (e.g. /bell turn-done on)")
         print("  /todos  /plan                   show Claude's current TodoWrite plan")
         print("  /quit  /exit                    graceful exit (waits up to ~10s for CLI flush)")
         print("  /quit! /exit!                   force exit immediately (may lose last message)")
@@ -3544,11 +3635,9 @@ class Orchestrator:
         # can trust a return-to-clean as a recovery signal.
         self.state.api_stall_saw_bad = source == "status"
         print(f"\033[31m[API STALL ({source}) -- {reason}]\033[0m")
+        _ring_bell(self.state, "api-stall")
         if not self.args.no_status_poll:
             self._ensure_status_poller()
-        else:
-            sys.stdout.write("\a")
-            sys.stdout.flush()
 
     async def _one_shot_status_check(self) -> None:
         """Single fetch of the Statuspage feed. If it reports an active
@@ -3691,8 +3780,7 @@ class Orchestrator:
                         "\033[32m[status-poll] Anthropic services operational "
                         "-- resuming]\033[0m"
                     )
-                    sys.stdout.write("\a")
-                    sys.stdout.flush()
+                    _ring_bell(self.state, "api-ok")
                     try:
                         self.event_queue.put_nowait(
                             ("wakeup", "api-status-recovered")
@@ -3805,6 +3893,47 @@ class Orchestrator:
         else:
             self.state.continue_prompt = payload
             print(f"\033[35m[continue-prompt set]\033[0m")
+
+    def set_bell(self, payload: str) -> None:
+        """`/bell` — view/modify which events ring the terminal bell.
+        Bare `/bell` shows the current set. `/bell all` or `/bell none`
+        replaces the set. Otherwise treats the arg as an incremental
+        update: a comma-separated list of events with optional `on`/`off`
+        suffixes (default `on`). Example: `/bell turn-done on,bg-done off`.
+        """
+        payload = (payload or "").strip()
+        if not payload:
+            if not self.state.bell_events:
+                print("\033[35m[bell] disabled (no events)\033[0m")
+            else:
+                events = ",".join(sorted(self.state.bell_events))
+                print(f"\033[35m[bell] {events}\033[0m")
+            print(
+                "\033[90m  available events: "
+                + ", ".join(sorted(_BELL_EVENT_NAMES))
+                + "\033[0m"
+            )
+            return
+        result = _parse_bell_spec(payload)
+        if result == "all":
+            self.state.bell_events = set(_BELL_EVENT_NAMES)
+        elif result == "none":
+            self.state.bell_events = set()
+        else:
+            assert isinstance(result, dict)
+            if not result:
+                print(
+                    "\033[31m[bell error: no valid events in "
+                    f"'{payload}']\033[0m"
+                )
+                return
+            for name, enable in result.items():
+                if enable:
+                    self.state.bell_events.add(name)
+                else:
+                    self.state.bell_events.discard(name)
+        events = ",".join(sorted(self.state.bell_events)) or "(none)"
+        print(f"\033[35m[bell] {events}\033[0m")
 
     def toggle_auto_continue(self, payload: str) -> None:
         if payload == "on":
@@ -4074,11 +4203,12 @@ class Orchestrator:
         """Usage:
           /show                 -- last 5 tool history entries, each full
           /show N               -- entry N, full input + full output
-          /show N -K            -- entry N, full input + *last K lines* of output
+          /show N -tail K       -- entry N, full input + *last K lines* of output
           /show N1 N2 N3 ...    -- entries N1, N2, N3, ..., each full
-        Positive ints are entry seqs; negative ints are tail-line counts
-        (must follow a seq). `/show 19 18` means two entries; `/show 19
-        -18` means entry 19 with the last 18 output lines."""
+        Positive ints are entry seqs; `-tail K` (or a legacy negative int
+        like `-K`) sets tail-line count for the preceding entry.
+        `/show 19 18` means two entries; `/show 19 -tail 18` means
+        entry 19 with the last 18 output lines."""
         history = self.state.tool_history
         payload = payload.strip()
         if not payload:
@@ -4088,20 +4218,36 @@ class Orchestrator:
                 return
             print(
                 f"\033[90m[showing last {len(recent)} tool call(s); "
-                f"/show N -- full; /show N -K -- tail K lines of output]\033[0m"
+                f"/show N -- full; /show N -tail K -- last K lines of output]\033[0m"
             )
             for e in recent:
                 self._print_tool_history_entry(e)
             return
+        # Tokenize: each "-tail" is a marker whose following token is the
+        # tail count. Legacy negative-int syntax (`-50`) still works.
+        tokens: list[int] = []
+        parts = payload.split()
+        idx = 0
         try:
-            nums = [int(p) for p in payload.split()]
+            while idx < len(parts):
+                p = parts[idx]
+                if p == "-tail":
+                    idx += 1
+                    if idx >= len(parts):
+                        raise ValueError("-tail needs a count")
+                    tokens.append(-int(parts[idx]))
+                    idx += 1
+                else:
+                    tokens.append(int(p))
+                    idx += 1
         except ValueError:
             print(
-                "\033[31m[error: usage /show [N [-K]] or /show N1 N2 N3 ... "
-                "-- positive ints are entry seqs, -K (negative) is "
-                "tail lines]\033[0m"
+                "\033[31m[error: usage /show [N [-tail K]] or /show N1 N2 ... "
+                "-- positive ints are entry seqs, -tail K "
+                "(or legacy -K) sets tail lines]\033[0m"
             )
             return
+        nums = tokens
         by_seq = {e["seq"]: e for e in history}
         # Walk the list: each positive int picks an entry; a negative int
         # immediately after a positive one is that entry's tail count.
@@ -4320,25 +4466,38 @@ class Orchestrator:
     def show_bg_tasks(self, payload: str = "") -> None:
         """`/bg` — summary of bg tasks (this turn + running carryover).
         `/bg N` — full detail for task `[#N]`.
-        `/bg N -K` — detail + tail K lines of `output_file`.
+        `/bg N -tail K` — detail + last K lines of `output_file`.
         `/bg N1 N2 N3` — detail for several bg tasks.
-        `/bg N1 -K1 N2 -K2` — mix freely; each negative arg is the tail
-                              count for the entry just before it.
-        Parallel to `/show` so the two commands behave identically."""
+        Parallel to `/show` so the two commands behave identically.
+        Legacy `-K` (negative int) syntax still works."""
         parts = payload.split()
         index = self._bg_entry_index()
         if not parts:
             self._print_bg_summary(index)
             return
+        # Tokenize: `-tail K` produces -K; legacy `-K` still accepted.
+        tokens: list[int] = []
+        idx = 0
         try:
-            nums = [int(p) for p in parts]
+            while idx < len(parts):
+                p = parts[idx]
+                if p == "-tail":
+                    idx += 1
+                    if idx >= len(parts):
+                        raise ValueError("-tail needs a count")
+                    tokens.append(-int(parts[idx]))
+                    idx += 1
+                else:
+                    tokens.append(int(p))
+                    idx += 1
         except ValueError:
             print(
-                "\033[31m[error: usage /bg [N [-K]] [N2 [-K2]] ... — "
-                "positive ints are bg task numbers, -K (negative) is "
-                "tail lines for the entry just before it]\033[0m"
+                "\033[31m[error: usage /bg [N [-tail K]] ... — "
+                "positive ints are bg task numbers, -tail K (or legacy -K) "
+                "sets tail lines for the entry just before it]\033[0m"
             )
             return
+        nums = tokens
         i = 0
         while i < len(nums):
             n = nums[i]
@@ -5445,6 +5604,7 @@ class Orchestrator:
         "autocompact":      "set_autocompact",
         "max-context":      "set_max_context",
         "continue-prompt":  "set_continue_prompt",
+        "bell":             "set_bell",
         "todos":            "show_todos",
         "effort-show":      "show_effort_info",
         "model-show":       "show_model_info",
@@ -5638,6 +5798,8 @@ class Orchestrator:
                 self.set_max_context(payload)
             elif kind == "continue-prompt":
                 self.set_continue_prompt(payload)
+            elif kind == "bell":
+                self.set_bell(payload)
             elif kind == "todos":
                 self.show_todos()
             elif kind == "effort":
@@ -5674,8 +5836,7 @@ class Orchestrator:
             if kind == "compact":
                 return "/compact"
             if kind == "wakeup":
-                sys.stdout.write("\a")
-                sys.stdout.flush()
+                _ring_bell(self.state, "bg-done")
                 print(f"\033[36m[wakeup -- {payload}]\033[0m")
                 # Don't start a new orchestrator turn.  The SDK/CLI has
                 # already injected the task-completion notification into
@@ -5720,6 +5881,8 @@ class Orchestrator:
                 self.set_max_context(payload)
             elif kind == "continue-prompt":
                 self.set_continue_prompt(payload)
+            elif kind == "bell":
+                self.set_bell(payload)
             elif kind == "todos":
                 self.show_todos()
             elif kind == "effort":
@@ -5784,8 +5947,7 @@ class Orchestrator:
                     continue
 
                 if interrupted:
-                    sys.stdout.write("\a")
-                    sys.stdout.flush()
+                    _ring_bell(self.state, "interrupt")
                     print("\033[33m(interrupted -- your turn)\033[0m")
                     next_prompt = await self._await_user_or_quit()
                     continue
@@ -5874,6 +6036,7 @@ class Orchestrator:
                 # mechanics only matter when we're driving Claude
                 # autonomously.
                 if not self.args.auto_continue:
+                    _ring_bell(self.state, "turn-done")
                     next_prompt = await self._await_user_or_quit()
                     continue
 
@@ -5898,21 +6061,23 @@ class Orchestrator:
                             "\033[36m[Claude is waiting -- your turn "
                             "(or async wakeup on bg-task / requires-action)]\033[0m"
                         )
+                        _bell_event = "stalled"
                     elif done_emitted:
                         self.state.needs_user_attention = "done"
                         msg_line = (
                             "\033[32m[Claude finished all tasks -- "
                             "your turn]\033[0m"
                         )
+                        _bell_event = "done"
                     else:
                         self.state.needs_user_attention = "waiting"
                         msg_line = (
                             "\033[36m[Claude is waiting -- your turn "
                             "(or async wakeup on bg-task / requires-action)]\033[0m"
                         )
+                        _bell_event = "waiting"
                     self.state.recent_turn_ends.clear()
-                    sys.stdout.write("\a")
-                    sys.stdout.flush()
+                    _ring_bell(self.state, _bell_event)
                     print(msg_line)
                     next_prompt = await self._await_user_or_quit()
                     continue
@@ -6108,7 +6273,7 @@ class Orchestrator:
         # syscall so the terminal doesn't appear to scroll line-by-line
         # while we're populating it.
         if history_jsonl is not None:
-            n, history_text = render_session_history_text(
+            n, history_text, orphan_bg = render_session_history_text(
                 history_jsonl,
                 show_tool_output=self.args.show_tool_output,
             )
@@ -6117,6 +6282,14 @@ class Orchestrator:
                 f"{history_text}"
                 f"\033[90m[end of history -- {n} message(s)]\033[0m\n"
             )
+            if orphan_bg:
+                buffered += (
+                    f"\033[33m[orchestrator: {len(orphan_bg)} background "
+                    f"task(s) from the previous session did not finish — "
+                    f"their processes are no longer running]\033[0m\n"
+                )
+                for entry in orphan_bg:
+                    buffered += f"\033[90m    - {entry}\033[0m\n"
             sys.stdout.write(buffered)
             sys.stdout.flush()
 
@@ -6438,6 +6611,23 @@ def parse_args() -> argparse.Namespace:
         "as a one-liner `edit path (+A -R lines) [#N]`. full: scroll "
         "inline with the full unified diff. off: live panel only, use "
         "/show N for detail. --inline-all-tools overrides this to 'full'.",
+    )
+    ap.add_argument(
+        "--bell-on",
+        default="waiting,done,stalled,api-stall,requires-action",
+        metavar="EVENTS",
+        help="Comma-separated list of events that ring the terminal bell "
+        "(\\a). Each event can have an optional `on` or `off` suffix (e.g. "
+        "`turn-done off`); no suffix means `on`. Event names: turn-done "
+        "(auto-continue off + turn ends, user needed), waiting ([WAITING] "
+        "emitted), done ([DONE] emitted), stalled (burst-limit brake fires), "
+        "api-stall (entering API-stall mode), api-ok (API recovered), "
+        "interrupt (user Ctrl-C'd a turn), bg-done (background task "
+        "completed), requires-action (session_state_changed → "
+        "requires_action). Shortcuts: `all`, `none`. Default skips "
+        "turn-done to avoid ringing on every interactive reply; use "
+        "/bell at runtime to toggle individual events (e.g. enable "
+        "turn-done temporarily for a long turn, then disable it).",
     )
     ap.add_argument(
         "--api-stall-limit",
