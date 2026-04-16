@@ -3960,19 +3960,59 @@ def _render_toolbar(state: "State") -> str:
     lines = [ln.replace("\r", " ").replace("\n", " ") for ln in lines]
 
     # --- Anti-ghost-row fix ---
-    # prompt_toolkit's renderer keeps `height = max(last_height, preferred)`
-    # so the layout height never decreases.  When the toolbar shrinks the
-    # diff algorithm writes the new content into the old (taller) canvas
-    # but never erases the vacated rows.  Fix: when the toolbar produces
-    # fewer lines than last time, null out the renderer's cached screen.
-    # This makes the *current* render cycle treat the frame as a first
-    # render → `erase_down` + full redraw on a clean canvas — exactly the
-    # same path prompt_toolkit takes for the initial render or a terminal-
-    # width change.  The cost is one full repaint per shrink event (not
-    # every frame), which is invisible at 0.5 s refresh.
+    # The prompt's layout is: DefaultBufferWindow + spacer Window +
+    # bottom_toolbar Window (`dont_extend_height=True`), all inside a
+    # region sized to `_min_available_height` (cursor-to-bottom-of-
+    # terminal). When the toolbar shrinks by K rows, the spacer grows
+    # by K rows and the toolbar content moves DOWN by K rows within
+    # the same-sized region. prompt_toolkit's diff is supposed to
+    # clear the vacated upper rows of the toolbar, but in practice
+    # the ghost persists — especially for shrink-by-2-or-more.
+    #
+    # The reliable hammer: from the next event-loop tick (AFTER the
+    # racy in-flight render has committed), directly emit `erase_down`
+    # on the output to physically clear the terminal below the render
+    # region's top-left cursor, then null `_last_screen` and
+    # `_min_available_height` and invalidate — so the following render
+    # is a full clean repaint onto a blanked canvas.
     n = len(lines)
     if n < _toolbar_last_lines and _toolbar_renderer is not None:
-        _toolbar_renderer._last_screen = None
+        try:
+            from prompt_toolkit.application import get_app as _get_app
+            _app = _get_app()
+
+            def _force_full_redraw_next_tick() -> None:
+                r = _toolbar_renderer
+                if r is None:
+                    return
+                # Null both caches and call `_redraw()` synchronously
+                # so the collapse-to-preferred + re-measure + repaint
+                # happen in ONE event-loop tick, too fast for the
+                # terminal to show an intermediate frame. With
+                # `_min_available_height=0`, the next render's height
+                # calc `max(0, 0, preferred)` = preferred — which is
+                # correct content size, forcing prompt_toolkit to
+                # draw only the new (shorter) region. Immediately
+                # after, the render re-measures `_min_available_height`
+                # via `request_absolute_cursor_position` and the
+                # region re-expands on the FOLLOWING render (also in
+                # this same synchronous block if invalidate fires
+                # again). All output gets flushed together.
+                r._last_screen = None
+                r._min_available_height = 0
+                # Synchronous redraw — paints immediately, no gap.
+                try:
+                    _app._redraw()
+                except Exception:  # noqa: BLE001
+                    # Fallback to async invalidate if _redraw fails
+                    # (e.g., called in an unexpected state).
+                    _app.invalidate()
+
+            asyncio.get_running_loop().call_soon(_force_full_redraw_next_tick)
+        except (RuntimeError, LookupError):
+            # No running app/loop — in-render nulls (partial fix).
+            _toolbar_renderer._last_screen = None
+            _toolbar_renderer._min_available_height = 0
     _toolbar_last_lines = n
 
     return "\n".join(lines)
@@ -6641,11 +6681,22 @@ class Orchestrator:
                     )
                 # state.queued_prompts is the source of truth for
                 # pending user prompts — the worker pops from it at
-                # turn boundaries. The event_queue message is just a
+                # turn boundaries. The event_queue message is both a
                 # wakeup signal (so the worker unblocks from
-                # `_await_user_or_quit`); its payload is redundant and
-                # gets dropped by `_drain_between_turns`.
-                if kind == "message":
+                # `_await_user_or_quit`) AND a payload carrier for
+                # the race case below.
+                #
+                # Only queue WHILE BUSY so idle-typed messages don't
+                # briefly flash in the queue panel (they're about to
+                # be consumed directly by `_await_user_or_quit`).
+                #
+                # The turn-end race (user's Enter arrives just after
+                # busy flipped to False — message lands in
+                # event_queue only) is caught by `_drain_between_turns`,
+                # which moves any stray "message" events into
+                # `queued_prompts` before dropping them. That keeps
+                # this gate safe: no lost messages, no panel flash.
+                if kind == "message" and self.state.busy:
                     self.state.queued_prompts.append(payload)
                 await self.event_queue.put((kind, payload))
         finally:
@@ -6661,9 +6712,12 @@ class Orchestrator:
         self,
     ) -> tuple[bool, bool, bool]:
         """Empty the event queue of side-effect events (status, help,
-        effort, etc.).  Message events are just signals — state.queued_prompts
-        is the source of truth for queued prompts — so we drop them here
-        and pop from state.queued_prompts at the turn boundary instead.
+        effort, etc.). Message events: `input_loop` appends to
+        `state.queued_prompts` only while busy=True, so a "message"
+        event seen here MAY already be in the queue (busy case) or
+        MAY NOT (race case: Enter arrived just after busy flipped
+        off). Dedupe-append-then-drop keeps both paths correct —
+        nothing gets lost, nothing gets duplicated.
         Returns (has_pending_compact, reconnect_needed, quit_requested)."""
         has_compact = False
         reconnect_needed = False
@@ -6673,9 +6727,15 @@ class Orchestrator:
             if kind == "quit":
                 quit_requested = True
             elif kind == "message":
-                # Just a wakeup signal; payload is redundant with
-                # state.queued_prompts. Nothing to do here.
-                pass
+                # Race-catcher: input_loop only appends to
+                # queued_prompts while busy=True. If Enter arrived
+                # just after busy flipped off, the message is ONLY
+                # on event_queue — append it to queued_prompts here
+                # so the worker's popleft() finds it. Dedupe with
+                # `in` so the common busy-case (where it's already
+                # queued) doesn't double-add.
+                if payload not in self.state.queued_prompts:
+                    self.state.queued_prompts.append(payload)
             elif kind == "compact":
                 print(f"{_C_MAGENTA}[orchestrator: compacting session]{_C_RESET}")
                 has_compact = True
@@ -6765,13 +6825,14 @@ class Orchestrator:
                 self.stop_event.set()
                 return None
             if kind == "message":
-                # input_loop always appends to state.queued_prompts,
-                # so we need to dequeue this one here (we're consuming
-                # it directly instead of via popleft() in worker_loop).
-                # remove() uses equality; if a duplicate message text
-                # also sits ahead in the queue we'd remove the wrong
-                # slot, but the event order guarantees this one is the
-                # oldest matching entry — same result either way.
+                # input_loop only appends to queued_prompts while
+                # busy=True. For idle typing (the common case at the
+                # prompt), the message isn't in queued_prompts —
+                # remove() is a no-op (ValueError caught). For the
+                # race where a message was typed during busy but
+                # arrived here before `_drain_between_turns` ran, it
+                # IS in queued_prompts and remove() keeps the panel
+                # display in sync. The try/except covers both.
                 try:
                     self.state.queued_prompts.remove(payload)
                 except ValueError:
