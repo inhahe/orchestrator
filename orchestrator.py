@@ -128,11 +128,14 @@ DEFAULT_COMPACT_THRESHOLD_1M = 950_000
 
 
 def _cmd_hint(text: str) -> str:
-    """Render an inline slash-command hint (e.g. /show 17 [-tail N]) in
-    scrollback output. Bare dim-gray text — bold doesn't render on
-    Windows Terminal with default intenseTextStyle=bright, and other
-    decorations (underline, italic) were visually distracting."""
-    return f"\033[90m{text}\033[0m"
+    """Render an inline slash-command hint (e.g. /show 17 [-tail N]).
+    Bold + 256-color gray (index 248). Using `90` (bright black) with
+    bold is a visual no-op on Windows Terminal with the default
+    `intenseTextStyle=bright` setting — WT maps bold onto the "bright"
+    variant of the base color, and there's no brighter variant of an
+    already-bright 90–97 color. 256-color indices aren't in that
+    mapping, so bold stacks normally."""
+    return f"\033[0;1;38;5;240m{text}\033[0m"
 
 
 # Valid event names for --bell-on / /bell. Frozenset so typos don't silently
