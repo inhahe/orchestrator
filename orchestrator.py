@@ -119,20 +119,12 @@ DEFAULT_COMPACT_THRESHOLD = 160_000
 DEFAULT_COMPACT_THRESHOLD_1M = 950_000
 
 
-_CMD_HINT_USE_BG = False  # flipped by --cmd-hint-style; see parse_args()
-
-
 def _cmd_hint(text: str) -> str:
-    """Render an inline slash-command hint (e.g. `/show 17 [-K]`) in
-    scrollback output. Style controlled by the module global
-    `_CMD_HINT_USE_BG`, set from --cmd-hint-style:
-      backticks (default) → `<text>`     — plain ASCII, copy-friendly.
-      bg                  → dark green, no backticks — pops as interactive.
-    Meant purely for visual A/B — either call site ultimately shows the
-    same command name."""
-    if _CMD_HINT_USE_BG:
-        return f"\033[32m{text}\033[0m"
-    return f"`{text}`"
+    """Render an inline slash-command hint (e.g. /show 17 [-K]) in
+    scrollback output. Bare dim-gray text — bold doesn't render on
+    Windows Terminal with default intenseTextStyle=bright, and other
+    decorations (underline, italic) were visually distracting."""
+    return f"\033[90m{text}\033[0m"
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -1212,7 +1204,7 @@ def render_tool_use(
         seq_prefix = (
             f"\033[90m[#{seq} -- "
             f"{_cmd_hint(f'/show {seq} [-K]')}"
-            f"]\033[0m "
+            f"\033[90m]\033[0m "
         )
     else:
         seq_prefix = ""
@@ -3143,11 +3135,19 @@ def _render_toolbar(state: "State") -> str:
             cur_len = nxt
     if cur:
         lines.append(" " + sep.join(cur) + " ")
+    # Task rows and headers inherit the toolbar's light background.
+    # Hint rows (fully wrapped in <panel-hint>) get the darker background
+    # across the whole row including the padding spaces.
+    def _wrap_panel_row(row: str) -> str:
+        if row.startswith("<panel-hint>") and row.endswith("</panel-hint>"):
+            inner = row[len("<panel-hint>"):-len("</panel-hint>")]
+            return f"<panel-hint> {inner} </panel-hint>"
+        return " " + row + " "
     if state.show_tasks_panel:
         for row in _panel_live_tasks(state):
-            lines.append("<panel-row> " + row + " </panel-row>")
+            lines.append(_wrap_panel_row(row))
     for row in _panel_live_bg(state):
-        lines.append("<panel-row> " + row + " </panel-row>")
+        lines.append(_wrap_panel_row(row))
     # Every user-provided cell (Task desc, Grep pattern, Bash command
     # preview, API-status description, session title, etc.) can carry an
     # embedded newline that would silently render as an extra toolbar row
@@ -5677,10 +5677,15 @@ class Orchestrator:
                 sys.stdout.write("\a")
                 sys.stdout.flush()
                 print(f"\033[36m[wakeup -- {payload}]\033[0m")
-                # Don't send the full CONTINUE_PROMPT — the bg task
-                # completion is already injected into context by the SDK.
-                # A minimal nudge is enough to start the next turn.
-                return "(background task completed — check results and continue)"
+                # Don't start a new orchestrator turn.  The SDK/CLI has
+                # already injected the task-completion notification into
+                # Claude's context and, in most cases, Claude auto-
+                # responds — that response arrives via `_handle_async_message`
+                # and renders as `claude (async):`.  Starting our own turn
+                # here would be redundant (and cause the double-response
+                # effect).  Just ring the bell and keep waiting for real
+                # user input.
+                continue
             if kind == "status":
                 self.print_status()
             elif kind == "help":
@@ -6435,17 +6440,6 @@ def parse_args() -> argparse.Namespace:
         "/show N for detail. --inline-all-tools overrides this to 'full'.",
     )
     ap.add_argument(
-        "--cmd-hint-style",
-        choices=("backticks", "bg"),
-        default="backticks",
-        help="How inline slash-command hints render (e.g. the "
-        "`/show 17 [-K]` tag next to Bash tool calls). `backticks` "
-        "wraps the command in ASCII backticks (copy-friendly). `bg` "
-        "uses an ANSI 256-color dark-grey background behind the "
-        "command (no backticks). Purely visual; both forms reference "
-        "the same command.",
-    )
-    ap.add_argument(
         "--api-stall-limit",
         type=int,
         default=5,
@@ -6494,9 +6488,6 @@ def parse_args() -> argparse.Namespace:
     # Fill compact-at from the model when the user didn't specify.
     if args.compact_at is None:
         args.compact_at = _default_compact_at(args.model)
-    # Hoist --cmd-hint-style into the module global used by _cmd_hint().
-    global _CMD_HINT_USE_BG
-    _CMD_HINT_USE_BG = (args.cmd_hint_style == "bg")
     return args
 
 
