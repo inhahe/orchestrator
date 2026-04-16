@@ -39,7 +39,8 @@ Slash commands (tab-complete at the prompt):
     /burst  N [T]                  set continue-burst limit (and window seconds); no arg = show
     /export [path]                 save the current conversation as markdown
     /tools                         list every active tool call and background task
-    /show [N ...]                  expand a collapsed tool call (input + output) by its [#N] tag
+    /show [tN|bN|kN ...]           unified viewer: tN=tool call, bN=bg task, kN=thinking block
+                                   (bare number = tN; -tail K = last K output lines)
     /todos  /plan                  show Claude's current TodoWrite plan
     /quit   /exit                  graceful exit (waits up to ~10s for the CLI to flush)
     /quit!  /exit!                 force-kill immediately (may lose last in-flight message)
@@ -420,6 +421,53 @@ def _cmd_hint(text: str) -> str:
     return f"{_C_RESET}{_C_DIM_BOLD}{text}{_C_RESET}"
 
 
+# Tools whose "output" is a short confirmation (one line or so): an
+# Edit/Write returns "File was updated successfully", TodoWrite echoes
+# a short acknowledgement, KillShell says "Shell X killed", etc.
+# For these, `-tail N` would mean "last N of 1 line" — pointless, so
+# we suppress the `[-tail N]` hint from their tags.
+_SHORT_OUTPUT_TOOLS = frozenset({
+    "Edit", "Write", "NotebookEdit", "TodoWrite", "KillShell",
+})
+
+
+def _call_seq_prefix(seq: int | None, letter: str = "t") -> str:
+    """Build the `[#<letter><N> -- /show <letter><N>]` hint prefix for
+    a tool CALL line. Never includes `[-tail N]` — output doesn't exist
+    yet when the call is rendered, so advertising "-tail N" would be
+    premature. The option comes into scope on the result line (see
+    `_result_seq_prefix`).
+
+    `letter` is 't' (tool call), 'b' (bg task), or 'k' (thinking),
+    matching the unified `/show` prefix scheme."""
+    if seq is None:
+        return ""
+    ref = f"{letter}{seq}"
+    return f"{_C_DIM}[#{ref} -- {_cmd_hint(f'/show {ref}')}{_C_DIM}]{_C_RESET} "
+
+
+def _result_seq_prefix(
+    seq: int | None,
+    tool_name: str | None,
+    letter: str = "t",
+) -> str:
+    """Build the `[#<letter><N> -- /show <letter><N> [-tail N]]` hint
+    prefix for a tool RESULT line. Short-output tools
+    (`_SHORT_OUTPUT_TOOLS`) get the shorter `[#<letter><N> -- /show
+    <letter><N>]` form since tailing a confirmation line is useless.
+    `-tail N` still parses for them if someone types it — we just don't
+    advertise it."""
+    if seq is None:
+        return ""
+    ref = f"{letter}{seq}"
+    if tool_name in _SHORT_OUTPUT_TOOLS:
+        return f"{_C_DIM}[#{ref} -- {_cmd_hint(f'/show {ref}')}{_C_DIM}]{_C_RESET} "
+    return (
+        f"{_C_DIM}[#{ref} -- {_cmd_hint(f'/show {ref} [-tail N]')}"
+        f"{_C_DIM}]{_C_RESET} "
+    )
+
+
 # Valid event names for --bell-on / /bell. Frozenset so typos don't silently
 # expand to something else.
 _BELL_EVENT_NAMES = frozenset({
@@ -598,7 +646,6 @@ SLASH_COMMANDS = [
     "/bg",
     "/background",
     "/show",
-    "/think",
     "/btw",
     "/autocompact",
     "/max-context",
@@ -724,7 +771,7 @@ class State:
     # Latched True once the poller observes a non-operational status since
     # the stall began. Gates heuristic-stall recovery.
     api_stall_saw_bad: bool = False
-    # Capped history of thinking blocks, used by /think <N>.
+    # Capped history of thinking blocks, used by `/show k<N>`.
     thinking_history: deque[dict[str, Any]] = field(
         default_factory=lambda: deque(maxlen=200)
     )
@@ -776,8 +823,12 @@ class State:
     # last bg task completes (i.e. the orchestrator becomes truly idle).
     # `None` = no deferred bell.
     pending_bell: str | None = None
-    rate_limit_util: float | None = None
-    rate_limit_label: str | None = None
+    # Per-bucket utilizations, keyed by `rate_limit_type` (five_hour,
+    # seven_day, seven_day_opus, seven_day_sonnet). A subscription can
+    # have multiple independent buckets in flight at once — e.g. both
+    # "5h: 30%" and "7d: 80%" — so we keep a dict instead of a single
+    # value that would clobber on the next event.
+    rate_limit_utils: dict[str, float] = field(default_factory=dict)
     # Populated when rate_limit_info.status == "rejected" (rate limit hit).
     # Cleared once resets_at has passed.
     rate_limit_status: str | None = None  # "allowed" / "allowed_warning" / "rejected" / None
@@ -896,10 +947,11 @@ def _apply_rate_limit_info(state: "State", info: Any) -> None:
         resets_at = getattr(info, "resets_at", None)
     if rl_type in _SUBSCRIPTION_RL_TYPES:
         state.is_subscription = True
-    if isinstance(util, (int, float)):
-        state.rate_limit_util = float(util)
-    if isinstance(rl_type, str):
-        state.rate_limit_label = _RL_TYPE_LABEL.get(rl_type, rl_type)
+    # Bucket utilizations are per-type: an event for `five_hour` at 30%
+    # must NOT clobber an earlier `seven_day` at 80% that's still
+    # in-window. Keep them side-by-side in the dict.
+    if isinstance(util, (int, float)) and isinstance(rl_type, str):
+        state.rate_limit_utils[rl_type] = float(util)
     if isinstance(status, str):
         # On transition into `rejected`, ring the rate-hit bell and
         # reset the "rate-reset bell already fired" latch so the next
@@ -919,6 +971,10 @@ def classify(line: str) -> tuple[str, str]:
     if not s.startswith("/"):
         return "message", s
     parts = s[1:].split(None, 1)
+    if not parts:
+        # Bare "/" (or "/" + whitespace only) — no command at all. Don't
+        # crash; just nudge the user with a hint.
+        return "error", "empty slash command (try /help)"
     cmd = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
     if cmd in ("i", "interrupt"):
@@ -964,13 +1020,28 @@ def classify(line: str) -> tuple[str, str]:
     if cmd in ("tasks", "task"):
         return "tasks", ""
     if cmd in ("bg", "background", "bgtasks"):
-        return "bg", arg  # "" = summary list; "N" = detail; "N K" = detail + tail K lines
+        if arg.strip():
+            # Detail mode moved to the unified /show b<N> command.
+            # Redirect the user so they don't hit a silent failure.
+            return (
+                "error",
+                f"/bg lists bg tasks now — use `/show b{arg.strip().split()[0]}` "
+                "for detail (or `/show b<N> [-tail K]`).",
+            )
+        return "bg", ""
     if cmd in ("todos", "todo", "plan"):
         return "todos", ""
     if cmd == "show":
-        return "show", arg  # "" = last few; "N [N2 N3 ...]" = those entries
+        # Unified viewer: tool calls (tN or bare N), bg tasks (bN),
+        # thinking blocks (kN). Multi-arg + `-tail K` supported.
+        return "show", arg
     if cmd in ("think", "thinking", "thought"):
-        return "think", arg  # "" = last few; "N [N2 ...]" = those thinking blocks
+        # Folded into /show with the `k` prefix.
+        hint = arg.strip().split()[0] if arg.strip() else "N"
+        return (
+            "error",
+            f"/think is removed — use `/show k{hint}` instead.",
+        )
     if cmd == "btw":
         if not arg:
             return "error", "usage: /btw <question>"
@@ -1127,7 +1198,8 @@ def render_unknown_message(msg: Any, state: "State | None" = None) -> None:
             bits.append(f"{util * 100:.0f}% used")
         if rl_type:
             bits.append(str(rl_type))
-        print(f"{color}[rate-limit: {' · '.join(bits)}]{_C_RESET}")
+        sep = f" {_mark('bullet')} "
+        print(f"{color}[rate-limit: {sep.join(bits)}]{_C_RESET}")
         return
     # tool_progress: { type: 'tool_progress', tool_name, elapsed_time_seconds, ... }
     tool_name = getattr(msg, "tool_name", None)
@@ -1158,17 +1230,54 @@ def render_unknown_message(msg: Any, state: "State | None" = None) -> None:
 
 
 _BG_STATUS_COLORS = {
-    "completed": _C_GREEN,
+    # "completed" uses MAGENTA (same as the "started" line's colour) so
+    # the normal lifecycle (start → end) reads as one visual thread.
+    # Error-ish outcomes get their own colours to pop.
+    "completed": _C_MAGENTA,
     "failed": _C_RED,
     "stopped": _C_YELLOW,
     "cancelled": _C_YELLOW,
 }
-_BG_STATUS_MARKERS = {
-    "completed": "✓",
-    "failed": "✗",
-    "stopped": "⏹",
-    "cancelled": "⏹",
+
+# Swappable glyph set for status markers, result arrows, bullets, etc.
+# `--ascii-only` flips `_USE_UNICODE_MARKERS` to False at startup,
+# which makes `_mark()` return the ASCII variant instead of the Unicode
+# one. Defaults to Unicode — the BMP chars below render cleanly in
+# every modern terminal/font combo (Windows Terminal, iTerm2, the
+# major Linux emulators); ASCII is the fallback for the edge cases
+# (ancient CMD.exe, weird tmux-in-screen-in-ssh stacks, piping
+# scrollback to files consumed by non-UTF-8 readers, etc.).
+_USE_UNICODE_MARKERS = True
+
+_MARKERS: dict[str, tuple[str, str]] = {
+    # key: (unicode, ascii). All ASCII variants are 1-char so column
+    # alignment is preserved regardless of mode.
+    "start":        ("▶", ">"),   # bg-task started
+    "completed":    ("▶", ">"),   # bg-task ended normally (same as start — single lifecycle thread)
+    "failed":       ("✗", "x"),   # bg-task ended with non-zero / error
+    "stopped":      ("⏹", "-"),   # bg-task was stopped
+    "cancelled":    ("⏹", "-"),   # bg-task was cancelled
+    "check":        ("✓", "v"),   # generic tick for todo-complete / tool-success
+    "arrow_result": ("→", ">"),   # tool-result "→ N lines"
+    "arrow_cur":    ("→", ">"),   # panel current-sub arrow
+    "bullet":       ("·", "."),   # list separator / inactive marker
+    "unknown":      ("•", "*"),   # fallback for unrecognised status
 }
+
+
+def _mark(key: str) -> str:
+    """Return a status marker / arrow / bullet, respecting `--ascii-only`.
+    Unknown keys return `?` (shouldn't happen — the keys are closed)."""
+    u, a = _MARKERS.get(key, ("?", "?"))
+    return u if _USE_UNICODE_MARKERS else a
+
+
+def _bg_status_marker(status: str) -> str:
+    """Marker for a bg-task end status. Falls back to `unknown` for
+    anything the CLI sends that we don't know about."""
+    if status in ("completed", "failed", "stopped", "cancelled"):
+        return _mark(status)
+    return _mark("unknown")
 
 
 def _emit_bg_completion(
@@ -1223,12 +1332,12 @@ def _emit_bg_completion(
         if usage is not None:
             turn_entry["usage"] = usage
     color = _BG_STATUS_COLORS.get(status, _C_MAGENTA)
-    marker = _BG_STATUS_MARKERS.get(status, "•")
-    seq_tag = (
-        f"[#{seq} -- {_cmd_hint(f'/bg {seq} [-tail N]')}] "
-        if isinstance(seq, int)
-        else ""
-    )
+    marker = _bg_status_marker(status)
+    # Hint tag at the front (matches the foreground-tool-call pattern).
+    # End-time tag includes `[-tail N]` since output is now viewable,
+    # so no dedicated hint line needed below. Letter prefix "b" per
+    # the unified /show scheme.
+    seq_prefix = _result_seq_prefix(seq, None, letter="b") if isinstance(seq, int) else ""
     label = (name or summary or "(unnamed)").replace("\n", " ")
     # If this bg task originated from a Bash tool call, append the
     # command (inline if it fits, size hint otherwise).
@@ -1242,22 +1351,32 @@ def _emit_bg_completion(
                 orig_cmd = (h.get("input") or {}).get("command", "") or ""
                 if orig_cmd.strip():
                     lines = orig_cmd.splitlines() or [orig_cmd]
+                    # Mirror the actual print-line layout exactly so the
+                    # width check reflects what will be emitted.
                     base = (
-                        f"{color}[bg {marker} {seq_tag}{task_id} -- "
-                        f"{status}]{_C_RESET} {label}"
+                        f"{seq_prefix}{_C_MAGENTA}bg-task{_C_RESET} "
+                        f"{color}{marker} {status}{_C_RESET} "
+                        f"{_C_DESC}-- {label}{_C_RESET}"
                     )
                     if len(lines) <= 1:
-                        trial = f"{base}  {_C_BRIGHT_CYAN}`{orig_cmd}`{_C_RESET}"
+                        trial = f"{base}  {_C_COMMAND}`{orig_cmd}`{_C_RESET}"
                         if _visible_len(trial) <= _term_width():
-                            cmd_suffix = f"  {_C_BRIGHT_CYAN}`{orig_cmd}`{_C_RESET}"
+                            cmd_suffix = f"  {_C_COMMAND}`{orig_cmd}`{_C_RESET}"
                     if not cmd_suffix:
                         cmd_suffix = (
                             f"  {_C_DIM}({_cmd_size_hint(orig_cmd)}){_C_RESET}"
                         )
                 break
+    # End format mirrors the start: hint tag, "bg-task" marker (MAGENTA),
+    # then the status pair (✓ completed / ✗ failed / ⏹ stopped) coloured
+    # by status. Parallel structure with "▶ started" on the start line.
+    # Label + cmd_suffix go in DESC so only the status pair visually
+    # pops; cmd_suffix carries its own COMMAND / DIM colour for the
+    # embedded backtick cmd or the (size) hint, which remains distinct.
     print(
-        f"{color}[bg {marker} {seq_tag}{task_id} -- {status}]{_C_RESET} "
-        f"{label}{cmd_suffix}"
+        f"{seq_prefix}{_C_MAGENTA}bg-task{_C_RESET} "
+        f"{color}{marker} {status}{_C_RESET} "
+        f"{_C_DESC}-- {label}{_C_RESET}{cmd_suffix}"
     )
     # Per-task ring (opt-in via bell-on bg-done).
     _ring_bell(state, "bg-done")
@@ -1396,6 +1515,7 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
         task_id = task_id_full[:8] if task_id_full else "?"
         task_type = d.get("task_type", "?")
         name = d.get("name") or d.get("description") or ""
+        seq: int | None = None
         if task_id_full:
             started = time.monotonic()
             seq = state.next_bg_seq
@@ -1419,14 +1539,26 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
                 "summary": None,
                 "output_file": None,
             }
-        # Skip the "started" print for plain background-bash launches —
-        # the user already saw the Bash tool call render and the
-        # task_notification on completion will be informative on its own.
-        # Other task types (Task subagents, etc.) still get the print.
-        if task_type != "local_bash":
-            print(
-                f"{_C_MAGENTA}[bg-task {task_id} started -- {task_type}]{_C_RESET} {name}"
-            )
+        # Start notice — mirrors the foreground-tool format (hint tag
+        # at the front, then a short label body). Emitted for every
+        # bg task so the /bg N hint is always visible and pairs
+        # symmetrically with the completion message below. "bg-task"
+        # carries the "this is a background task" signal; "▶ started"
+        # is the status pair that matches "✓ completed" etc. on exit.
+        # For local_bash the Bash tool call already printed the
+        # command one line above, so the name is omitted; the seq
+        # and the "bg-task started" signal are the whole point here.
+        seq_prefix = _call_seq_prefix(seq, letter="b") if isinstance(seq, int) else ""
+        label_suffix = (
+            f" -- {name}" if (name and task_type != "local_bash") else ""
+        )
+        # MAGENTA carries the "bg-task started" signal; everything
+        # past that (task_type + optional name) is supporting context,
+        # dimmed to DESC so only the status pair stands out.
+        print(
+            f"{seq_prefix}{_C_MAGENTA}bg-task {_mark('start')} started{_C_RESET} "
+            f"{_C_DESC}-- {task_type}{label_suffix}{_C_RESET}"
+        )
         return
 
     if sub == "task_progress":
@@ -1713,18 +1845,14 @@ def render_tool_use(
     elif name != "Bash" and not inline_all and show_tasks == "off":
         return
     inp = block.input or {}
-    # Leading-position seq prefix so the [#N] tag lines up with the
-    # identically-formatted tags on thinking and bg rows. Each type is
-    # disambiguated by the command you use (/show, /think, /bg) — no
-    # letter prefix needed.
-    if seq is not None:
-        seq_prefix = (
-            f"{_C_DIM}[#{seq} -- "
-            f"{_cmd_hint(f'/show {seq} [-tail N]')}"
-            f"{_C_DIM}]{_C_RESET} "
-        )
-    else:
-        seq_prefix = ""
+    # Leading-position seq prefix so the [#tN] tag lines up with the
+    # identically-formatted tags on thinking (`[#kN]`) and bg rows
+    # (`[#bN]`). The letter prefix disambiguates the type; a bare
+    # number in `/show <N>` defaults to `t` (tool call).
+    # No `[-tail N]` on the call line — output doesn't exist yet. The
+    # hint gets upgraded to `[-tail N]` on the matching result line
+    # (for tools where tailing is meaningful — see `_result_seq_prefix`).
+    seq_prefix = _call_seq_prefix(seq)
     seq_tag = ""  # kept for legacy placeholders below; always empty now
     if name == "Edit":
         path = inp.get("file_path", "?")
@@ -1830,7 +1958,11 @@ def render_tool_use(
     elif name == "TodoWrite":
         todos = inp.get("todos", []) or []
         print(f"{seq_prefix}{_C_BOLD_BLUE}TodoWrite{_C_RESET} {_C_DIM}({len(todos)} items){_C_RESET}")
-        markers = {"completed": f"{_C_GREEN}✓{_C_RESET}", "in_progress": f"{_C_YELLOW}→{_C_RESET}", "pending": f"{_C_DIM}·{_C_RESET}"}
+        markers = {
+            "completed": f"{_C_GREEN}{_mark('check')}{_C_RESET}",
+            "in_progress": f"{_C_YELLOW}{_mark('arrow_cur')}{_C_RESET}",
+            "pending": f"{_C_DIM}{_mark('bullet')}{_C_RESET}",
+        }
         for t in todos:
             m = markers.get(t.get("status", "pending"), "?")
             content = t.get("content", "") or t.get("activeForm", "")
@@ -1977,19 +2109,22 @@ def _humanize_size(text: str) -> str:
 
 
 def _render_tool_result(
-    text: str, *, is_error: bool, show_full: bool, seq: int | None = None
+    text: str,
+    *,
+    is_error: bool,
+    show_full: bool,
+    seq: int | None = None,
+    tool_name: str | None = None,
 ) -> None:
     """Print a tool result. With show_full=True, dump the entire (possibly
     truncated by summarize_tool_result) content indented under a marker.
     Default is suppressed: a dim size indicator on success, a red one-liner
     on error — full content lives in the JSONL transcript and /export.
-    `seq` (when provided) prints `[#N]` so the user can `/show N` later."""
-    seq_prefix = (
-        f"{_C_DIM}[#{seq} -- {_cmd_hint(f'/show {seq} [-tail N]')}"
-        f"{_C_DIM}]{_C_RESET} "
-        if seq is not None
-        else ""
-    )
+    `seq` (when provided) prints `[#N]` so the user can `/show N` later.
+    `tool_name` lets us elide the `[-tail N]` hint for tools whose
+    output is a short confirmation (Edit/Write/NotebookEdit/TodoWrite/
+    KillShell)."""
+    seq_prefix = _result_seq_prefix(seq, tool_name)
     if show_full:
         marker = (
             f"{_C_RED}tool-err:{_C_RESET}"
@@ -2013,11 +2148,11 @@ def _render_tool_result(
     size = _humanize_size(text)
     if is_error:
         print(
-            f"{seq_prefix}{_C_RED}✗ tool error{_C_RESET}  "
+            f"{seq_prefix}{_C_RED}{_mark('failed')} tool error{_C_RESET}  "
             f"{_C_DIM}({size}){_C_RESET}"
         )
     else:
-        print(f"{seq_prefix}{_C_DIM}→ {size}{_C_RESET}")
+        print(f"{seq_prefix}{_C_DIM}{_mark('arrow_result')} {size}{_C_RESET}")
 
 
 # ----------------------------------------------------------------------------
@@ -2629,15 +2764,16 @@ async def cursor_select(
             line = str(label).rstrip("\n")
             handler = _make_row_handler(actual)
             if actual == state["cursor"]:
-                out.append(("reverse", " ▶ " + line + "\n", handler))
+                out.append(("reverse", f" {_mark('start')} " + line + "\n", handler))
             else:
                 out.append(("", "   " + line + "\n", handler))
         out.append(("", "\n"))
+        _sep = _mark("bullet")
         out.append(
             (
                 "ansibrightblack",
                 f" [{state['cursor'] + 1}/{len(values)}]  "
-                f"↑↓/click navigate · wheel scrolls · Enter/click selects · Esc cancels",
+                f"↑↓/click navigate {_sep} wheel scrolls {_sep} Enter/click selects {_sep} Esc cancels",
             )
         )
         return out
@@ -2872,11 +3008,11 @@ def render_session_history_text(
                                 size = _humanize_size(text)
                                 if is_err:
                                     write(
-                                        f"{_C_RED}✗ tool error{_C_RESET}  "
+                                        f"{_C_RED}{_mark('failed')} tool error{_C_RESET}  "
                                         f"{_C_DIM}({size}){_C_RESET}\n"
                                     )
                                 else:
-                                    write(f"{_C_DIM}→ {size}{_C_RESET}\n")
+                                    write(f"{_C_DIM}{_mark('arrow_result')} {size}{_C_RESET}\n")
                                 continue
                             # show_tool_output on: full content (truncated
                             # at 600 chars to keep the backscroll sane).
@@ -3197,9 +3333,26 @@ def _panel_session(state: "State") -> str:
             # Normal foreground — informational; the red RATE-LIMIT in the
             # state field already flags the critical status.
             rate_field = f"rate-limit reset: {_fmt_reset_time(resets)}"
-        elif state.rate_limit_util is not None:
-            label = state.rate_limit_label or "limit"
-            rate_field = f"{state.rate_limit_util * 100:.0f}% / {label}"
+        elif state.rate_limit_utils:
+            # Render every tracked bucket (5h, 7d, 7d-opus, 7d-sonnet)
+            # side-by-side so a subscription user can see "30% / 5h, 80% / 7d"
+            # at a glance — both limits apply simultaneously and the
+            # binding one is often the less-obvious of the two. Order
+            # follows _RL_TYPE_LABEL declaration (5h first, then 7d,
+            # then model-specific 7d buckets) so the display is stable
+            # regardless of which bucket fired its event most recently.
+            order = list(_RL_TYPE_LABEL.keys())
+            seen: list[str] = [t for t in order if t in state.rate_limit_utils]
+            seen += [
+                t for t in state.rate_limit_utils
+                if t not in _RL_TYPE_LABEL  # unknown/future bucket types
+            ]
+            parts = [
+                f"{state.rate_limit_utils[t] * 100:.0f}% / "
+                f"{_RL_TYPE_LABEL.get(t, t)}"
+                for t in seen
+            ]
+            rate_field = ", ".join(parts)
     else:
         plan_field = f"cost: ${state.total_cost_usd:.4f}"
     # Model: prefer user-pinned (--model) over the CLI-reported active model
@@ -3286,7 +3439,7 @@ def _panel_todos(state: "State") -> str:
             label = label.replace("\n", " ")
             if len(label) > 50:
                 label = label[:49] + "…"
-            in_prog_label = f" → {label}"
+            in_prog_label = f" {_mark('arrow_cur')} {label}"
             break
     return f"todos: <b>{done}/{len(todos)}</b>{in_prog_label}"
 
@@ -3442,10 +3595,10 @@ def _panel_live_tasks(state: "State") -> list[str]:
             cur_id = info.get("current_sub_id")
             cur = state.active_tools.get(cur_id) if cur_id else None
             if cur is not None:
-                lines.append(f"  <panel-dim>→</panel-dim> {_describe_current_sub(cur)}")
+                lines.append(f"  <panel-dim>{_mark('arrow_cur')}</panel-dim> {_describe_current_sub(cur)}")
             else:
                 lines.append(
-                    "  <panel-dim>→ (subagent thinking...)</panel-dim>"
+                    f"  <panel-dim>{_mark('arrow_cur')} (subagent thinking...)</panel-dim>"
                 )
         elif name == "Grep":
             pat = _tb_escape(str(inp.get("pattern", "")))
@@ -3521,25 +3674,25 @@ def _panel_live_tasks(state: "State") -> list[str]:
             subtype = _tb_escape(str(inp.get("subagent_type", "?")))
             desc = _tb_escape(str(inp.get("description") or "").strip()[:60])
             lines.append(
-                f'[<b>#{seq}</b>] <done-marker>✓</done-marker> '
+                f'[<b>#{seq}</b>] <done-marker>{_mark('check')}</done-marker> '
                 f'<tool-label>task</tool-label> '
                 f'<b>{subtype}</b>: "{desc}"'
             )
         elif name == "Grep":
             pat = _tb_escape(str(inp.get("pattern", "")))
             lines.append(
-                f"[<b>#{seq}</b>] <done-marker>✓</done-marker> "
+                f"[<b>#{seq}</b>] <done-marker>{_mark('check')}</done-marker> "
                 f"<tool-label>search</tool-label> /<b>{pat}</b>/"
             )
         elif name == "Read":
             path = _tb_escape(str(inp.get("file_path", "?")))
             lines.append(
-                f"[<b>#{seq}</b>] <done-marker>✓</done-marker> "
+                f"[<b>#{seq}</b>] <done-marker>{_mark('check')}</done-marker> "
                 f"<tool-label>read</tool-label> {path}"
             )
         else:
             lines.append(
-                f"[<b>#{seq}</b>] <done-marker>✓</done-marker> "
+                f"[<b>#{seq}</b>] <done-marker>{_mark('check')}</done-marker> "
                 f"<tool-label>{_tb_escape(name.lower())}</tool-label>"
             )
     for tid in expired_ids:
@@ -3639,7 +3792,7 @@ def _panel_live_bg(state: "State") -> list[str]:
         seq = info.get("seq")
         seq_tag = f"[<b>#{seq}</b>] " if isinstance(seq, int) else ""
         out.append(
-            f"{seq_tag}<done-marker>✓</done-marker> <b>{task_type}</b>: "
+            f"{seq_tag}<done-marker>{_mark('check')}</done-marker> <b>{task_type}</b>: "
             f"{_tb_escape(raw_name)}"
         )
     for tid in expired_ids:
@@ -3650,13 +3803,14 @@ def _panel_live_bg(state: "State") -> list[str]:
             f"… +{overflow} more bg task"
             f"{'s' if overflow != 1 else ''} (/bg for all)"
         )
-    # Prepend header only when there are visible rows.
+    # Prepend header only when there are visible rows. The `-tail K`
+    # hint lives on the completion message, not here — by the time the
+    # user could type it the task is already gone from the panel.
     if out:
         out[0:0] = [
             _panel_header("background tasks"),
             "<panel-hint>"
-            "(<b>/bg</b>: list, <b>/bg N</b>: detail, "
-            "<b>/bg N -tail K</b>: last K lines of output)"
+            "(<b>/bg</b>: list, <b>/bg N</b>: detail)"
             "</panel-hint>",
         ]
     return out
@@ -4092,8 +4246,8 @@ class Orchestrator:
         print("  /tools                          list active tool calls and background tasks")
         print("  /tasks                          list every task this turn (in-flight + completed)")
         print("  /bg  /background                list background shells / Task subagents still running")
-        print("  /show [N ...]                   expand collapsed tool calls by their [#N] tag")
-        print("  /think [N ...]                  show full thinking blocks by their [#N] tag")
+        print("  /show [tN|bN|kN ...]            unified viewer — tN=tool call, bN=bg task, kN=thinking block")
+        print("                                  (bare number = tN; add -tail K for last K output lines)")
         print("  /btw <question>                 ask a side question (doesn't enter main session history)")
         print("  /autocompact [on|off|N]         enable/disable/set auto-compact threshold")
         print("  /max-context [off|N]            cap context at N tokens (rolling-window trim)")
@@ -4754,40 +4908,6 @@ class Orchestrator:
         self.args.max_context_tokens = n
         print(f"{_C_MAGENTA}[sys] max context -> ~{n} tok (rolling-window trim){_C_RESET}")
 
-    def show_thinking_detail(self, payload: str) -> None:
-        history = self.state.thinking_history
-        payload = payload.strip()
-        if not payload:
-            recent = list(history)[-3:]
-            if not recent:
-                print(f"{_C_DIM}[no thinking blocks yet]{_C_RESET}")
-                return
-            print(
-                f"{_C_DIM}[showing last {len(recent)} thinking block(s); "
-                f"/think <N> [N2 ...] to pick specific ones]{_C_RESET}"
-            )
-            for e in recent:
-                self._print_thinking_entry(e)
-            return
-        try:
-            nums = [int(p) for p in payload.split()]
-        except ValueError:
-            print(
-                f"{_C_RED}[error: usage /think [<N> ...] -- numbers come from "
-                f"the [#N] tags shown with each thinking preview]{_C_RESET}"
-            )
-            return
-        by_seq = {e["seq"]: e for e in history}
-        for n in nums:
-            entry = by_seq.get(n)
-            if entry is None:
-                print(
-                    f"{_C_YELLOW}[#{n} not found "
-                    f"(history kept = last {history.maxlen} blocks)]{_C_RESET}"
-                )
-            else:
-                self._print_thinking_entry(entry)
-
     def _print_thinking_entry(self, e: dict[str, Any]) -> None:
         seq = e.get("seq", "?")
         text = (e.get("text") or "").strip()
@@ -4799,81 +4919,147 @@ class Orchestrator:
         for ln in text.splitlines():
             print(f"  {_C_DIM}{ln}{_C_RESET}")
 
-    def show_tool_detail(self, payload: str) -> None:
-        """Usage:
-          /show                 -- last 5 tool history entries, each full
-          /show N               -- entry N, full input + full output
-          /show N -tail K       -- entry N, full input + *last K lines* of output
-          /show N1 N2 N3 ...    -- entries N1, N2, N3, ..., each full
-        Positive ints are entry seqs; `-tail K` (or a legacy negative int
-        like `-K`) sets tail-line count for the preceding entry.
-        `/show 19 18` means two entries; `/show 19 -tail 18` means
-        entry 19 with the last 18 output lines."""
-        history = self.state.tool_history
+    def show_detail(self, payload: str) -> None:
+        """Unified `/show` — inspect tool calls, bg tasks, or thinking
+        blocks by their [#<letter><N>] tag.
+
+        Usage:
+          /show                      -- recent entries of each type
+          /show N (or tN)            -- tool call #N (detail)
+          /show bN                   -- background task #N (detail)
+          /show kN                   -- thinking block #N (detail)
+          /show tN -tail K           -- tool call #N with last K output lines
+          /show bN -tail K           -- bg task #N with last K output lines
+          /show t5 b3 k1 -tail 20 t7 -- multi-arg, mixed types
+
+        Letter prefixes: `t` = tool call, `b` = background task,
+        `k` = thinking block. An unprefixed number (`/show 42`)
+        defaults to `t`. `-tail K` (or legacy `-K`) applies to the
+        reference immediately preceding it. `-tail` is a no-op for
+        thinking blocks (they have no output stream)."""
         payload = payload.strip()
         if not payload:
-            recent = list(history)[-5:]
-            if not recent:
-                print(f"{_C_DIM}[no tool history yet]{_C_RESET}")
-                return
+            self._show_recent_each_type()
+            return
+        entries, err = self._parse_show_tokens(payload.split())
+        if err is not None:
+            print(f"{_C_RED}[error: {err}]{_C_RESET}")
+            return
+        tool_hist = self.state.tool_history
+        think_hist = self.state.thinking_history
+        tool_by_seq = {e["seq"]: e for e in tool_hist}
+        think_by_seq = {e["seq"]: e for e in think_hist}
+        bg_index = self._bg_entry_index()
+        for letter, seq, tail in entries:
+            if letter == "t":
+                entry = tool_by_seq.get(seq)
+                if entry is None:
+                    print(
+                        f"{_C_YELLOW}[#t{seq} not found "
+                        f"(tool history kept = last {tool_hist.maxlen} "
+                        f"calls)]{_C_RESET}"
+                    )
+                    continue
+                self._print_tool_history_entry(entry, tail=tail)
+            elif letter == "b":
+                match = bg_index.get(seq)
+                if match is None:
+                    print(f"{_C_YELLOW}[#b{seq} not found]{_C_RESET}")
+                    continue
+                self._print_bg_detail(match[0], match[1], tail)
+            elif letter == "k":
+                entry = think_by_seq.get(seq)
+                if entry is None:
+                    print(
+                        f"{_C_YELLOW}[#k{seq} not found "
+                        f"(thinking history kept = last "
+                        f"{think_hist.maxlen} blocks)]{_C_RESET}"
+                    )
+                    continue
+                # Thinking blocks have no output stream; -tail is a no-op.
+                self._print_thinking_entry(entry)
+
+    @staticmethod
+    def _parse_show_tokens(
+        parts: list[str],
+    ) -> tuple[list[tuple[str, int, int | None]], str | None]:
+        """Parse /show payload tokens into [(letter, seq, tail_or_None), ...].
+        Accepts refs like `42` (default `t`), `t42`, `b5`, `k17`, and
+        tail markers `-tail K` or legacy `-K` that attach to the ref
+        immediately before them. Returns (entries, error_msg)."""
+        import re
+        ref_re = re.compile(r"^([tbk])?(\d+)$", re.IGNORECASE)
+        entries: list[tuple[str, int, int | None]] = []
+        i = 0
+        n = len(parts)
+        while i < n:
+            p = parts[i]
+            m = ref_re.match(p)
+            if m is None:
+                # Could be a stray `-tail` or `-K` with no preceding ref.
+                if p == "-tail" or (p.startswith("-") and p[1:].isdigit()):
+                    return [], f"'{p}' must follow a ref (tN/bN/kN or just N)"
+                return [], (
+                    f"bad reference '{p}' — expected N, tN, bN, or kN"
+                )
+            letter = (m.group(1) or "t").lower()
+            seq = int(m.group(2))
+            i += 1
+            # Look for an optional trailing `-tail K` or legacy `-K`.
+            tail: int | None = None
+            if i < n:
+                nxt = parts[i]
+                if nxt == "-tail":
+                    if i + 1 >= n:
+                        return [], "-tail needs a count"
+                    try:
+                        tail = int(parts[i + 1])
+                    except ValueError:
+                        return [], f"bad -tail count '{parts[i + 1]}'"
+                    i += 2
+                elif (
+                    nxt.startswith("-")
+                    and nxt[1:].isdigit()
+                ):
+                    tail = int(nxt[1:])
+                    i += 1
+            entries.append((letter, seq, tail))
+        return entries, None
+
+    def _show_recent_each_type(self) -> None:
+        """Fallback for bare `/show`: print a brief of each history type."""
+        tool_hist = self.state.tool_history
+        think_hist = self.state.thinking_history
+        bg_index = self._bg_entry_index()
+        any_shown = False
+        if tool_hist:
+            recent = list(tool_hist)[-5:]
             print(
-                f"{_C_DIM}[showing last {len(recent)} tool call(s); "
-                f"/show N -- full; /show N -tail K -- last K lines of output]{_C_RESET}"
+                f"{_C_DIM}[last {len(recent)} tool call(s); "
+                f"/show tN for full, /show tN -tail K for last K output lines]"
+                f"{_C_RESET}"
             )
             for e in recent:
                 self._print_tool_history_entry(e)
-            return
-        # Tokenize: each "-tail" is a marker whose following token is the
-        # tail count. Legacy negative-int syntax (`-50`) still works.
-        tokens: list[int] = []
-        parts = payload.split()
-        idx = 0
-        try:
-            while idx < len(parts):
-                p = parts[idx]
-                if p == "-tail":
-                    idx += 1
-                    if idx >= len(parts):
-                        raise ValueError("-tail needs a count")
-                    tokens.append(-int(parts[idx]))
-                    idx += 1
-                else:
-                    tokens.append(int(p))
-                    idx += 1
-        except ValueError:
+            any_shown = True
+        if bg_index:
             print(
-                f"{_C_RED}[error: usage /show [N [-tail K]] or /show N1 N2 ... "
-                "-- positive ints are entry seqs, -tail K "
-                f"(or legacy -K) sets tail lines]{_C_RESET}"
+                f"{_C_DIM}[bg tasks; /show bN for detail, "
+                f"/show bN -tail K for last K output lines]{_C_RESET}"
             )
-            return
-        nums = tokens
-        by_seq = {e["seq"]: e for e in history}
-        # Walk the list: each positive int picks an entry; a negative int
-        # immediately after a positive one is that entry's tail count.
-        i = 0
-        while i < len(nums):
-            n = nums[i]
-            if n < 0:
-                print(
-                    f"{_C_RED}[error: standalone negative {n} — "
-                    f"tail must follow an entry number]{_C_RESET}"
-                )
-                return
-            tail_k: int | None = None
-            if i + 1 < len(nums) and nums[i + 1] < 0:
-                tail_k = -nums[i + 1]
-                i += 2
-            else:
-                i += 1
-            entry = by_seq.get(n)
-            if entry is None:
-                print(
-                    f"{_C_YELLOW}[#{n} not found "
-                    f"(history kept = last {history.maxlen} calls)]{_C_RESET}"
-                )
-                continue
-            self._print_tool_history_entry(entry, tail=tail_k)
+            self._print_bg_summary(bg_index)
+            any_shown = True
+        if think_hist:
+            recent = list(think_hist)[-3:]
+            print(
+                f"{_C_DIM}[last {len(recent)} thinking block(s); "
+                f"/show kN for full text]{_C_RESET}"
+            )
+            for e in recent:
+                self._print_thinking_entry(e)
+            any_shown = True
+        if not any_shown:
+            print(f"{_C_DIM}[no tool calls, bg tasks, or thinking blocks yet]{_C_RESET}")
 
     def _print_tool_history_entry(
         self, e: dict[str, Any], tail: int | None = None
@@ -4968,9 +5154,9 @@ class Orchestrator:
             f"({len(todos)} total)"
         )
         markers = {
-            "completed": f"{_C_GREEN}✓{_C_RESET}",
-            "in_progress": f"{_C_YELLOW}→{_C_RESET}",
-            "pending": f"{_C_DIM}·{_C_RESET}",
+            "completed": f"{_C_GREEN}{_mark('check')}{_C_RESET}",
+            "in_progress": f"{_C_YELLOW}{_mark('arrow_cur')}{_C_RESET}",
+            "pending": f"{_C_DIM}{_mark('bullet')}{_C_RESET}",
         }
         for t in todos:
             status = t.get("status", "pending")
@@ -5024,10 +5210,10 @@ class Orchestrator:
                 elapsed = now - h.get("started_at", now)
                 status = f"{_C_YELLOW}… running {_fmt_duration(elapsed)}{_C_RESET}"
             elif is_err:
-                status = f"{_C_RED}✗ error{_C_RESET}"
+                status = f"{_C_RED}{_mark('failed')} error{_C_RESET}"
             else:
                 dur = ended - h.get("started_at", ended)
-                status = f"{_C_GREEN}✓{_C_RESET} {_C_DIM}{_fmt_duration(dur)}{_C_RESET}"
+                status = f"{_C_GREEN}{_mark('check')}{_C_RESET} {_C_DIM}{_fmt_duration(dur)}{_C_RESET}"
             summary = _task_summary_line(name, inp)
             print(f"  [{_C_DIM}#{seq}{_C_RESET}] {status}  {_C_BLUE}{name}{_C_RESET}  {summary}")
         print()
@@ -5065,59 +5251,11 @@ class Orchestrator:
 
     def show_bg_tasks(self, payload: str = "") -> None:
         """`/bg` — summary of bg tasks (this turn + running carryover).
-        `/bg N` — full detail for task `[#N]`.
-        `/bg N -tail K` — detail + last K lines of `output_file`.
-        `/bg N1 N2 N3` — detail for several bg tasks.
-        Parallel to `/show` so the two commands behave identically.
-        Legacy `-K` (negative int) syntax still works."""
-        parts = payload.split()
-        index = self._bg_entry_index()
-        if not parts:
-            self._print_bg_summary(index)
-            return
-        # Tokenize: `-tail K` produces -K; legacy `-K` still accepted.
-        tokens: list[int] = []
-        idx = 0
-        try:
-            while idx < len(parts):
-                p = parts[idx]
-                if p == "-tail":
-                    idx += 1
-                    if idx >= len(parts):
-                        raise ValueError("-tail needs a count")
-                    tokens.append(-int(parts[idx]))
-                    idx += 1
-                else:
-                    tokens.append(int(p))
-                    idx += 1
-        except ValueError:
-            print(
-                f"{_C_RED}[error: usage /bg [N [-tail K]] ... — "
-                "positive ints are bg task numbers, -tail K (or legacy -K) "
-                f"sets tail lines for the entry just before it]{_C_RESET}"
-            )
-            return
-        nums = tokens
-        i = 0
-        while i < len(nums):
-            n = nums[i]
-            if n < 0:
-                print(
-                    f"{_C_RED}[error: standalone negative {n} — "
-                    f"tail must follow a bg task number]{_C_RESET}"
-                )
-                return
-            tail_k: int | None = None
-            if i + 1 < len(nums) and nums[i + 1] < 0:
-                tail_k = -nums[i + 1]
-                i += 2
-            else:
-                i += 1
-            match = index.get(n)
-            if match is None:
-                print(f"{_C_YELLOW}[bg #{n} not found]{_C_RESET}")
-                continue
-            self._print_bg_detail(match[0], match[1], tail_k)
+        Detail view moved to the unified `/show b<N>` command; classify()
+        rejects any args here with a redirect message, so payload is
+        always empty at this point (kept as a param for dispatch-table
+        uniformity). See `show_detail` for the detail renderer."""
+        self._print_bg_summary(self._bg_entry_index())
 
     def _print_bg_summary(self, index: dict[int, tuple[str, dict[str, Any]]]) -> None:
         now = time.monotonic()
@@ -5134,7 +5272,7 @@ class Orchestrator:
             f"{_C_BOLD}Background tasks{_C_RESET} ({len(index)}): "
             f"{_C_YELLOW}{running} running{_C_RESET}, "
             f"{_C_GREEN}{done} completed{_C_RESET}  "
-            f"{_C_DIM}/bg N for detail, /bg N K to tail K lines{_C_RESET}"
+            f"{_C_DIM}/show bN for detail, /show bN -tail K for last K output lines{_C_RESET}"
         )
         for seq in sorted(index):
             tid, info = index[seq]
@@ -5149,9 +5287,9 @@ class Orchestrator:
                 dur = ended - started
                 st = info.get("status") or "completed"
                 marker = {
-                    "completed": f"{_C_GREEN}✓{_C_RESET}",
-                    "failed": f"{_C_RED}✗{_C_RESET}",
-                    "stopped": f"{_C_YELLOW}⏹{_C_RESET}",
+                    "completed": f"{_C_GREEN}{_mark('check')}{_C_RESET}",
+                    "failed": f"{_C_RED}{_mark('failed')}{_C_RESET}",
+                    "stopped": f"{_C_YELLOW}{_mark('stopped')}{_C_RESET}",
                 }.get(st, f"{_C_DIM}[{st}]{_C_RESET}")
                 status = f"{marker} {_C_DIM}{_fmt_duration(dur)}{_C_RESET}"
             carry = f" {_C_DIM}(carryover){_C_RESET}" if info.get("carryover") else ""
@@ -5300,7 +5438,7 @@ class Orchestrator:
                         f"  {_C_BLUE}[{tu_id[:8]}]{_C_RESET}{seq_tag} WebFetch  "
                         f"{_C_DIM}-- {_fmt_duration(elapsed)}{_C_RESET}"
                     )
-                    print(f"    {_C_CYAN}→{_C_RESET} {url}")
+                    print(f"    {_C_CYAN}{_mark('arrow_result')}{_C_RESET} {url}")
                     prompt_str = inp.get("prompt", "")
                     if prompt_str:
                         print(f"    {_C_DIM}{prompt_str}{_C_RESET}")
@@ -5811,15 +5949,26 @@ class Orchestrator:
                     if isinstance(block, ToolResultBlock):
                         # Match in-turn behavior: only Bash results print inline.
                         tool_name = None
+                        tool_input: dict[str, Any] = {}
                         for h in reversed(self.state.tool_history):
                             if h["tool_use_id"] == block.tool_use_id:
                                 tool_name = h.get("name")
+                                tool_input = h.get("input") or {}
                                 break
+                        # Skip background-Bash "results" — see the matching
+                        # branch inside run_turn for the reasoning.
+                        is_bg_bash = (
+                            tool_name == "Bash"
+                            and bool(tool_input.get("run_in_background"))
+                        )
                         _show_tasks = getattr(self.args, "show_tasks", "compact")
                         if (
-                            tool_name == "Bash"
-                            or self.args.inline_all_tools
-                            or _show_tasks != "off"
+                            not is_bg_bash
+                            and (
+                                tool_name == "Bash"
+                                or self.args.inline_all_tools
+                                or _show_tasks != "off"
+                            )
                         ):
                             _render_tool_result(
                                 summarize_tool_result(block),
@@ -5828,6 +5977,7 @@ class Orchestrator:
                                     self.args.show_tool_output
                                     or _show_tasks == "full+output"
                                 ),
+                                tool_name=tool_name,
                             )
         elif isinstance(msg, ResultMessage):
             # Stray ResultMessage outside a turn (rare). Capture session id.
@@ -6045,22 +6195,19 @@ class Orchestrator:
                                     "started_at": time.time(),
                                 }
                             )
+                            _k_prefix = _call_seq_prefix(seq, letter="k")
                             if self.args.show_thinking:
                                 print(
-                                    f"{_C_DIM}[#{seq} -- "
-                                    f"{_cmd_hint(f'/think {seq}')}"
-                                    f"{_C_DIM}]{_C_RESET}  "
+                                    f"{_k_prefix} "
                                     f"{_C_CYAN}(thinking){_C_RESET}  "
                                     f"{_C_DIM}{full_text.strip()}{_C_RESET}"
                                 )
                             else:
-                                # No snippet in the compact form — leave it to
-                                # /think N to fetch the full text, same way
-                                # Bash gets its command body via /show N.
+                                # No snippet in the compact form — leave it
+                                # to `/show k{seq}` to fetch the full text,
+                                # same way Bash's body lives behind /show t{seq}.
                                 print(
-                                    f"{_C_DIM}[#{seq} -- "
-                                    f"{_cmd_hint(f'/think {seq}')}"
-                                    f"{_C_DIM}]{_C_RESET}  "
+                                    f"{_k_prefix} "
                                     f"{_C_CYAN}(thinking){_C_RESET}"
                                 )
                     # End-of-AssistantMessage: flush a newline if we left
@@ -6151,6 +6298,7 @@ class Orchestrator:
                                         self.state.background_tasks.pop(tid, None)
                                 seq = active.get("seq") if active else None
                                 tool_name = active.get("name") if active else None
+                                tool_input = (active or {}).get("input") or {}
                                 text = summarize_tool_result(block)
                                 is_err = bool(block.is_error)
                                 # Update history.
@@ -6160,14 +6308,29 @@ class Orchestrator:
                                         h["is_error"] = is_err
                                         h["ended_at"] = time.monotonic()
                                         break
+                                # Background-Bash "result" is just the CLI's
+                                # launch ack (no stdout yet, it's still running)
+                                # — meaningless to render. The real output
+                                # shows up later via `/bg N -tail K` or the
+                                # task_notification completion message. Skip
+                                # the ack line entirely so the bg-task start
+                                # notice isn't paired with a misleading
+                                # "→ 1 line, 217 chars" ghost.
+                                is_bg_bash = (
+                                    tool_name == "Bash"
+                                    and bool(tool_input.get("run_in_background"))
+                                )
                                 # Match the tool-use side: Bash always prints
                                 # inline; others only with --inline-all-tools
                                 # or --show-tasks.
                                 _show_tasks = getattr(self.args, "show_tasks", "compact")
                                 if (
-                                    tool_name == "Bash"
-                                    or self.args.inline_all_tools
-                                    or _show_tasks != "off"
+                                    not is_bg_bash
+                                    and (
+                                        tool_name == "Bash"
+                                        or self.args.inline_all_tools
+                                        or _show_tasks != "off"
+                                    )
                                 ):
                                     _render_tool_result(
                                         text,
@@ -6177,6 +6340,7 @@ class Orchestrator:
                                             or _show_tasks == "full+output"
                                         ),
                                         seq=seq,
+                                        tool_name=tool_name,
                                     )
                     elif isinstance(content, str) and content.strip():
                         # System-injected user messages — e.g. background-shell
@@ -6269,8 +6433,7 @@ class Orchestrator:
         "tools":            "show_tools",
         "tasks":            "show_tasks",
         "bg":               "show_bg_tasks",
-        "show":             "show_tool_detail",
-        "think":            "show_thinking_detail",
+        "show":             "show_detail",
         "autocompact":      "set_autocompact",
         "max-context":      "set_max_context",
         "continue-prompt":  "set_continue_prompt",
@@ -6498,9 +6661,7 @@ class Orchestrator:
             elif kind == "bg":
                 self.show_bg_tasks(payload)
             elif kind == "show":
-                self.show_tool_detail(payload)
-            elif kind == "think":
-                self.show_thinking_detail(payload)
+                self.show_detail(payload)
             elif kind == "btw":
                 await self.ask_btw(payload)
             elif kind == "autocompact":
@@ -6606,9 +6767,7 @@ class Orchestrator:
             elif kind == "bg":
                 self.show_bg_tasks(payload)
             elif kind == "show":
-                self.show_tool_detail(payload)
-            elif kind == "think":
-                self.show_thinking_detail(payload)
+                self.show_detail(payload)
             elif kind == "btw":
                 await self.ask_btw(payload)
             elif kind == "autocompact":
@@ -6887,12 +7046,13 @@ class Orchestrator:
         # helpful message instead of hanging or cryptic-erroring.
         ok, reason = _check_authentication()
         if not ok:
+            b = _mark("unknown")
             print(
                 f"{_C_RED}[auth error] {reason}{_C_RESET}\n"
                 f"{_C_YELLOW}To authenticate, either:\n"
-                f"  • Run `claude login` in a terminal (subscription users), or\n"
-                f"  • Set ANTHROPIC_API_KEY in the environment (API users), or\n"
-                f"  • Set CLAUDE_CODE_USE_BEDROCK or CLAUDE_CODE_USE_VERTEX "
+                f"  {b} Run `claude login` in a terminal (subscription users), or\n"
+                f"  {b} Set ANTHROPIC_API_KEY in the environment (API users), or\n"
+                f"  {b} Set CLAUDE_CODE_USE_BEDROCK or CLAUDE_CODE_USE_VERTEX "
                 f"(enterprise cloud)\n"
                 f"Then start the orchestrator again.{_C_RESET}"
             )
@@ -7388,6 +7548,15 @@ def parse_args() -> argparse.Namespace:
         "/show N for detail. --inline-all-tools overrides this to 'full'.",
     )
     ap.add_argument(
+        "--ascii-only",
+        action="store_true",
+        help="Render status markers as ASCII (>, v, x, -) instead of "
+        "Unicode (▶, ✓, ✗, ⏹, →). Useful for terminals/fonts that don't "
+        "render the BMP glyphs cleanly (ancient Windows console, some "
+        "minimal tmux-in-screen setups, piping scrollback to files "
+        "consumed by non-UTF-8 readers). Default: Unicode.",
+    )
+    ap.add_argument(
         "--bell-on",
         default="waiting,done,stalled,api-stall,requires-action,rate-hit,rate-reset",
         metavar="EVENTS",
@@ -7460,6 +7629,10 @@ def parse_args() -> argparse.Namespace:
 
 async def _amain() -> None:
     args = parse_args()
+    # Flip the module-level marker-style flag before anything renders.
+    # Default is Unicode; --ascii-only switches to ASCII equivalents.
+    global _USE_UNICODE_MARKERS
+    _USE_UNICODE_MARKERS = not args.ascii_only
     orch = Orchestrator(args)
     with patch_stdout(raw=True):
         await orch.run()
