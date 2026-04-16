@@ -3483,7 +3483,7 @@ def _panel_tools(state: "State") -> str:
 
 def _panel_bg(state: "State") -> str:
     bg = state.background_tasks
-    return f"bg: <b>{len(bg)}</b>" if bg else "bg: -"
+    return f"bg: {len(bg)}" if bg else "bg: -"
 
 
 def _panel_todos(state: "State") -> str:
