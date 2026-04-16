@@ -108,6 +108,183 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 
+#
+# ANSI colour scheme for scrollback output.
+#
+# Default values use 256-color 244 for dim-gray because on Windows
+# Terminal with `intenseTextStyle=bright` (the default), bold + 8-color
+# bright (90-97) is a visual no-op. 256-color indices sidestep that.
+#
+# Users can override any of these by creating a file at
+# `~/.claude/orchestrator-colors.conf` (or $CLAUDE_CONFIG_DIR + "/"
+# "orchestrator-colors.conf") with one `NAME=ANSI_PARAMS` per line:
+#
+#   # One line per colour; NAME is from the list below.
+#   # ANSI_PARAMS is the text between `\033[` and `m`.
+#   DIM=38;5;244
+#   DIM_BOLD=1;38;5;244
+#   RED=31
+#
+# Unknown names are ignored; missing names fall back to the defaults.
+# A file with defaults is auto-created on first run if absent.
+#
+# Each entry: dict with keys {"fg", "bg", "bold"}.
+#   fg / bg are SGR param strings (e.g. "31", "38;5;244") or None (unset).
+#   bold is a boolean flag.
+# Config file format mirrors this: `NAME=fg=PARAMS bg=PARAMS bold` with
+# any subset of the three parts (space-separated, any order).
+_ColorSpec = dict[str, "str | bool | None"]
+_DEFAULT_COLORS: dict[str, _ColorSpec] = {
+    # RESET uses SGR "0" as an fg param (by convention — SGR 0 clears all attrs).
+    "RESET":       {"fg": "0",        "bg": None, "bold": False},
+    "DIM":         {"fg": "38;5;244", "bg": None, "bold": False},  # scrollback "surroundings"
+    "DIM_BOLD":    {"fg": "38;5;244", "bg": None, "bold": True},   # /show N [-tail N] hints
+    "RED":         {"fg": "31",       "bg": None, "bold": False},
+    "BOLD_RED":    {"fg": "31",       "bg": None, "bold": True},
+    "GREEN":       {"fg": "32",       "bg": None, "bold": False},
+    "YELLOW":      {"fg": "33",       "bg": None, "bold": False},
+    "BLUE":        {"fg": "34",       "bg": None, "bold": False},
+    "BOLD_BLUE":   {"fg": "34",       "bg": None, "bold": True},   # tool name colour
+    "MAGENTA":     {"fg": "35",       "bg": None, "bold": False},
+    "CYAN":        {"fg": "36",       "bg": None, "bold": False},
+    "BRIGHT_CYAN": {"fg": "96",       "bg": None, "bold": False},
+    "BOLD":        {"fg": None,       "bg": None, "bold": True},
+}
+
+
+def _spec_to_sgr(spec: _ColorSpec) -> str:
+    """Render a color-spec dict to an ANSI SGR escape sequence like
+    `\\033[1;38;5;244m`. Empty spec → empty string."""
+    parts: list[str] = []
+    if spec.get("bold"):
+        parts.append("1")
+    fg = spec.get("fg")
+    if fg:
+        parts.append(str(fg))
+    bg = spec.get("bg")
+    if bg:
+        parts.append(str(bg))
+    if not parts:
+        return ""
+    return f"\033[{';'.join(parts)}m"
+
+
+def _colors_config_path() -> "Path":
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(base if base else Path.home() / ".claude") / "orchestrator-colors.conf"
+
+
+def _parse_color_spec(rhs: str) -> _ColorSpec:
+    """Parse the right-hand side of a `NAME=...` config line.
+    Accepts any combination of `fg=PARAMS`, `bg=PARAMS`, and `bold`
+    tokens separated by whitespace; order doesn't matter. Unknown
+    tokens are ignored. Returns a dict with keys fg/bg/bold."""
+    spec: _ColorSpec = {"fg": None, "bg": None, "bold": False}
+    for tok in rhs.split():
+        tok_lower = tok.lower()
+        if tok_lower == "bold":
+            spec["bold"] = True
+        elif tok_lower.startswith("fg="):
+            v = tok[3:].strip()
+            spec["fg"] = v if v else None
+        elif tok_lower.startswith("bg="):
+            v = tok[3:].strip()
+            spec["bg"] = v if v else None
+        # Unknown tokens silently ignored.
+    return spec
+
+
+def _format_color_spec(spec: _ColorSpec) -> str:
+    """Inverse of _parse_color_spec: render to the config-file token form."""
+    parts: list[str] = []
+    fg = spec.get("fg")
+    if fg:
+        parts.append(f"fg={fg}")
+    bg = spec.get("bg")
+    if bg:
+        parts.append(f"bg={bg}")
+    if spec.get("bold"):
+        parts.append("bold")
+    return " ".join(parts)
+
+
+def _load_colors_config() -> dict[str, _ColorSpec]:
+    """Parse the user's colour overrides file. Returns {NAME: spec}
+    for any recognised names; unknown/invalid lines are dropped. Missing
+    or unreadable file → empty dict (caller falls back to defaults)."""
+    path = _colors_config_path()
+    out: dict[str, _ColorSpec] = {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip().upper()
+                if key in _DEFAULT_COLORS:
+                    out[key] = _parse_color_spec(val)
+    except OSError:
+        pass
+    return out
+
+
+def _maybe_write_default_colors_config() -> None:
+    """If the config file doesn't exist, write one populated with the
+    current defaults so the user can discover and edit it."""
+    path = _colors_config_path()
+    if path.exists():
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            "# Orchestrator colour scheme.",
+            "# Format: NAME=[fg=PARAMS] [bg=PARAMS] [bold]",
+            "#   fg=PARAMS - foreground SGR params (e.g. 31, 38;5;244)",
+            "#   bg=PARAMS - background SGR params (e.g. 41, 48;5;235)",
+            "#   bold      - adds the bold attribute",
+            "# All three fields are OPTIONAL. Omit bg= and the terminal's",
+            "# default background shows through (same for toolbar context).",
+            "# Whitespace-separated in any order. Lines starting with # are",
+            "# ignored. Unknown NAMEs are ignored; missing NAMEs fall back",
+            "# to internal defaults.",
+            "#",
+            "# Examples:",
+            "#   RED=fg=31                     -> \\033[31m",
+            "#   BOLD_RED=fg=31 bold           -> \\033[1;31m",
+            "#   DIM=fg=38;5;244               -> \\033[38;5;244m  (256-color gray)",
+            "#   HIGHLIGHT=fg=37 bg=41 bold    -> \\033[1;37;41m   (bold white on red)",
+            "#   BG_ONLY=bg=44                 -> \\033[44m        (blue background)",
+            "",
+        ]
+        for name, spec in _DEFAULT_COLORS.items():
+            lines.append(f"{name}={_format_color_spec(spec)}")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+# Build the effective colour table: defaults merged with overrides.
+# Writes a default config file on first run (if one doesn't exist).
+_maybe_write_default_colors_config()
+_COLORS: dict[str, _ColorSpec] = {**_DEFAULT_COLORS, **_load_colors_config()}
+
+_C_RESET       = _spec_to_sgr(_COLORS["RESET"])
+_C_DIM         = _spec_to_sgr(_COLORS["DIM"])
+_C_DIM_BOLD    = _spec_to_sgr(_COLORS["DIM_BOLD"])
+_C_RED         = _spec_to_sgr(_COLORS["RED"])
+_C_BOLD_RED    = _spec_to_sgr(_COLORS["BOLD_RED"])
+_C_GREEN       = _spec_to_sgr(_COLORS["GREEN"])
+_C_YELLOW      = _spec_to_sgr(_COLORS["YELLOW"])
+_C_BLUE        = _spec_to_sgr(_COLORS["BLUE"])
+_C_BOLD_BLUE   = _spec_to_sgr(_COLORS["BOLD_BLUE"])
+_C_MAGENTA     = _spec_to_sgr(_COLORS["MAGENTA"])
+_C_CYAN        = _spec_to_sgr(_COLORS["CYAN"])
+_C_BRIGHT_CYAN = _spec_to_sgr(_COLORS["BRIGHT_CYAN"])
+_C_BOLD        = _spec_to_sgr(_COLORS["BOLD"])
+
 EFFORT_LEVELS = ("low", "medium", "high", "max")
 # "auto" is not a real API value; it means "don't pass effort, let the model
 # pick its default" (which is typically 'high' for Opus/Sonnet 4.6).
@@ -127,8 +304,8 @@ def _bg_waiting_msg(n: int) -> str:
     """Standard status line for when a turn has ended but background
     tasks are still running. Used regardless of auto-continue mode."""
     return (
-        f"\033[90m[bg tasks running ({n}); "
-        f"will wake on bg completion or your input]\033[0m"
+        f"{_C_DIM}[bg tasks running ({n}); "
+        f"will wake on bg completion or your input]{_C_RESET}"
     )
 
 DEFAULT_COMPACT_THRESHOLD = 160_000
@@ -137,12 +314,11 @@ DEFAULT_COMPACT_THRESHOLD_1M = 950_000
 
 
 def _cmd_hint(text: str) -> str:
-    """Render an inline slash-command hint (e.g. /show 17 [-tail N])
-    in the same dim gray as the surrounding bracket text. No bold —
-    it's a no-op on Windows Terminal with default intenseTextStyle,
-    and matching the surrounding color looked cleaner than using a
-    distinct 256-color shade."""
-    return f"\033[90m{text}\033[0m"
+    """Render an inline slash-command hint (e.g. /show 17 [-tail N]).
+    Bold + the shared `_C_DIM` gray. The surrounding `[#N --` / `]`
+    also uses `_C_DIM`, so colour matches exactly and the hint is
+    distinguished only by its bold weight."""
+    return f"{_C_RESET}{_C_DIM_BOLD}{text}{_C_RESET}"
 
 
 # Valid event names for --bell-on / /bell. Frozenset so typos don't silently
@@ -746,7 +922,7 @@ def _print_one_line_tool(
         print(header + params_colored)
         return
     tail = plain_stripped[-keep:]
-    print(f"{header} \033[90m...{tail}\033[0m")
+    print(f"{header} {_C_DIM}...{tail}{_C_RESET}")
 
 
 def _truncate_left(s: str, budget: int) -> str:
@@ -773,7 +949,7 @@ def _print_path_tool(
     gap_w = 1 + (1 if suffix else 0)
     path_budget = max(4, term_w - prefix_w - suffix_w - gap_w)
     path_display = _truncate_left(path, path_budget)
-    line = f"{prefix} \033[90m{path_display}\033[0m"
+    line = f"{prefix} {_C_DIM}{path_display}{_C_RESET}"
     if suffix:
         line += f" {suffix}"
     print(line)
@@ -790,19 +966,19 @@ def _print_unified_diff(old: str, new: str, *, indent: str = "    ", max_lines: 
     # Drop the first two header lines (--- / +++) since we print the file path separately.
     body = [ln for ln in lines if not ln.startswith("---") and not ln.startswith("+++")]
     if not body:
-        print(f"{indent}\033[90m(no textual change)\033[0m")
+        print(f"{indent}{_C_DIM}(no textual change){_C_RESET}")
         return
     for ln in body[:max_lines]:
         if ln.startswith("+"):
-            print(f"{indent}\033[32m{ln}\033[0m")
+            print(f"{indent}{_C_GREEN}{ln}{_C_RESET}")
         elif ln.startswith("-"):
-            print(f"{indent}\033[31m{ln}\033[0m")
+            print(f"{indent}{_C_RED}{ln}{_C_RESET}")
         elif ln.startswith("@@"):
-            print(f"{indent}\033[36m{ln}\033[0m")
+            print(f"{indent}{_C_CYAN}{ln}{_C_RESET}")
         else:
             print(f"{indent}{ln}")
     if len(body) > max_lines:
-        print(f"{indent}\033[90m... [+{len(body) - max_lines} more diff lines]\033[0m")
+        print(f"{indent}{_C_DIM}... [+{len(body) - max_lines} more diff lines]{_C_RESET}")
 
 
 def _msg_fields(msg: Any) -> dict[str, Any]:
@@ -829,24 +1005,24 @@ def render_unknown_message(msg: Any, state: "State | None" = None) -> None:
         if state is not None:
             _apply_rate_limit_info(state, info)
         color = (
-            "\033[31m"
+            _C_RED
             if status == "rejected"
-            else "\033[33m"
+            else _C_YELLOW
             if status == "allowed_warning"
-            else "\033[90m"
+            else _C_DIM
         )
         bits = [f"status={status}"]
         if isinstance(util, (int, float)):
             bits.append(f"{util * 100:.0f}% used")
         if rl_type:
             bits.append(str(rl_type))
-        print(f"{color}[rate-limit: {' · '.join(bits)}]\033[0m")
+        print(f"{color}[rate-limit: {' · '.join(bits)}]{_C_RESET}")
         return
     # tool_progress: { type: 'tool_progress', tool_name, elapsed_time_seconds, ... }
     tool_name = getattr(msg, "tool_name", None)
     elapsed = getattr(msg, "elapsed_time_seconds", None)
     if tool_name and isinstance(elapsed, (int, float)):
-        print(f"\033[33m  [... {tool_name} running for {_fmt_duration(elapsed)}]\033[0m")
+        print(f"{_C_YELLOW}  [... {tool_name} running for {_fmt_duration(elapsed)}]{_C_RESET}")
         return
     # partial assistant message (streaming chunk) — suppress to avoid duplicate text
     raw_type = getattr(msg, "type", None)
@@ -860,21 +1036,21 @@ def render_unknown_message(msg: Any, state: "State | None" = None) -> None:
         or getattr(msg, "content", None)
     )
     if isinstance(hint, str) and hint.strip():
-        print(f"\033[35m[{cls_name}] {hint.strip()}\033[0m")
+        print(f"{_C_MAGENTA}[{cls_name}] {hint.strip()}{_C_RESET}")
         return
     attrs = (
         {k: v for k, v in vars(msg).items() if not k.startswith("_")}
         if hasattr(msg, "__dict__")
         else {}
     )
-    print(f"\033[35m[{cls_name}] {brief_args(attrs)}\033[0m")
+    print(f"{_C_MAGENTA}[{cls_name}] {brief_args(attrs)}{_C_RESET}")
 
 
 _BG_STATUS_COLORS = {
-    "completed": "\033[32m",
-    "failed": "\033[31m",
-    "stopped": "\033[33m",
-    "cancelled": "\033[33m",
+    "completed": _C_GREEN,
+    "failed": _C_RED,
+    "stopped": _C_YELLOW,
+    "cancelled": _C_YELLOW,
 }
 _BG_STATUS_MARKERS = {
     "completed": "✓",
@@ -935,7 +1111,7 @@ def _emit_bg_completion(
             turn_entry["output_file"] = out_file
         if usage is not None:
             turn_entry["usage"] = usage
-    color = _BG_STATUS_COLORS.get(status, "\033[35m")
+    color = _BG_STATUS_COLORS.get(status, _C_MAGENTA)
     marker = _BG_STATUS_MARKERS.get(status, "•")
     seq_tag = (
         f"[#{seq} -- {_cmd_hint(f'/bg {seq} [-tail N]')}] "
@@ -957,19 +1133,19 @@ def _emit_bg_completion(
                     lines = orig_cmd.splitlines() or [orig_cmd]
                     base = (
                         f"{color}[bg {marker} {seq_tag}{task_id} -- "
-                        f"{status}]\033[0m {label}"
+                        f"{status}]{_C_RESET} {label}"
                     )
                     if len(lines) <= 1:
-                        trial = f"{base}  \033[96m`{orig_cmd}`\033[0m"
+                        trial = f"{base}  {_C_BRIGHT_CYAN}`{orig_cmd}`{_C_RESET}"
                         if _visible_len(trial) <= _term_width():
-                            cmd_suffix = f"  \033[96m`{orig_cmd}`\033[0m"
+                            cmd_suffix = f"  {_C_BRIGHT_CYAN}`{orig_cmd}`{_C_RESET}"
                     if not cmd_suffix:
                         cmd_suffix = (
-                            f"  \033[90m({_cmd_size_hint(orig_cmd)})\033[0m"
+                            f"  {_C_DIM}({_cmd_size_hint(orig_cmd)}){_C_RESET}"
                         )
                 break
     print(
-        f"{color}[bg {marker} {seq_tag}{task_id} -- {status}]\033[0m "
+        f"{color}[bg {marker} {seq_tag}{task_id} -- {status}]{_C_RESET} "
         f"{label}{cmd_suffix}"
     )
     # Per-task ring (opt-in via bell-on bg-done).
@@ -979,7 +1155,7 @@ def _emit_bg_completion(
     if not state.background_tasks:
         _fire_pending_bell(state)
     if out_file:
-        print(f"    \033[90moutput: {out_file}\033[0m")
+        print(f"    {_C_DIM}output: {out_file}{_C_RESET}")
     if usage:
         dur = usage.get("duration_ms")
         dur_s = (
@@ -988,8 +1164,8 @@ def _emit_bg_completion(
             else ""
         )
         print(
-            f"    \033[90musage: {usage.get('total_tokens', '?')} tok, "
-            f"{usage.get('tool_uses', '?')} tool uses{dur_s}\033[0m"
+            f"    {_C_DIM}usage: {usage.get('total_tokens', '?')} tok, "
+            f"{usage.get('tool_uses', '?')} tool uses{dur_s}{_C_RESET}"
         )
     return True
 
@@ -1014,12 +1190,12 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
         if first or old_sid != new_sid:
             short_new = new_sid[:12]
             if old_sid is None or (first and old_sid == new_sid):
-                print(f"\033[90m[init] session {short_new}\033[0m")
+                print(f"{_C_DIM}[init] session {short_new}{_C_RESET}")
             else:
                 short_old = old_sid[:12]
                 print(
-                    f"\033[33m[init] SDK forked: expected {short_old}, "
-                    f"got {short_new} (context was carried over)\033[0m"
+                    f"{_C_YELLOW}[init] SDK forked: expected {short_old}, "
+                    f"got {short_new} (context was carried over){_C_RESET}"
                 )
         # First check disk for this (possibly fresh) session id.
         disk_title = _read_session_title(new_sid)
@@ -1056,7 +1232,7 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
         # cumulative I/O. The compact turn's own ResultMessage will be
         # suppressed from overwriting this (see ResultMessage handling).
         state.context_tokens = 0
-        print(f"\033[35m[compacted -- {trigger} -- was ~{pre} tok]\033[0m")
+        print(f"{_C_MAGENTA}[compacted -- {trigger} -- was ~{pre} tok]{_C_RESET}")
         return
 
     if sub == "api_retry":
@@ -1072,8 +1248,8 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
         # rate-limit errors (which aren't symptoms of real service issues)
         # before counting toward the stall heuristic.
         print(
-            f"\033[33m[api retry {attempt}/{max_r} in {delay_ms}ms "
-            f"status={status} {err_txt}]\033[0m"
+            f"{_C_YELLOW}[api retry {attempt}/{max_r} in {delay_ms}ms "
+            f"status={status} {err_txt}]{_C_RESET}"
         )
         return
 
@@ -1082,7 +1258,7 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
         status = info.get("status") if isinstance(info, dict) else None
         util = info.get("utilization") if isinstance(info, dict) else None
         _apply_rate_limit_info(state, info)
-        print(f"\033[33m[rate-limit status={status} util={util}]\033[0m")
+        print(f"{_C_YELLOW}[rate-limit status={status} util={util}]{_C_RESET}")
         return
 
     if sub == "task_notification":
@@ -1138,7 +1314,7 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
         # Other task types (Task subagents, etc.) still get the print.
         if task_type != "local_bash":
             print(
-                f"\033[35m[bg-task {task_id} started -- {task_type}]\033[0m {name}"
+                f"{_C_MAGENTA}[bg-task {task_id} started -- {task_type}]{_C_RESET} {name}"
             )
         return
 
@@ -1148,7 +1324,7 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
     if sub == "hook_started":
         name = d.get("hook_name", "?")
         evt = d.get("hook_event", "?")
-        print(f"\033[35m[hook {name} on {evt}]\033[0m")
+        print(f"{_C_MAGENTA}[hook {name} on {evt}]{_C_RESET}")
         return
 
     if sub == "hook_response":
@@ -1156,14 +1332,14 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
         outcome = d.get("outcome", "?")
         exit_code = d.get("exit_code")
         stderr = (d.get("stderr") or "").strip()
-        tag = {"success": "\033[32m", "error": "\033[31m", "cancelled": "\033[33m"}.get(
-            outcome, "\033[35m"
+        tag = {"success": _C_GREEN, "error": _C_RED, "cancelled": _C_YELLOW}.get(
+            outcome, _C_MAGENTA
         )
         suffix = f" exit={exit_code}" if exit_code is not None else ""
-        print(f"{tag}[hook {name} -- {outcome}{suffix}]\033[0m")
+        print(f"{tag}[hook {name} -- {outcome}{suffix}]{_C_RESET}")
         if stderr and outcome != "success":
             for ln in stderr.splitlines()[:5]:
-                print(f"    \033[31m{ln}\033[0m")
+                print(f"    {_C_RED}{ln}{_C_RESET}")
         return
 
     if sub == "hook_progress":
@@ -1172,35 +1348,35 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
     if sub == "local_command_output":
         content = (d.get("content") or "").strip()
         if content:
-            print(f"\033[36m[local cmd]\033[0m {content}")
+            print(f"{_C_CYAN}[local cmd]{_C_RESET} {content}")
         return
 
     if sub == "status":
         perm = d.get("permissionMode")
         status_payload = d.get("status") or {}
         if perm:
-            print(f"\033[90m[status perm={perm}]\033[0m")
+            print(f"{_C_DIM}[status perm={perm}]{_C_RESET}")
         elif isinstance(status_payload, dict) and status_payload:
-            print(f"\033[90m[status] {brief_args(status_payload)}\033[0m")
+            print(f"{_C_DIM}[status] {brief_args(status_payload)}{_C_RESET}")
         return
 
     if sub == "session_state_changed":
         state_val = d.get("state")
         if state_val == "requires_action":
             _ring_bell(state, "requires-action")
-            print("\033[33m[session requires action]\033[0m")
+            print(f"{_C_YELLOW}[session requires action]{_C_RESET}")
         # 'idle' and 'running' are too chatty; skip
         return
 
     if sub == "auth_status":
-        print(f"\033[90m[auth] {brief_args(d)}\033[0m")
+        print(f"{_C_DIM}[auth] {brief_args(d)}{_C_RESET}")
         return
 
     if sub in ("files_persisted", "files_persisted_event"):
         succeeded = d.get("succeeded") or []
         failed = d.get("failed") or []
         print(
-            f"\033[90m[files persisted: {len(succeeded)} ok, {len(failed)} failed]\033[0m"
+            f"{_C_DIM}[files persisted: {len(succeeded)} ok, {len(failed)} failed]{_C_RESET}"
         )
         return
 
@@ -1220,7 +1396,7 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
         return
 
     # Unknown subtype — surface it so nothing is silently dropped.
-    print(f"\033[35m[system/{sub}] {brief_args(d)}\033[0m")
+    print(f"{_C_MAGENTA}[system/{sub}] {brief_args(d)}{_C_RESET}")
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -1303,9 +1479,11 @@ def _task_summary_line(name: str, inp: dict[str, Any]) -> str:
     return ""
 
 
-_DIM = "\033[90m"  # tool-parameter color (dark gray / dim)
-_RST = "\033[0m"
-_TNAME = "\033[1;34m"  # tool-name color (bold blue)
+# Aliases for `_format_tool_header` readability — bound to the module
+# colour constants so everything uses the same shades.
+_DIM = _C_DIM
+_RST = _C_RESET
+_TNAME = _C_BOLD_BLUE
 
 
 def _format_tool_header(name: str, inp: dict[str, Any]) -> str:
@@ -1323,8 +1501,8 @@ def _format_tool_header(name: str, inp: dict[str, Any]) -> str:
         tag = f"Edit ({ra})" if ra else "Edit"
         return (
             f"{_TNAME}{tag}{_RST} {_DIM}{path}  "
-            f"(\033[32m+{added}{_RST}{_DIM} "
-            f"\033[31m-{removed}{_RST}{_DIM} lines){_RST}"
+            f"({_C_GREEN}+{added}{_RST}{_DIM} "
+            f"{_C_RED}-{removed}{_RST}{_DIM} lines){_RST}"
         )
     if name == "Write":
         path = inp.get("file_path", "?")
@@ -1421,9 +1599,9 @@ def render_tool_use(
     # letter prefix needed.
     if seq is not None:
         seq_prefix = (
-            f"\033[90m[#{seq} -- "
+            f"{_C_DIM}[#{seq} -- "
             f"{_cmd_hint(f'/show {seq} [-tail N]')}"
-            f"\033[90m]\033[0m "
+            f"{_C_DIM}]{_C_RESET} "
         )
     else:
         seq_prefix = ""
@@ -1436,11 +1614,11 @@ def render_tool_use(
         new = inp.get("new_string", "") or ""
         removed = len(old.splitlines()) or (1 if old else 0)
         added = len(new.splitlines()) or (1 if new else 0)
-        header = f"{seq_prefix}\033[1;34m{tag}\033[0m"
+        header = f"{seq_prefix}{_C_BOLD_BLUE}{tag}{_C_RESET}"
         if effective_edits == "compact":
             suffix = (
-                f"\033[90m(\033[32m+{added}\033[0m "
-                f"\033[31m-{removed}\033[0m\033[90m lines)\033[0m"
+                f"{_C_DIM}({_C_GREEN}+{added}{_C_RESET} "
+                f"{_C_RED}-{removed}{_C_RESET}{_C_DIM} lines){_C_RESET}"
             )
             _print_path_tool(header, path, suffix)
         else:
@@ -1450,9 +1628,9 @@ def render_tool_use(
         path = inp.get("file_path", "?")
         content = inp.get("content", "") or ""
         line_count = len(content.splitlines())
-        suffix = f"\033[90m({line_count} lines, {len(content)} chars)\033[0m"
+        suffix = f"{_C_DIM}({line_count} lines, {len(content)} chars){_C_RESET}"
         _print_path_tool(
-            f"{seq_prefix}\033[1;34mWrite\033[0m",
+            f"{seq_prefix}{_C_BOLD_BLUE}Write{_C_RESET}",
             path,
             suffix,
         )
@@ -1460,31 +1638,31 @@ def render_tool_use(
         if show_tasks != "compact":
             preview = content.splitlines()[:10]
             for ln in preview:
-                print(f"    \033[32m+{ln}\033[0m")
+                print(f"    {_C_GREEN}+{ln}{_C_RESET}")
             if line_count > 10:
-                print(f"    \033[90m... [+{line_count - 10} more lines]\033[0m")
+                print(f"    {_C_DIM}... [+{line_count - 10} more lines]{_C_RESET}")
     elif name == "NotebookEdit":
         path = inp.get("notebook_path", "?")
         cell_id = inp.get("cell_id", "")
         mode = inp.get("edit_mode", "replace")
-        suffix = f"\033[90mcell={cell_id} mode={mode}\033[0m"
+        suffix = f"{_C_DIM}cell={cell_id} mode={mode}{_C_RESET}"
         _print_path_tool(
-            f"{seq_prefix}\033[1;34mNotebookEdit\033[0m",
+            f"{seq_prefix}{_C_BOLD_BLUE}NotebookEdit{_C_RESET}",
             path,
             suffix,
         )
         if show_tasks != "compact":
             src = inp.get("new_source", "") or ""
             for ln in src.splitlines()[:12]:
-                print(f"    \033[32m+{ln}\033[0m")
+                print(f"    {_C_GREEN}+{ln}{_C_RESET}")
     elif name == "Bash":
         cmd = inp.get("command", "") or ""
         bg = bool(inp.get("run_in_background"))
         desc = inp.get("description", "")
         tag = "Bash (background)" if bg else "Bash"
-        base = f"{seq_prefix}\033[1;34m{tag}\033[0m"
+        base = f"{seq_prefix}{_C_BOLD_BLUE}{tag}{_C_RESET}"
         if desc:
-            base += f" \033[90m— {desc}\033[0m"
+            base += f" {_C_DIM}— {desc}{_C_RESET}"
         stripped = cmd.strip()
         cmd_lines = cmd.splitlines() or ([cmd] if cmd else [])
         if show_full_commands:
@@ -1493,7 +1671,7 @@ def render_tool_use(
             # the header line. Body lines align under each other.
             print(base)
             for ln in cmd_lines or [cmd]:
-                print(f"    \033[36m$\033[0m {ln}")
+                print(f"    {_C_CYAN}${_C_RESET} {ln}")
         else:
             # Compact mode: inline the command on the header when it's a
             # single line that fits; fall back to a size hint otherwise.
@@ -1502,7 +1680,7 @@ def render_tool_use(
             if stripped and len(cmd_lines) <= 1:
                 # Wrap in bright-cyan backticks so it's visually distinct
                 # from the dim description and the leading [#N] tag.
-                trial = f"{base}  \033[96m`{cmd}`\033[0m"
+                trial = f"{base}  {_C_BRIGHT_CYAN}`{cmd}`{_C_RESET}"
                 if _visible_len(trial) <= term_w:
                     print(trial)
                     shown_inline = True
@@ -1511,28 +1689,28 @@ def render_tool_use(
                     # Show the command char/line count in place of the
                     # command itself when it won't fit on one line.
                     print(
-                        f"{base}  \033[90m({_cmd_size_hint(cmd)})\033[0m"
+                        f"{base}  {_C_DIM}({_cmd_size_hint(cmd)}){_C_RESET}"
                     )
                 else:
                     print(base)
     elif name == "BashOutput":
         shell_id = inp.get("bash_id") or inp.get("shell_id") or "?"
         _print_one_line_tool(
-            f"{seq_prefix}\033[1;34mBashOutput\033[0m",
+            f"{seq_prefix}{_C_BOLD_BLUE}BashOutput{_C_RESET}",
             f" shell={shell_id}",
-            f" \033[90mshell={shell_id}\033[0m",
+            f" {_C_DIM}shell={shell_id}{_C_RESET}",
         )
     elif name == "KillShell":
         shell_id = inp.get("shell_id") or inp.get("bash_id") or "?"
         _print_one_line_tool(
-            f"{seq_prefix}\033[1;34mKillShell\033[0m",
+            f"{seq_prefix}{_C_BOLD_BLUE}KillShell{_C_RESET}",
             f" shell={shell_id}",
-            f" \033[90mshell={shell_id}\033[0m",
+            f" {_C_DIM}shell={shell_id}{_C_RESET}",
         )
     elif name == "TodoWrite":
         todos = inp.get("todos", []) or []
-        print(f"{seq_prefix}\033[1;34mTodoWrite\033[0m \033[90m({len(todos)} items)\033[0m")
-        markers = {"completed": "\033[32m✓\033[0m", "in_progress": "\033[33m→\033[0m", "pending": "\033[90m·\033[0m"}
+        print(f"{seq_prefix}{_C_BOLD_BLUE}TodoWrite{_C_RESET} {_C_DIM}({len(todos)} items){_C_RESET}")
+        markers = {"completed": f"{_C_GREEN}✓{_C_RESET}", "in_progress": f"{_C_YELLOW}→{_C_RESET}", "pending": f"{_C_DIM}·{_C_RESET}"}
         for t in todos:
             m = markers.get(t.get("status", "pending"), "?")
             content = t.get("content", "") or t.get("activeForm", "")
@@ -1541,21 +1719,21 @@ def render_tool_use(
         desc = inp.get("description", "")
         subtype = inp.get("subagent_type", "general-purpose")
         _print_one_line_tool(
-            f"{seq_prefix}\033[1;34mTask\033[0m",
+            f"{seq_prefix}{_C_BOLD_BLUE}Task{_C_RESET}",
             f" [{subtype}] {desc}",
-            f" \033[90m[{subtype}] {desc}\033[0m",
+            f" {_C_DIM}[{subtype}] {desc}{_C_RESET}",
         )
     elif name == "Read":
         path = inp.get("file_path", "?")
         offset = inp.get("offset")
         limit = inp.get("limit")
         suffix = (
-            f"\033[90moffset={offset} limit={limit}\033[0m"
+            f"{_C_DIM}offset={offset} limit={limit}{_C_RESET}"
             if offset or limit
             else ""
         )
         _print_path_tool(
-            f"{seq_prefix}\033[1;34mRead\033[0m",
+            f"{seq_prefix}{_C_BOLD_BLUE}Read{_C_RESET}",
             path,
             suffix,
         )
@@ -1565,28 +1743,28 @@ def render_tool_use(
         # Pattern goes in the prefix (never truncated) — only the search
         # path is truncatable.
         prefix = (
-            f"{seq_prefix}\033[1;34mGrep\033[0m "
-            f"\033[90m/{pattern}/\033[0m"
+            f"{seq_prefix}{_C_BOLD_BLUE}Grep{_C_RESET} "
+            f"{_C_DIM}/{pattern}/{_C_RESET}"
         )
         _print_path_tool(prefix, path)
     elif name == "Glob":
         pattern = inp.get("pattern", "")
         path = inp.get("path", ".")
         prefix = (
-            f"{seq_prefix}\033[1;34mGlob\033[0m "
-            f"\033[90m{pattern}\033[0m"
+            f"{seq_prefix}{_C_BOLD_BLUE}Glob{_C_RESET} "
+            f"{_C_DIM}{pattern}{_C_RESET}"
         )
         _print_path_tool(prefix, path)
     elif name == "WebFetch":
         url = inp.get("url", "?")
         _print_path_tool(
-            f"{seq_prefix}\033[1;34mWebFetch\033[0m",
+            f"{seq_prefix}{_C_BOLD_BLUE}WebFetch{_C_RESET}",
             url,
         )
     elif name == "WebSearch":
         q = inp.get("query", "?")
         _print_path_tool(
-            f"{seq_prefix}\033[1;34mWebSearch\033[0m",
+            f"{seq_prefix}{_C_BOLD_BLUE}WebSearch{_C_RESET}",
             repr(q),
         )
     else:
@@ -1595,7 +1773,7 @@ def render_tool_use(
         # arg on its own line indented + aligned. Values are rendered via
         # repr() so nested dicts/lists print structurally; long values
         # wrap at terminal width to the same indent.
-        print(f"{seq_prefix}\033[1;34m{name}\033[0m")
+        print(f"{seq_prefix}{_C_BOLD_BLUE}{name}{_C_RESET}")
         if inp and show_tasks != "compact":
             keys = list(inp.keys())
             keylen = max(len(str(k)) for k in keys)
@@ -1608,7 +1786,7 @@ def render_tool_use(
                 indent_n = 2 + keylen + 2  # "  " + key + ": "
                 wrapped = _wrap_text(value_repr, indent_n, indent_n)
                 print(
-                    f"  \033[90m{str(k):>{keylen}}:\033[0m {wrapped}"
+                    f"  {_C_DIM}{str(k):>{keylen}}:{_C_RESET} {wrapped}"
                 )
 
 
@@ -1683,16 +1861,16 @@ def _render_tool_result(
     on error — full content lives in the JSONL transcript and /export.
     `seq` (when provided) prints `[#N]` so the user can `/show N` later."""
     seq_prefix = (
-        f"\033[90m[#{seq} -- {_cmd_hint(f'/show {seq} [-tail N]')}"
-        f"\033[90m]\033[0m "
+        f"{_C_DIM}[#{seq} -- {_cmd_hint(f'/show {seq} [-tail N]')}"
+        f"{_C_DIM}]{_C_RESET} "
         if seq is not None
         else ""
     )
     if show_full:
         marker = (
-            f"\033[31mtool-err:\033[0m"
+            f"{_C_RED}tool-err:{_C_RESET}"
             if is_error
-            else f"\033[34m->\033[0m"
+            else f"{_C_BLUE}->{_C_RESET}"
         )
         marker_visible = len("tool-err: ") if is_error else len("-> ")
         indent_n = _visible_len(seq_prefix) + marker_visible
@@ -1711,11 +1889,11 @@ def _render_tool_result(
     size = _humanize_size(text)
     if is_error:
         print(
-            f"{seq_prefix}\033[31m✗ tool error\033[0m  "
-            f"\033[90m({size})\033[0m"
+            f"{seq_prefix}{_C_RED}✗ tool error{_C_RESET}  "
+            f"{_C_DIM}({size}){_C_RESET}"
         )
     else:
-        print(f"{seq_prefix}\033[90m→ {size}\033[0m")
+        print(f"{seq_prefix}{_C_DIM}→ {size}{_C_RESET}")
 
 
 # ----------------------------------------------------------------------------
@@ -2504,7 +2682,7 @@ def render_session_history_text(
     try:
         f = jsonl.open(encoding="utf-8", errors="replace")
     except OSError as e:
-        return 0, f"\033[31m[history: failed to open {jsonl.name}: {e}]\033[0m\n", []
+        return 0, f"{_C_RED}[history: failed to open {jsonl.name}: {e}]{_C_RESET}\n", []
 
     with f:
         for line in f:
@@ -2541,7 +2719,7 @@ def render_session_history_text(
                     if has_perm_mode and not looks_synthetic:
                         # "you: " is 5 visible chars.
                         wrapped = _wrap_text(text, indent=5, start_col=5)
-                        write(f"\033[36myou:\033[0m {wrapped}\n")
+                        write(f"{_C_CYAN}you:{_C_RESET} {wrapped}\n")
                         rendered += 1
                     # Match bg task completions to their starts.
                     if text.startswith("<task-notification"):
@@ -2570,11 +2748,11 @@ def render_session_history_text(
                                 size = _humanize_size(text)
                                 if is_err:
                                     write(
-                                        f"\033[31m✗ tool error\033[0m  "
-                                        f"\033[90m({size})\033[0m\n"
+                                        f"{_C_RED}✗ tool error{_C_RESET}  "
+                                        f"{_C_DIM}({size}){_C_RESET}\n"
                                     )
                                 else:
-                                    write(f"\033[90m→ {size}\033[0m\n")
+                                    write(f"{_C_DIM}→ {size}{_C_RESET}\n")
                                 continue
                             # show_tool_output on: full content (truncated
                             # at 600 chars to keep the backscroll sane).
@@ -2584,9 +2762,9 @@ def render_session_history_text(
                                     + f"... [+{len(text) - 600} chars]"
                                 )
                             tag = (
-                                "\033[31mtool-err:\033[0m"
+                                f"{_C_RED}tool-err:{_C_RESET}"
                                 if is_err
-                                else "\033[34m->\033[0m"
+                                else f"{_C_BLUE}->{_C_RESET}"
                             )
                             # Align continuation lines under the first
                             # line's start (after tag + space).
@@ -2603,7 +2781,7 @@ def render_session_history_text(
                             if text:
                                 wrapped = _wrap_text(text, indent=7, start_col=7)
                                 write(
-                                    f"\033[36myou:\033[0m "
+                                    f"{_C_CYAN}you:{_C_RESET} "
                                     f"{wrapped}\n"
                                 )
                                 rendered += 1
@@ -2625,7 +2803,7 @@ def render_session_history_text(
                         # join with a space — column continues from where
                         # the previous block left off.
                         if not started:
-                            write("\033[32mclaude:\033[0m ")
+                            write(f"{_C_GREEN}claude:{_C_RESET} ")
                             started = True
                             wrapped = _wrap_text(text, indent=8, start_col=8)
                         else:
@@ -3520,7 +3698,7 @@ class Orchestrator:
         if self.args.mcp_config:
             path = Path(self.args.mcp_config).expanduser()
             if not path.exists():
-                print(f"\033[31m[warn] --mcp-config not found: {path}\033[0m")
+                print(f"{_C_RED}[warn] --mcp-config not found: {path}{_C_RESET}")
                 return None
         else:
             candidate = Path(self.args.cwd) / ".mcp.json"
@@ -3531,12 +3709,12 @@ class Orchestrator:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as e:
-            print(f"\033[31m[warn] failed to load MCP config {path}: {e}\033[0m")
+            print(f"{_C_RED}[warn] failed to load MCP config {path}: {e}{_C_RESET}")
             return None
         servers = data.get("mcpServers") if isinstance(data, dict) else None
         if not isinstance(servers, dict) or not servers:
             return None
-        print(f"\033[35m[sys] loaded MCP servers from {path}: {list(servers)}\033[0m")
+        print(f"{_C_MAGENTA}[sys] loaded MCP servers from {path}: {list(servers)}{_C_RESET}")
         return servers
 
     # ---- prompt / UI ---------------------------------------------------
@@ -3756,7 +3934,7 @@ class Orchestrator:
     def clear_screen(self) -> None:
         sys.stdout.write("\033[2J\033[3J\033[H")
         sys.stdout.flush()
-        print(f"\033[90m[screen cleared -- session {self.state.session_id} continues]\033[0m")
+        print(f"{_C_DIM}[screen cleared -- session {self.state.session_id} continues]{_C_RESET}")
 
     def _check_api_stall(
         self, error_status: Any = None, error_info: Any = None
@@ -3821,7 +3999,7 @@ class Orchestrator:
         # stalls, status was clean, so we require it to go bad before we
         # can trust a return-to-clean as a recovery signal.
         self.state.api_stall_saw_bad = source == "status"
-        print(f"\033[31m[API STALL ({source}) -- {reason}]\033[0m")
+        print(f"{_C_RED}[API STALL ({source}) -- {reason}]{_C_RESET}")
         _ring_bell(self.state, "api-stall")
         if not self.args.no_status_poll:
             self._ensure_status_poller()
@@ -3843,7 +4021,7 @@ class Orchestrator:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode("utf-8", "replace"))
         except (urllib.error.URLError, OSError, ValueError) as e:
-            print(f"\033[90m[status-probe] fetch failed: {e}\033[0m")
+            print(f"{_C_DIM}[status-probe] fetch failed: {e}{_C_RESET}")
             return
         indicator, bad = self._status_summary(data)
         self.state.api_status_indicator = indicator
@@ -3868,8 +4046,8 @@ class Orchestrator:
             )
             return
         print(
-            "\033[90m[status-probe] Anthropic status is clean; treating "
-            "the retry as transient (heuristic still armed)\033[0m"
+            f"{_C_DIM}[status-probe] Anthropic status is clean; treating "
+            f"the retry as transient (heuristic still armed){_C_RESET}"
         )
 
     @staticmethod
@@ -3915,8 +4093,8 @@ class Orchestrator:
         import urllib.request
         import urllib.error
         print(
-            f"\033[36m[status-poll] watching {url} every "
-            f"{interval:.0f}s; will auto-resume when operational\033[0m"
+            f"{_C_CYAN}[status-poll] watching {url} every "
+            f"{interval:.0f}s; will auto-resume when operational{_C_RESET}"
         )
         while self.state.needs_user_attention == "api-error":
             try:
@@ -3926,7 +4104,7 @@ class Orchestrator:
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     data = json.loads(resp.read().decode("utf-8", "replace"))
             except (urllib.error.URLError, OSError, ValueError) as e:
-                print(f"\033[90m[status-poll] fetch failed: {e}\033[0m")
+                print(f"{_C_DIM}[status-poll] fetch failed: {e}{_C_RESET}")
                 await asyncio.sleep(interval)
                 continue
             indicator, bad = self._status_summary(data)
@@ -3956,16 +4134,16 @@ class Orchestrator:
                     self.state.api_retry_times.popleft()
                 if self.state.api_retry_times:
                     print(
-                        "\033[36m[status-poll] status indicator clear, but "
-                        "retries still in window; waiting another tick\033[0m"
+                        f"{_C_CYAN}[status-poll] status indicator clear, but "
+                        f"retries still in window; waiting another tick{_C_RESET}"
                     )
                 else:
                     self.state.needs_user_attention = None
                     self.state.api_stall_source = None
                     self.state.api_stall_saw_bad = False
                     print(
-                        "\033[32m[status-poll] Anthropic services operational "
-                        "-- resuming]\033[0m"
+                        f"{_C_GREEN}[status-poll] Anthropic services operational "
+                        f"-- resuming]{_C_RESET}"
                     )
                     _ring_bell(self.state, "api-ok")
                     try:
@@ -3980,9 +4158,9 @@ class Orchestrator:
                 # heuristic stall that the status page never acknowledged.
                 # Keep waiting; /q or manual input still lets you resume.
                 print(
-                    "\033[90m[status-poll] status clean (heuristic stall) "
+                    f"{_C_DIM}[status-poll] status clean (heuristic stall) "
                     "-- waiting for status to acknowledge the issue; "
-                    "type to resume manually\033[0m"
+                    f"type to resume manually{_C_RESET}"
                 )
             else:
                 bits = [f"indicator={indicator}"]
@@ -3992,7 +4170,7 @@ class Orchestrator:
                         for c in bad[:3]
                     )
                     bits.append(f"components: {names}")
-                print(f"\033[90m[status-poll] {'; '.join(bits)}\033[0m")
+                print(f"{_C_DIM}[status-poll] {'; '.join(bits)}{_C_RESET}")
             await asyncio.sleep(interval)
 
     async def _maybe_trim_context(self) -> bool:
@@ -4012,14 +4190,14 @@ class Orchestrator:
         new_id = _trim_session(old_sid, project_dir, target)
         if new_id is None:
             print(
-                f"\033[33m[sys] max-context trim skipped -- "
+                f"{_C_YELLOW}[sys] max-context trim skipped -- "
                 f"not enough turns to cut (ctx={self.state.context_tokens}, "
-                f"cap={cap})\033[0m"
+                f"cap={cap}){_C_RESET}"
             )
             return False
         print(
-            f"\033[35m[sys] max-context: ctx ~{self.state.context_tokens} tok "
-            f"> cap {cap} -- trimmed to {new_id[:8]} (was {old_sid[:8]})\033[0m"
+            f"{_C_MAGENTA}[sys] max-context: ctx ~{self.state.context_tokens} tok "
+            f"> cap {cap} -- trimmed to {new_id[:8]} (was {old_sid[:8]}){_C_RESET}"
         )
         await self._disconnect()
         self.state.session_id = new_id
@@ -4065,21 +4243,21 @@ class Orchestrator:
         finally:
             self.args.no_continue = prev_no_continue
         old = f"(was {old_sid[:8]})" if old_sid else ""
-        print(f"\033[35m[sys] context cleared -- fresh session {old}\033[0m")
+        print(f"{_C_MAGENTA}[sys] context cleared -- fresh session {old}{_C_RESET}")
 
     def set_continue_prompt(self, payload: str) -> None:
         if not payload:
             # Show current
             print(
-                f"\033[35m[continue-prompt] "
-                f"{self.state.continue_prompt}\033[0m"
+                f"{_C_MAGENTA}[continue-prompt] "
+                f"{self.state.continue_prompt}{_C_RESET}"
             )
         elif payload.lower() == "default":
             self.state.continue_prompt = CONTINUE_PROMPT
-            print("\033[35m[continue-prompt reset to default]\033[0m")
+            print(f"{_C_MAGENTA}[continue-prompt reset to default]{_C_RESET}")
         else:
             self.state.continue_prompt = payload
-            print(f"\033[35m[continue-prompt set]\033[0m")
+            print(f"{_C_MAGENTA}[continue-prompt set]{_C_RESET}")
 
     def set_bell(self, payload: str) -> None:
         """`/bell` — view/modify which events ring the terminal bell.
@@ -4091,14 +4269,14 @@ class Orchestrator:
         payload = (payload or "").strip()
         if not payload:
             if not self.state.bell_events:
-                print("\033[35m[bell] disabled (no events)\033[0m")
+                print(f"{_C_MAGENTA}[bell] disabled (no events){_C_RESET}")
             else:
                 events = ",".join(sorted(self.state.bell_events))
-                print(f"\033[35m[bell] {events}\033[0m")
+                print(f"{_C_MAGENTA}[bell] {events}{_C_RESET}")
             print(
-                "\033[90m  available events: "
+                _C_DIM + "  available events: "
                 + ", ".join(sorted(_BELL_EVENT_NAMES))
-                + "\033[0m"
+                + _C_RESET
             )
             return
         result = _parse_bell_spec(payload)
@@ -4110,8 +4288,8 @@ class Orchestrator:
             assert isinstance(result, dict)
             if not result:
                 print(
-                    "\033[31m[bell error: no valid events in "
-                    f"'{payload}']\033[0m"
+                    f"{_C_RED}[bell error: no valid events in "
+                    f"'{payload}']{_C_RESET}"
                 )
                 return
             for name, enable in result.items():
@@ -4120,7 +4298,7 @@ class Orchestrator:
                 else:
                     self.state.bell_events.discard(name)
         events = ",".join(sorted(self.state.bell_events)) or "(none)"
-        print(f"\033[35m[bell] {events}\033[0m")
+        print(f"{_C_MAGENTA}[bell] {events}{_C_RESET}")
 
     def toggle_auto_continue(self, payload: str) -> None:
         if payload == "on":
@@ -4131,25 +4309,25 @@ class Orchestrator:
             self.args.auto_continue = not self.args.auto_continue
         if self.args.auto_continue:
             print(
-                f"\033[35m[auto-continue ON  "
+                f"{_C_MAGENTA}[auto-continue ON  "
                 f"(delay {self.args.continue_response_delay}s, "
                 f"burst {self.args.continue_burst_limit}/"
-                f"{self.args.continue_burst_window:.0f}s)]\033[0m"
+                f"{self.args.continue_burst_window:.0f}s)]{_C_RESET}"
             )
         else:
             self.state.recent_turn_ends.clear()
             print(
-                "\033[35m[auto-continue OFF -- orchestrator will wait for "
-                "your input after each turn]\033[0m"
+                f"{_C_MAGENTA}[auto-continue OFF -- orchestrator will wait for "
+                f"your input after each turn]{_C_RESET}"
             )
 
     def set_burst(self, payload: str) -> None:
         payload = payload.strip()
         if not payload:
             print(
-                f"\033[35m[burst: limit={self.args.continue_burst_limit}, "
+                f"{_C_MAGENTA}[burst: limit={self.args.continue_burst_limit}, "
                 f"window={self.args.continue_burst_window:.0f}s "
-                f"(only used while --auto-continue is on)]\033[0m"
+                f"(only used while --auto-continue is on)]{_C_RESET}"
             )
             return
         parts = payload.split()
@@ -4157,18 +4335,18 @@ class Orchestrator:
             n = int(parts[0])
             t = float(parts[1]) if len(parts) > 1 else None
         except (ValueError, IndexError):
-            print("\033[31m[error: usage /burst N [T-seconds]]\033[0m")
+            print(f"{_C_RED}[error: usage /burst N [T-seconds]]{_C_RESET}")
             return
         if n < 0 or (t is not None and t <= 0):
-            print("\033[31m[error: N must be >= 0, T must be > 0]\033[0m")
+            print(f"{_C_RED}[error: N must be >= 0, T must be > 0]{_C_RESET}")
             return
         self.args.continue_burst_limit = n
         if t is not None:
             self.args.continue_burst_window = t
         self.state.recent_turn_ends.clear()
         print(
-            f"\033[35m[burst: limit={n}, "
-            f"window={self.args.continue_burst_window:.0f}s]\033[0m"
+            f"{_C_MAGENTA}[burst: limit={n}, "
+            f"window={self.args.continue_burst_window:.0f}s]{_C_RESET}"
         )
 
     async def ask_btw(self, prompt_text: str) -> None:
@@ -4178,7 +4356,7 @@ class Orchestrator:
         /btw finishes, your next turn continues from where it left off."""
         prompt_text = prompt_text.strip()
         if not prompt_text:
-            print("\033[31m[error: usage /btw <question>]\033[0m")
+            print(f"{_C_RED}[error: usage /btw <question>]{_C_RESET}")
             return
         # Build fresh options: no resume, no continue. Inherit cwd,
         # permission mode, model, effort, tool allow/deny lists.
@@ -4200,7 +4378,7 @@ class Orchestrator:
             kwargs["append_system_prompt"] = self.args.append_system_prompt
         options = ClaudeAgentOptions(**kwargs)
         print()
-        print(f"\033[36m> btw:\033[0m {prompt_text}")
+        print(f"{_C_CYAN}> btw:{_C_RESET} {prompt_text}")
         print()
         in_text = False
         try:
@@ -4210,7 +4388,7 @@ class Orchestrator:
                         if isinstance(block, TextBlock):
                             if not in_text:
                                 sys.stdout.write(
-                                    "\033[32mclaude (btw):\033[0m "
+                                    f"{_C_GREEN}claude (btw):{_C_RESET} "
                                 )
                                 in_text = True
                                 self._claude_col = 14  # "claude (btw): " width
@@ -4226,7 +4404,7 @@ class Orchestrator:
         except Exception as e:  # noqa: BLE001
             if in_text:
                 self._flush_claude_text()
-            print(f"\033[31m[btw failed: {e}]\033[0m")
+            print(f"{_C_RED}[btw failed: {e}]{_C_RESET}")
             return
         if in_text:
             self._flush_claude_text()
@@ -4246,28 +4424,28 @@ class Orchestrator:
         active = self.state.active_model
         print()
         if pinned:
-            print(f"\033[1mcurrent model\033[0m (pinned): {pinned}")
+            print(f"{_C_BOLD}current model{_C_RESET} (pinned): {pinned}")
         elif active:
-            print(f"\033[1mcurrent model\033[0m (CLI-picked): {active}")
+            print(f"{_C_BOLD}current model{_C_RESET} (CLI-picked): {active}")
         else:
             print(
-                "\033[1mcurrent model\033[0m: (auto — no AssistantMessage "
+                f"{_C_BOLD}current model{_C_RESET}: (auto — no AssistantMessage "
                 "received yet)"
             )
         print()
-        print("\033[1mknown models\033[0m:")
+        print(f"{_C_BOLD}known models{_C_RESET}:")
         for model_id, desc in self._KNOWN_MODELS:
-            print(f"  \033[34m{model_id}\033[0m  \033[90m— {desc}\033[0m")
+            print(f"  {_C_BLUE}{model_id}{_C_RESET}  {_C_DIM}— {desc}{_C_RESET}")
         print()
-        print("\033[90m/model <id> to change. Reconnects and resumes the session.\033[0m")
+        print(f"{_C_DIM}/model <id> to change. Reconnects and resumes the session.{_C_RESET}")
         print()
 
     def show_effort_info(self) -> None:
         current = self.state.effort or "auto"
         print()
-        print(f"\033[1mcurrent effort\033[0m: {current}")
+        print(f"{_C_BOLD}current effort{_C_RESET}: {current}")
         print()
-        print("\033[1mavailable levels\033[0m:")
+        print(f"{_C_BOLD}available levels{_C_RESET}:")
         descs = {
             "auto": "no override — model picks its default (typically 'high')",
             "low": "minimal thinking budget",
@@ -4277,69 +4455,69 @@ class Orchestrator:
         }
         for level in EFFORT_CHOICES:
             print(
-                f"  \033[34m{level}\033[0m  "
-                f"\033[90m— {descs.get(level, '')}\033[0m"
+                f"  {_C_BLUE}{level}{_C_RESET}  "
+                f"{_C_DIM}— {descs.get(level, '')}{_C_RESET}"
             )
         print()
-        print("\033[90m/effort <level> to change. Reconnects and resumes the session.\033[0m")
+        print(f"{_C_DIM}/effort <level> to change. Reconnects and resumes the session.{_C_RESET}")
         print()
 
     def set_autocompact(self, payload: str) -> None:
         p = payload.strip().lower()
         if not p:
             status = "OFF" if self.args.no_compact else f"ON (at ~{self.args.compact_at} tok)"
-            print(f"\033[35m[sys] auto-compact: {status}]\033[0m")
+            print(f"{_C_MAGENTA}[sys] auto-compact: {status}]{_C_RESET}")
             return
         if p in ("on", "true", "enable", "1"):
             self.args.no_compact = False
             print(
-                f"\033[35m[sys] auto-compact ON "
-                f"(at ~{self.args.compact_at} tok)\033[0m"
+                f"{_C_MAGENTA}[sys] auto-compact ON "
+                f"(at ~{self.args.compact_at} tok){_C_RESET}"
             )
             return
         if p in ("off", "false", "disable", "0"):
             self.args.no_compact = True
-            print("\033[35m[sys] auto-compact OFF\033[0m")
+            print(f"{_C_MAGENTA}[sys] auto-compact OFF{_C_RESET}")
             return
         try:
             n = int(p.replace(",", "").replace("_", ""))
         except ValueError:
             print(
-                "\033[31m[error: usage /autocompact [on|off|N] where N is a "
-                "token count]\033[0m"
+                f"{_C_RED}[error: usage /autocompact [on|off|N] where N is a "
+                f"token count]{_C_RESET}"
             )
             return
         if n <= 0:
-            print("\033[31m[error: /autocompact N must be positive]\033[0m")
+            print(f"{_C_RED}[error: /autocompact N must be positive]{_C_RESET}")
             return
         self.args.compact_at = n
         self.args.no_compact = False
-        print(f"\033[35m[sys] auto-compact threshold -> ~{n} tok (ON)\033[0m")
+        print(f"{_C_MAGENTA}[sys] auto-compact threshold -> ~{n} tok (ON){_C_RESET}")
 
     def set_max_context(self, payload: str) -> None:
         p = payload.strip().lower()
         if not p:
             cur = self.args.max_context_tokens
             status = "unlimited" if not cur else f"~{cur} tok"
-            print(f"\033[35m[sys] max context: {status}\033[0m")
+            print(f"{_C_MAGENTA}[sys] max context: {status}{_C_RESET}")
             return
         if p in ("off", "none", "unlimited", "0"):
             self.args.max_context_tokens = 0
-            print("\033[35m[sys] max context: unlimited\033[0m")
+            print(f"{_C_MAGENTA}[sys] max context: unlimited{_C_RESET}")
             return
         try:
             n = int(p.replace(",", "").replace("_", ""))
         except ValueError:
             print(
-                "\033[31m[error: usage /max-context [off|N] where N is a "
-                "token count]\033[0m"
+                f"{_C_RED}[error: usage /max-context [off|N] where N is a "
+                f"token count]{_C_RESET}"
             )
             return
         if n <= 0:
-            print("\033[31m[error: /max-context N must be positive]\033[0m")
+            print(f"{_C_RED}[error: /max-context N must be positive]{_C_RESET}")
             return
         self.args.max_context_tokens = n
-        print(f"\033[35m[sys] max context -> ~{n} tok (rolling-window trim)\033[0m")
+        print(f"{_C_MAGENTA}[sys] max context -> ~{n} tok (rolling-window trim){_C_RESET}")
 
     def show_thinking_detail(self, payload: str) -> None:
         history = self.state.thinking_history
@@ -4347,11 +4525,11 @@ class Orchestrator:
         if not payload:
             recent = list(history)[-3:]
             if not recent:
-                print("\033[90m[no thinking blocks yet]\033[0m")
+                print(f"{_C_DIM}[no thinking blocks yet]{_C_RESET}")
                 return
             print(
-                f"\033[90m[showing last {len(recent)} thinking block(s); "
-                f"/think <N> [N2 ...] to pick specific ones]\033[0m"
+                f"{_C_DIM}[showing last {len(recent)} thinking block(s); "
+                f"/think <N> [N2 ...] to pick specific ones]{_C_RESET}"
             )
             for e in recent:
                 self._print_thinking_entry(e)
@@ -4360,8 +4538,8 @@ class Orchestrator:
             nums = [int(p) for p in payload.split()]
         except ValueError:
             print(
-                "\033[31m[error: usage /think [<N> ...] -- numbers come from "
-                "the [#N] tags shown with each thinking preview]\033[0m"
+                f"{_C_RED}[error: usage /think [<N> ...] -- numbers come from "
+                f"the [#N] tags shown with each thinking preview]{_C_RESET}"
             )
             return
         by_seq = {e["seq"]: e for e in history}
@@ -4369,8 +4547,8 @@ class Orchestrator:
             entry = by_seq.get(n)
             if entry is None:
                 print(
-                    f"\033[33m[#{n} not found "
-                    f"(history kept = last {history.maxlen} blocks)]\033[0m"
+                    f"{_C_YELLOW}[#{n} not found "
+                    f"(history kept = last {history.maxlen} blocks)]{_C_RESET}"
                 )
             else:
                 self._print_thinking_entry(entry)
@@ -4379,12 +4557,12 @@ class Orchestrator:
         seq = e.get("seq", "?")
         text = (e.get("text") or "").strip()
         print()
-        print(f"\033[1m[#{seq}] thinking\033[0m")
+        print(f"{_C_BOLD}[#{seq}] thinking{_C_RESET}")
         if not text:
-            print("  \033[90m(empty)\033[0m")
+            print(f"  {_C_DIM}(empty){_C_RESET}")
             return
         for ln in text.splitlines():
-            print(f"  \033[90m{ln}\033[0m")
+            print(f"  {_C_DIM}{ln}{_C_RESET}")
 
     def show_tool_detail(self, payload: str) -> None:
         """Usage:
@@ -4401,11 +4579,11 @@ class Orchestrator:
         if not payload:
             recent = list(history)[-5:]
             if not recent:
-                print("\033[90m[no tool history yet]\033[0m")
+                print(f"{_C_DIM}[no tool history yet]{_C_RESET}")
                 return
             print(
-                f"\033[90m[showing last {len(recent)} tool call(s); "
-                f"/show N -- full; /show N -tail K -- last K lines of output]\033[0m"
+                f"{_C_DIM}[showing last {len(recent)} tool call(s); "
+                f"/show N -- full; /show N -tail K -- last K lines of output]{_C_RESET}"
             )
             for e in recent:
                 self._print_tool_history_entry(e)
@@ -4429,9 +4607,9 @@ class Orchestrator:
                     idx += 1
         except ValueError:
             print(
-                "\033[31m[error: usage /show [N [-tail K]] or /show N1 N2 ... "
+                f"{_C_RED}[error: usage /show [N [-tail K]] or /show N1 N2 ... "
                 "-- positive ints are entry seqs, -tail K "
-                "(or legacy -K) sets tail lines]\033[0m"
+                f"(or legacy -K) sets tail lines]{_C_RESET}"
             )
             return
         nums = tokens
@@ -4443,8 +4621,8 @@ class Orchestrator:
             n = nums[i]
             if n < 0:
                 print(
-                    f"\033[31m[error: standalone negative {n} — "
-                    f"tail must follow an entry number]\033[0m"
+                    f"{_C_RED}[error: standalone negative {n} — "
+                    f"tail must follow an entry number]{_C_RESET}"
                 )
                 return
             tail_k: int | None = None
@@ -4456,8 +4634,8 @@ class Orchestrator:
             entry = by_seq.get(n)
             if entry is None:
                 print(
-                    f"\033[33m[#{n} not found "
-                    f"(history kept = last {history.maxlen} calls)]\033[0m"
+                    f"{_C_YELLOW}[#{n} not found "
+                    f"(history kept = last {history.maxlen} calls)]{_C_RESET}"
                 )
                 continue
             self._print_tool_history_entry(entry, tail=tail_k)
@@ -4469,17 +4647,17 @@ class Orchestrator:
         name = e.get("name", "?")
         inp = e.get("input") or {}
         print()
-        print(f"\033[1m[#{seq}] tool {name}\033[0m")
+        print(f"{_C_BOLD}[#{seq}] tool {name}{_C_RESET}")
         if name == "Bash":
             cmd = inp.get("command", "") or ""
             desc = inp.get("description", "")
             bg = bool(inp.get("run_in_background"))
             if desc:
-                print(f"  \033[90m{desc}\033[0m")
+                print(f"  {_C_DIM}{desc}{_C_RESET}")
             if bg:
-                print("  \033[90m(background)\033[0m")
+                print(f"  {_C_DIM}(background){_C_RESET}")
             for ln in cmd.splitlines() or [cmd]:
-                print(f"  \033[36m$\033[0m {ln}")
+                print(f"  {_C_CYAN}${_C_RESET} {ln}")
         elif name == "WebFetch":
             print(f"  URL: {inp.get('url', '?')}")
             if inp.get("prompt"):
@@ -4496,14 +4674,14 @@ class Orchestrator:
             old = inp.get("old_string", "") or ""
             new = inp.get("new_string", "") or ""
             for ln in old.splitlines():
-                print(f"  \033[31m-\033[0m {ln}")
+                print(f"  {_C_RED}-{_C_RESET} {ln}")
             for ln in new.splitlines():
-                print(f"  \033[32m+\033[0m {ln}")
+                print(f"  {_C_GREEN}+{_C_RESET} {ln}")
         elif name == "Write":
             print(f"  Path: {inp.get('file_path', '?')}")
             content = inp.get("content", "") or ""
             for ln in content.splitlines():
-                print(f"  \033[32m+\033[0m {ln}")
+                print(f"  {_C_GREEN}+{_C_RESET} {ln}")
         else:
             try:
                 rendered = json.dumps(inp, indent=2, default=str)
@@ -4514,19 +4692,19 @@ class Orchestrator:
         result = e.get("result_text")
         is_err = e.get("is_error")
         if result is None:
-            print("\n  \033[90m(still running)\033[0m")
+            print(f"\n  {_C_DIM}(still running){_C_RESET}")
         else:
             tag = (
-                "\033[31mtool-err:\033[0m"
+                f"{_C_RED}tool-err:{_C_RESET}"
                 if is_err
-                else "\033[34mresult:\033[0m"
+                else f"{_C_BLUE}result:{_C_RESET}"
             )
             result_lines = result.splitlines() or [result]
             total = len(result_lines)
             if tail is not None and tail > 0 and total > tail:
                 tail_head = (
-                    f"\n  {tag} \033[90m(tail -{tail}, showing last {tail} "
-                    f"of {total} lines)\033[0m"
+                    f"\n  {tag} {_C_DIM}(tail -{tail}, showing last {tail} "
+                    f"of {total} lines){_C_RESET}"
                 )
                 print(tail_head)
                 for ln in result_lines[-tail:]:
@@ -4541,23 +4719,23 @@ class Orchestrator:
         todos = self.state.current_todos
         print()
         if not todos:
-            print("\033[90mNo todos yet (Claude hasn't called TodoWrite).\033[0m")
+            print(f"{_C_DIM}No todos yet (Claude hasn't called TodoWrite).{_C_RESET}")
             print()
             return
         done = sum(1 for t in todos if t.get("status") == "completed")
         in_prog = sum(1 for t in todos if t.get("status") == "in_progress")
         pending = sum(1 for t in todos if t.get("status") == "pending")
         print(
-            f"\033[1mClaude's plan\033[0m  "
-            f"\033[32m{done} done\033[0m / "
-            f"\033[33m{in_prog} in-progress\033[0m / "
-            f"\033[90m{pending} pending\033[0m  "
+            f"{_C_BOLD}Claude's plan{_C_RESET}  "
+            f"{_C_GREEN}{done} done{_C_RESET} / "
+            f"{_C_YELLOW}{in_prog} in-progress{_C_RESET} / "
+            f"{_C_DIM}{pending} pending{_C_RESET}  "
             f"({len(todos)} total)"
         )
         markers = {
-            "completed": "\033[32m✓\033[0m",
-            "in_progress": "\033[33m→\033[0m",
-            "pending": "\033[90m·\033[0m",
+            "completed": f"{_C_GREEN}✓{_C_RESET}",
+            "in_progress": f"{_C_YELLOW}→{_C_RESET}",
+            "pending": f"{_C_DIM}·{_C_RESET}",
         }
         for t in todos:
             status = t.get("status", "pending")
@@ -4568,11 +4746,11 @@ class Orchestrator:
                 or "(no description)"
             ).strip()
             line_color = (
-                "\033[90m" if status == "completed" else
-                "\033[33m" if status == "in_progress" else
+                _C_DIM if status == "completed" else
+                _C_YELLOW if status == "in_progress" else
                 ""
             )
-            print(f"  {m} {line_color}{content}\033[0m")
+            print(f"  {m} {line_color}{content}{_C_RESET}")
         print()
 
     def show_tasks(self) -> None:
@@ -4584,8 +4762,8 @@ class Orchestrator:
         seqs = self.state.current_turn_tool_seqs
         if not seqs:
             print(
-                "\033[90m[no tasks this turn -- /tools shows in-flight "
-                "state; /show N expands any completed tool]\033[0m"
+                f"{_C_DIM}[no tasks this turn -- /tools shows in-flight "
+                f"state; /show N expands any completed tool]{_C_RESET}"
             )
             return
         # Index tool_history by seq so we can look up status + input per row.
@@ -4595,13 +4773,13 @@ class Orchestrator:
         now = time.monotonic()
         print()
         print(
-            f"\033[1mTasks this turn\033[0m ({len(seqs)}); "
-            f"\033[90m/show N for full detail\033[0m"
+            f"{_C_BOLD}Tasks this turn{_C_RESET} ({len(seqs)}); "
+            f"{_C_DIM}/show N for full detail{_C_RESET}"
         )
         for seq in seqs:
             h = by_seq.get(seq)
             if h is None:
-                print(f"  \033[90m[#{seq}] (history evicted)\033[0m")
+                print(f"  {_C_DIM}[#{seq}] (history evicted){_C_RESET}")
                 continue
             name = h.get("name", "?")
             inp = h.get("input") or {}
@@ -4609,14 +4787,14 @@ class Orchestrator:
             is_err = h.get("is_error")
             if ended is None:
                 elapsed = now - h.get("started_at", now)
-                status = f"\033[33m… running {_fmt_duration(elapsed)}\033[0m"
+                status = f"{_C_YELLOW}… running {_fmt_duration(elapsed)}{_C_RESET}"
             elif is_err:
-                status = "\033[31m✗ error\033[0m"
+                status = f"{_C_RED}✗ error{_C_RESET}"
             else:
                 dur = ended - h.get("started_at", ended)
-                status = f"\033[32m✓\033[0m \033[90m{_fmt_duration(dur)}\033[0m"
+                status = f"{_C_GREEN}✓{_C_RESET} {_C_DIM}{_fmt_duration(dur)}{_C_RESET}"
             summary = _task_summary_line(name, inp)
-            print(f"  [\033[90m#{seq}\033[0m] {status}  \033[34m{name}\033[0m  {summary}")
+            print(f"  [{_C_DIM}#{seq}{_C_RESET}] {status}  {_C_BLUE}{name}{_C_RESET}  {summary}")
         print()
 
     def _bg_entry_index(self) -> dict[int, tuple[str, dict[str, Any]]]:
@@ -4679,9 +4857,9 @@ class Orchestrator:
                     idx += 1
         except ValueError:
             print(
-                "\033[31m[error: usage /bg [N [-tail K]] ... — "
+                f"{_C_RED}[error: usage /bg [N [-tail K]] ... — "
                 "positive ints are bg task numbers, -tail K (or legacy -K) "
-                "sets tail lines for the entry just before it]\033[0m"
+                f"sets tail lines for the entry just before it]{_C_RESET}"
             )
             return
         nums = tokens
@@ -4690,8 +4868,8 @@ class Orchestrator:
             n = nums[i]
             if n < 0:
                 print(
-                    f"\033[31m[error: standalone negative {n} — "
-                    f"tail must follow a bg task number]\033[0m"
+                    f"{_C_RED}[error: standalone negative {n} — "
+                    f"tail must follow a bg task number]{_C_RESET}"
                 )
                 return
             tail_k: int | None = None
@@ -4702,7 +4880,7 @@ class Orchestrator:
                 i += 1
             match = index.get(n)
             if match is None:
-                print(f"\033[33m[bg #{n} not found]\033[0m")
+                print(f"{_C_YELLOW}[bg #{n} not found]{_C_RESET}")
                 continue
             self._print_bg_detail(match[0], match[1], tail_k)
 
@@ -4710,7 +4888,7 @@ class Orchestrator:
         now = time.monotonic()
         print()
         if not index:
-            print("\033[1mBackground tasks\033[0m: \033[90mnone\033[0m")
+            print(f"{_C_BOLD}Background tasks{_C_RESET}: {_C_DIM}none{_C_RESET}")
             print()
             return
         running = sum(
@@ -4718,10 +4896,10 @@ class Orchestrator:
         )
         done = len(index) - running
         print(
-            f"\033[1mBackground tasks\033[0m ({len(index)}): "
-            f"\033[33m{running} running\033[0m, "
-            f"\033[32m{done} completed\033[0m  "
-            f"\033[90m/bg N for detail, /bg N K to tail K lines\033[0m"
+            f"{_C_BOLD}Background tasks{_C_RESET} ({len(index)}): "
+            f"{_C_YELLOW}{running} running{_C_RESET}, "
+            f"{_C_GREEN}{done} completed{_C_RESET}  "
+            f"{_C_DIM}/bg N for detail, /bg N K to tail K lines{_C_RESET}"
         )
         for seq in sorted(index):
             tid, info = index[seq]
@@ -4731,24 +4909,24 @@ class Orchestrator:
             ended = info.get("ended_at")
             if ended is None:
                 elapsed = now - started
-                status = f"\033[33m… {_fmt_duration(elapsed)}\033[0m"
+                status = f"{_C_YELLOW}… {_fmt_duration(elapsed)}{_C_RESET}"
             else:
                 dur = ended - started
                 st = info.get("status") or "completed"
                 marker = {
-                    "completed": "\033[32m✓\033[0m",
-                    "failed": "\033[31m✗\033[0m",
-                    "stopped": "\033[33m⏹\033[0m",
-                }.get(st, f"\033[90m[{st}]\033[0m")
-                status = f"{marker} \033[90m{_fmt_duration(dur)}\033[0m"
-            carry = " \033[90m(carryover)\033[0m" if info.get("carryover") else ""
+                    "completed": f"{_C_GREEN}✓{_C_RESET}",
+                    "failed": f"{_C_RED}✗{_C_RESET}",
+                    "stopped": f"{_C_YELLOW}⏹{_C_RESET}",
+                }.get(st, f"{_C_DIM}[{st}]{_C_RESET}")
+                status = f"{marker} {_C_DIM}{_fmt_duration(dur)}{_C_RESET}"
+            carry = f" {_C_DIM}(carryover){_C_RESET}" if info.get("carryover") else ""
             short_name = name.replace("\n", " ")
             if len(short_name) > 60:
                 short_name = short_name[:57] + "..."
             print(
-                f"  [\033[90m#{seq}\033[0m] {status}  "
-                f"\033[34m{task_type}\033[0m: {short_name}  "
-                f"\033[35m{tid[:8]}\033[0m{carry}"
+                f"  [{_C_DIM}#{seq}{_C_RESET}] {status}  "
+                f"{_C_BLUE}{task_type}{_C_RESET}: {short_name}  "
+                f"{_C_MAGENTA}{tid[:8]}{_C_RESET}{carry}"
             )
         print()
 
@@ -4765,11 +4943,11 @@ class Orchestrator:
         ended = info.get("ended_at")
         now = time.monotonic()
         print()
-        print(f"\033[1m[#{seq}] {task_type}: {name}\033[0m")
-        print(f"  task_id: \033[35m{tid}\033[0m")
+        print(f"{_C_BOLD}[#{seq}] {task_type}: {name}{_C_RESET}")
+        print(f"  task_id: {_C_MAGENTA}{tid}{_C_RESET}")
         tu_id = info.get("tool_use_id")
         if tu_id:
-            print(f"  tool_use_id: \033[90m{tu_id}\033[0m")
+            print(f"  tool_use_id: {_C_DIM}{tu_id}{_C_RESET}")
             # Cross-ref tool_history for the original tool input (the
             # full Bash command, or the Task's prompt/description).
             for h in self.state.tool_history:
@@ -4784,7 +4962,7 @@ class Orchestrator:
                     if t_name == "Bash":
                         cmd = inp.get("command", "") or ""
                         for ln in cmd.splitlines() or [cmd]:
-                            print(f"    \033[36m$\033[0m {ln}")
+                            print(f"    {_C_CYAN}${_C_RESET} {ln}")
                     elif t_name == "Task":
                         desc = inp.get("description", "")
                         prompt = inp.get("prompt", "")
@@ -4799,13 +4977,13 @@ class Orchestrator:
         if started is not None:
             if ended is None:
                 print(
-                    f"  status: \033[33mrunning {_fmt_duration(now - started)}\033[0m"
+                    f"  status: {_C_YELLOW}running {_fmt_duration(now - started)}{_C_RESET}"
                 )
             else:
                 st = info.get("status") or "completed"
                 print(
-                    f"  status: \033[34m{st}\033[0m "
-                    f"\033[90m({_fmt_duration(ended - started)})\033[0m"
+                    f"  status: {_C_BLUE}{st}{_C_RESET} "
+                    f"{_C_DIM}({_fmt_duration(ended - started)}){_C_RESET}"
                 )
         usage = info.get("usage") or {}
         if usage:
@@ -4826,11 +5004,11 @@ class Orchestrator:
                 print(f"    {ln}")
         out_file = info.get("output_file")
         if out_file:
-            print(f"  output_file: \033[36m{out_file}\033[0m")
+            print(f"  output_file: {_C_CYAN}{out_file}{_C_RESET}")
             if tail_lines is not None and tail_lines > 0:
                 self._print_output_tail(out_file, tail_lines)
         elif tail_lines is not None:
-            print("  \033[33m[no output_file recorded for this task]\033[0m")
+            print(f"  {_C_YELLOW}[no output_file recorded for this task]{_C_RESET}")
         print()
 
     def _print_output_tail(self, path: str, n: int) -> None:
@@ -4838,13 +5016,13 @@ class Orchestrator:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
         except OSError as e:
-            print(f"  \033[31m[tail failed: {e}]\033[0m")
+            print(f"  {_C_RED}[tail failed: {e}]{_C_RESET}")
             return
         tail = lines[-n:] if len(lines) > n else lines
         total = len(lines)
         print(
-            f"  \033[1mtail\033[0m -{n}  "
-            f"\033[90m(showing {len(tail)} of {total} lines)\033[0m"
+            f"  {_C_BOLD}tail{_C_RESET} -{n}  "
+            f"{_C_DIM}(showing {len(tail)} of {total} lines){_C_RESET}"
         )
         # Each tail line is indented to 4 spaces so visual wraps of long
         # lines land at the same column (matches the tool-output style).
@@ -4861,83 +5039,83 @@ class Orchestrator:
         now = time.monotonic()
         print()
         if active:
-            print(f"\033[1mActive tool calls\033[0m ({len(active)}):")
+            print(f"{_C_BOLD}Active tool calls{_C_RESET} ({len(active)}):")
             for tu_id, info in active.items():
                 elapsed = now - info.get("started_at", now)
                 name = info.get("name", "?")
                 inp = info.get("input", {}) or {}
                 seq = info.get("seq")
-                seq_tag = f" \033[90m[#{seq}]\033[0m" if seq is not None else ""
+                seq_tag = f" {_C_DIM}[#{seq}]{_C_RESET}" if seq is not None else ""
                 if name == "Bash":
                     cmd = inp.get("command", "") or ""
                     bg_tag = " [background]" if inp.get("run_in_background") else ""
                     desc = inp.get("description", "")
                     head = (
-                        f"  \033[34m[{tu_id[:8]}]\033[0m{seq_tag} Bash{bg_tag}  "
-                        f"\033[90m-- {_fmt_duration(elapsed)}\033[0m"
+                        f"  {_C_BLUE}[{tu_id[:8]}]{_C_RESET}{seq_tag} Bash{bg_tag}  "
+                        f"{_C_DIM}-- {_fmt_duration(elapsed)}{_C_RESET}"
                     )
                     if desc:
-                        head += f"\n    \033[90m{desc}\033[0m"
+                        head += f"\n    {_C_DIM}{desc}{_C_RESET}"
                     print(head)
                     for ln in cmd.splitlines() or [cmd]:
-                        print(f"    \033[36m$\033[0m {ln}")
+                        print(f"    {_C_CYAN}${_C_RESET} {ln}")
                 elif name == "WebFetch":
                     url = inp.get("url", "")
                     print(
-                        f"  \033[34m[{tu_id[:8]}]\033[0m{seq_tag} WebFetch  "
-                        f"\033[90m-- {_fmt_duration(elapsed)}\033[0m"
+                        f"  {_C_BLUE}[{tu_id[:8]}]{_C_RESET}{seq_tag} WebFetch  "
+                        f"{_C_DIM}-- {_fmt_duration(elapsed)}{_C_RESET}"
                     )
-                    print(f"    \033[36m→\033[0m {url}")
+                    print(f"    {_C_CYAN}→{_C_RESET} {url}")
                     prompt_str = inp.get("prompt", "")
                     if prompt_str:
-                        print(f"    \033[90m{prompt_str}\033[0m")
+                        print(f"    {_C_DIM}{prompt_str}{_C_RESET}")
                 elif name == "WebSearch":
                     q = inp.get("query", "")
                     print(
-                        f"  \033[34m[{tu_id[:8]}]\033[0m{seq_tag} WebSearch  "
-                        f"\033[90m-- {_fmt_duration(elapsed)}\033[0m"
+                        f"  {_C_BLUE}[{tu_id[:8]}]{_C_RESET}{seq_tag} WebSearch  "
+                        f"{_C_DIM}-- {_fmt_duration(elapsed)}{_C_RESET}"
                     )
-                    print(f"    \033[36m?\033[0m {q!r}")
+                    print(f"    {_C_CYAN}?{_C_RESET} {q!r}")
                 else:
                     inp_brief = brief_args(inp, limit=200)
                     print(
-                        f"  \033[34m[{tu_id[:8]}]\033[0m{seq_tag} {name}({inp_brief})  "
-                        f"\033[90m-- {_fmt_duration(elapsed)}\033[0m"
+                        f"  {_C_BLUE}[{tu_id[:8]}]{_C_RESET}{seq_tag} {name}({inp_brief})  "
+                        f"{_C_DIM}-- {_fmt_duration(elapsed)}{_C_RESET}"
                     )
         else:
-            print("Active tool calls: \033[90mnone\033[0m")
+            print(f"Active tool calls: {_C_DIM}none{_C_RESET}")
         print()
         if bg:
-            print(f"\033[1mBackground tasks\033[0m ({len(bg)}):")
+            print(f"{_C_BOLD}Background tasks{_C_RESET} ({len(bg)}):")
             for tid, info in bg.items():
                 elapsed = now - info.get("started_at", now)
                 print(
-                    f"  \033[35m[{tid[:8]}]\033[0m "
+                    f"  {_C_MAGENTA}[{tid[:8]}]{_C_RESET} "
                     f"{info.get('task_type', '?')}: "
                     f"{info.get('name') or '(unnamed)'}  "
-                    f"\033[90m-- running {_fmt_duration(elapsed)}\033[0m"
+                    f"{_C_DIM}-- running {_fmt_duration(elapsed)}{_C_RESET}"
                 )
         else:
-            print("Background tasks: \033[90mnone\033[0m")
+            print(f"Background tasks: {_C_DIM}none{_C_RESET}")
         print()
 
     def export_session(self, path_arg: str) -> None:
         sid = self.state.session_id
         if not sid:
             print(
-                "\033[33m[no active session id yet -- /export needs at least "
-                "one completed turn]\033[0m"
+                f"{_C_YELLOW}[no active session id yet -- /export needs at least "
+                f"one completed turn]{_C_RESET}"
             )
             return
         project_dir = _find_session_dir(sid)
         if project_dir is None:
             print(
-                f"\033[31m[session {sid[:8]} not found on disk; can't export]\033[0m"
+                f"{_C_RED}[session {sid[:8]} not found on disk; can't export]{_C_RESET}"
             )
             return
         jsonl = project_dir / f"{sid}.jsonl"
         if not jsonl.exists():
-            print(f"\033[31m[session file not found: {jsonl}]\033[0m")
+            print(f"{_C_RED}[session file not found: {jsonl}]{_C_RESET}")
             return
 
         out_path: Path
@@ -4954,56 +5132,56 @@ class Orchestrator:
         try:
             markdown = _render_session_markdown(jsonl)
         except Exception as e:  # noqa: BLE001
-            print(f"\033[31m[export failed while rendering: {e}]\033[0m")
+            print(f"{_C_RED}[export failed while rendering: {e}]{_C_RESET}")
             return
         try:
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(markdown, encoding="utf-8")
         except OSError as e:
-            print(f"\033[31m[export failed while writing: {e}]\033[0m")
+            print(f"{_C_RED}[export failed while writing: {e}]{_C_RESET}")
             return
         print(
-            f"\033[35m[exported -> {out_path.resolve()} "
-            f"({out_path.stat().st_size} bytes)]\033[0m"
+            f"{_C_MAGENTA}[exported -> {out_path.resolve()} "
+            f"({out_path.stat().st_size} bytes)]{_C_RESET}"
         )
 
     def rename_session(self, new_title: str) -> None:
         sid = self.state.session_id
         if not sid:
             print(
-                "\033[33m[no active session id yet -- run /rename after the "
-                "first turn so the session has been created]\033[0m"
+                f"{_C_YELLOW}[no active session id yet -- run /rename after the "
+                f"first turn so the session has been created]{_C_RESET}"
             )
             return
         new_title = new_title.strip()
         if not new_title:
             current = _read_session_title(sid)
             if current:
-                print(f"\033[35m[current title: {current}]\033[0m")
+                print(f"{_C_MAGENTA}[current title: {current}]{_C_RESET}")
             else:
-                print("\033[33m[no title set; usage: /rename <name>]\033[0m")
+                print(f"{_C_YELLOW}[no title set; usage: /rename <name>]{_C_RESET}")
             return
         duplicates = _find_sessions_with_title(new_title, exclude_id=sid)
         if duplicates:
             print(
-                f"\033[33m[warning: title '{new_title}' is already used by "
-                f"{len(duplicates)} other session(s):]\033[0m"
+                f"{_C_YELLOW}[warning: title '{new_title}' is already used by "
+                f"{len(duplicates)} other session(s):]{_C_RESET}"
             )
             for d in duplicates[:5]:
-                print(f"    \033[90m{d[:8]}\033[0m")
+                print(f"    {_C_DIM}{d[:8]}{_C_RESET}")
             if len(duplicates) > 5:
-                print(f"    \033[90m... +{len(duplicates) - 5} more\033[0m")
+                print(f"    {_C_DIM}... +{len(duplicates) - 5} more{_C_RESET}")
             print(
-                "\033[33m  (renaming anyway; the picker shows session ids "
-                "alongside titles so you can still tell them apart)\033[0m"
+                f"{_C_YELLOW}  (renaming anyway; the picker shows session ids "
+                f"alongside titles so you can still tell them apart){_C_RESET}"
             )
         try:
             _write_session_title(sid, new_title)
         except (OSError, ValueError) as e:
-            print(f"\033[31m[rename failed: {e}]\033[0m")
+            print(f"{_C_RED}[rename failed: {e}]{_C_RESET}")
             return
         self.state.session_title = new_title
-        print(f"\033[35m[renamed session {sid[:8]} -> '{new_title}']\033[0m")
+        print(f"{_C_MAGENTA}[renamed session {sid[:8]} -> '{new_title}']{_C_RESET}")
 
     def print_status(self) -> None:
         print()
@@ -5022,7 +5200,7 @@ class Orchestrator:
         if cwd_proj is not None and cwd_proj != cwd_expected:
             print(
                 f"  expected at  : {cwd_expected}  "
-                f"\033[33m(mismatch — case/normalization differs)\033[0m"
+                f"{_C_YELLOW}(mismatch — case/normalization differs){_C_RESET}"
             )
         print(f"  turns        : {self.state.turns}")
         print(f"  context      : ~{self.state.context_tokens} tokens")
@@ -5094,11 +5272,11 @@ class Orchestrator:
         fut: asyncio.Future[Any] = loop.create_future()
         header = _format_tool_header(tool_name, tool_input or {})
         _ring_bell(self.state, "requires-action")
-        print(f"\n\033[33m[permission] Claude wants to run:\033[0m")
+        print(f"\n{_C_YELLOW}[permission] Claude wants to run:{_C_RESET}")
         print(f"  {header}")
         print(
-            f"\033[90m  reply 'y' to allow, 'n' (or anything else) "
-            f"to deny, 'a' to allow and remember this tool\033[0m"
+            f"{_C_DIM}  reply 'y' to allow, 'n' (or anything else) "
+            f"to deny, 'a' to allow and remember this tool{_C_RESET}"
         )
         self._pending_permission = fut
         try:
@@ -5141,7 +5319,7 @@ class Orchestrator:
                     st.rate_limit_reset_bell_fired = True
                     st.rate_limit_status = None
                     _ring_bell(st, "rate-reset")
-                    print("\033[32m[rate-limit reset — ready to resume]\033[0m")
+                    print(f"{_C_GREEN}[rate-limit reset — ready to resume]{_C_RESET}")
                     try:
                         self.event_queue.put_nowait(
                             ("wakeup", "rate-limit reset")
@@ -5199,15 +5377,15 @@ class Orchestrator:
             return
         if not target.exists():
             print(
-                f"\033[33m[note: session's recorded cwd does not exist on this machine]"
-                f"\n\033[33m  recorded: {target}"
-                f"\n\033[33m  staying in: {current}\033[0m"
+                f"{_C_YELLOW}[note: session's recorded cwd does not exist on this machine]"
+                f"\n{_C_YELLOW}  recorded: {target}"
+                f"\n{_C_YELLOW}  staying in: {current}{_C_RESET}"
             )
             return
         print(
-            f"\033[35m[switching cwd to session's recorded directory]"
-            f"\n\033[35m  from: {current}"
-            f"\n\033[35m  to:   {target}\033[0m"
+            f"{_C_MAGENTA}[switching cwd to session's recorded directory]"
+            f"\n{_C_MAGENTA}  from: {current}"
+            f"\n{_C_MAGENTA}  to:   {target}{_C_RESET}"
         )
         self.args.cwd = str(target)
         # Reload MCP from the new cwd in case .mcp.json differs.
@@ -5222,7 +5400,7 @@ class Orchestrator:
         the project step."""
         projects = list_projects()
         if not projects:
-            print("\033[33m[no sessions found in ~/.claude/projects/]\033[0m")
+            print(f"{_C_YELLOW}[no sessions found in ~/.claude/projects/]{_C_RESET}")
             return None
 
         while True:
@@ -5241,7 +5419,7 @@ class Orchestrator:
                     )
                 except Exception as e:  # noqa: BLE001
                     print(
-                        f"\033[33m[picker UI failed ({e}); falling back to text]\033[0m"
+                        f"{_C_YELLOW}[picker UI failed ({e}); falling back to text]{_C_RESET}"
                     )
                     return self._pick_session_textfallback(projects)
                 if chosen_slug is None:
@@ -5254,7 +5432,7 @@ class Orchestrator:
             sessions = list_sessions_for_project(chosen_project["project_dir"])
             if not sessions:
                 print(
-                    f"\033[33m[no parseable sessions in {chosen_project['project_slug']}]\033[0m"
+                    f"{_C_YELLOW}[no parseable sessions in {chosen_project['project_slug']}]{_C_RESET}"
                 )
                 if len(projects) == 1:
                     return None
@@ -5274,14 +5452,14 @@ class Orchestrator:
                 )
             except Exception as e:  # noqa: BLE001
                 print(
-                    f"\033[33m[picker UI failed ({e}); falling back to text]\033[0m"
+                    f"{_C_YELLOW}[picker UI failed ({e}); falling back to text]{_C_RESET}"
                 )
                 return self._pick_sessions_in_project_textfallback(sessions)
             if chosen is None:
                 if len(projects) == 1:
                     return None
                 continue  # back to project picker
-            print(f"\033[35m[resuming session {chosen[:8]}]\033[0m")
+            print(f"{_C_MAGENTA}[resuming session {chosen[:8]}]{_C_RESET}")
             return chosen
 
     def _pick_session_textfallback(
@@ -5300,11 +5478,11 @@ class Orchestrator:
         try:
             chosen_project = projects[int(raw)]
         except (ValueError, IndexError):
-            print("\033[31m[invalid selection; cancelled]\033[0m")
+            print(f"{_C_RED}[invalid selection; cancelled]{_C_RESET}")
             return None
         sessions = list_sessions_for_project(chosen_project["project_dir"])
         if not sessions:
-            print("\033[33m[no parseable sessions in that project]\033[0m")
+            print(f"{_C_YELLOW}[no parseable sessions in that project]{_C_RESET}")
             return None
         return self._pick_sessions_in_project_textfallback(sessions)
 
@@ -5324,7 +5502,7 @@ class Orchestrator:
         try:
             return sessions[int(raw)]["session_id"]
         except (ValueError, IndexError):
-            print("\033[31m[invalid selection; cancelled]\033[0m")
+            print(f"{_C_RED}[invalid selection; cancelled]{_C_RESET}")
             return None
 
     # ---- SDK message dispatcher (persistent reader) --------------------
@@ -5344,7 +5522,7 @@ class Orchestrator:
             raise
         except Exception as e:  # noqa: BLE001
             print(
-                f"\033[31m[dispatcher error: {type(e).__name__}: {e}]\033[0m"
+                f"{_C_RED}[dispatcher error: {type(e).__name__}: {e}]{_C_RESET}"
             )
 
     def _handle_async_message(self, msg: Any) -> None:
@@ -5377,7 +5555,7 @@ class Orchestrator:
                 self.state.active_model = m
             for block in msg.content:
                 if isinstance(block, TextBlock):
-                    sys.stdout.write("\033[32mclaude (async):\033[0m ")
+                    sys.stdout.write(f"{_C_GREEN}claude (async):{_C_RESET} ")
                     self._claude_col = 16  # "claude (async): " width
                     self._write_indented(block.text, 16)
                     self._flush_claude_text()
@@ -5392,7 +5570,7 @@ class Orchestrator:
         elif isinstance(msg, UserMessage):
             content = msg.content
             if isinstance(content, str) and content.strip():
-                print(f"\033[35m[notice] {content.strip()}\033[0m")
+                print(f"{_C_MAGENTA}[notice] {content.strip()}{_C_RESET}")
             elif isinstance(content, list):
                 for block in content:
                     if isinstance(block, ToolResultBlock):
@@ -5503,7 +5681,7 @@ class Orchestrator:
         self._claude_col = 5
         self._claude_word_buf = ""
         self._claude_pending_indent = False
-        sys.stdout.write("\033[36myou:\033[0m ")
+        sys.stdout.write(f"{_C_CYAN}you:{_C_RESET} ")
         self._write_indented(prompt_text, 5, flush=True)
         self._flush_claude_text()
 
@@ -5534,7 +5712,7 @@ class Orchestrator:
                     for block in msg.content:
                         if isinstance(block, TextBlock):
                             if not in_text:
-                                sys.stdout.write("\033[32mclaude:\033[0m ")
+                                sys.stdout.write(f"{_C_GREEN}claude:{_C_RESET} ")
                                 in_text = True
                                 self._claude_col = 8  # "claude: " width
                             # Continuation lines (real \n + visual wraps)
@@ -5634,21 +5812,21 @@ class Orchestrator:
                             )
                             if self.args.show_thinking:
                                 print(
-                                    f"\033[90m[#{seq} -- "
+                                    f"{_C_DIM}[#{seq} -- "
                                     f"{_cmd_hint(f'/think {seq}')}"
-                                    f"]\033[0m  "
-                                    f"\033[36m(thinking)\033[0m  "
-                                    f"\033[90m{full_text.strip()}\033[0m"
+                                    f"]{_C_RESET}  "
+                                    f"{_C_CYAN}(thinking){_C_RESET}  "
+                                    f"{_C_DIM}{full_text.strip()}{_C_RESET}"
                                 )
                             else:
                                 # No snippet in the compact form — leave it to
                                 # /think N to fetch the full text, same way
                                 # Bash gets its command body via /show N.
                                 print(
-                                    f"\033[90m[#{seq} -- "
+                                    f"{_C_DIM}[#{seq} -- "
                                     f"{_cmd_hint(f'/think {seq}')}"
-                                    f"]\033[0m  "
-                                    f"\033[36m(thinking)\033[0m"
+                                    f"]{_C_RESET}  "
+                                    f"{_C_CYAN}(thinking){_C_RESET}"
                                 )
                     # End-of-AssistantMessage: flush a newline if we left
                     # an unterminated streamed-text line, otherwise
@@ -5676,10 +5854,10 @@ class Orchestrator:
                                 else ""
                             )
                             print(
-                                f"\033[31m[orchestrator] detected API error "
+                                f"{_C_RED}[orchestrator] detected API error "
                                 f"in assistant text{status_part} -- "
                                 f"treating as api_retry for stall "
-                                f"detection\033[0m"
+                                f"detection{_C_RESET}"
                             )
                             self._check_api_stall(
                                 error_status=status_code, error_info=None
@@ -5771,7 +5949,7 @@ class Orchestrator:
                         if in_text:
                             self._flush_claude_text()
                             in_text = False
-                        print(f"\033[35m[notice] {content.strip()}\033[0m")
+                        print(f"{_C_MAGENTA}[notice] {content.strip()}{_C_RESET}")
                 elif isinstance(msg, ResultMessage):
                     if in_text:
                         self._flush_claude_text()
@@ -5811,9 +5989,9 @@ class Orchestrator:
                     # separate "(interrupted -- your turn)" line when the
                     # user Ctrl-C'd, so the distinction is already clear.
                     print(
-                        f"\033[90m[turn done -- {msg.subtype} -- "
+                        f"{_C_DIM}[turn done -- {msg.subtype} -- "
                         f"{cost_part}ctx~{self.state.context_tokens} tok -- "
-                        f"{_fmt_duration(elapsed)}]\033[0m"
+                        f"{_fmt_duration(elapsed)}]{_C_RESET}"
                     )
                     break
                 else:
@@ -5909,13 +6087,13 @@ class Orchestrator:
                     low = line.strip().lower()
                     if low in ("y", "yes", "allow"):
                         fut.set_result(PermissionResultAllow())
-                        print("\033[32m[permission: allowed]\033[0m")
+                        print(f"{_C_GREEN}[permission: allowed]{_C_RESET}")
                     elif low in ("a", "always"):
                         fut.set_result(PermissionResultAllow())
                         print(
-                            "\033[32m[permission: allowed "
-                            "(note: per-tool remembering not yet implemented)]"
-                            "\033[0m"
+                            f"{_C_GREEN}[permission: allowed "
+                            f"(note: per-tool remembering not yet implemented)]"
+                            f"{_C_RESET}"
                         )
                     else:
                         fut.set_result(
@@ -5924,7 +6102,7 @@ class Orchestrator:
                                 interrupt=False,
                             )
                         )
-                        print("\033[31m[permission: denied]\033[0m")
+                        print(f"{_C_RED}[permission: denied]{_C_RESET}")
                     continue
                 # Multi-line paste: if any line is a standalone slash
                 # command (like /i), split the input — send the text
@@ -5960,8 +6138,8 @@ class Orchestrator:
                     # Unknown slash — forward to the CLI as a message
                     # (so /init, /skill-name, /agents, etc. still work).
                     print(
-                        f"\033[90m[forwarding {payload.split()[0]} "
-                        f"to the CLI as a message]\033[0m"
+                        f"{_C_DIM}[forwarding {payload.split()[0]} "
+                        f"to the CLI as a message]{_C_RESET}"
                     )
                     kind = "message"
                 if kind == "empty":
@@ -5969,32 +6147,32 @@ class Orchestrator:
                 if kind == "interrupt":
                     self.interrupt_event.set()
                     if not self.state.busy:
-                        print("\033[33m[nothing to interrupt]\033[0m")
+                        print(f"{_C_YELLOW}[nothing to interrupt]{_C_RESET}")
                     continue
                 if kind == "error":
-                    print(f"\033[31m[error] {payload}\033[0m")
+                    print(f"{_C_RED}[error] {payload}{_C_RESET}")
                     continue
                 if kind == "quit":
                     # Also interrupt so the worker ends quickly if mid-turn.
                     if self.state.busy:
                         self.interrupt_event.set()
                         print(
-                            "\033[33m[shutting down (interrupting current "
+                            f"{_C_YELLOW}[shutting down (interrupting current "
                             "turn; up to ~10s for the CLI to flush the "
-                            "session file)...]\033[0m"
+                            f"session file)...]{_C_RESET}"
                         )
                     else:
                         print(
-                            "\033[33m[shutting down (up to ~5s for the CLI "
-                            "to flush the session file)...]\033[0m"
+                            f"{_C_YELLOW}[shutting down (up to ~5s for the CLI "
+                            f"to flush the session file)...]{_C_RESET}"
                         )
                     await self.event_queue.put((kind, payload))
                     break
                 if kind == "force-quit":
                     print(
-                        "\033[31m[force-quit: killing CLI subprocess "
+                        f"{_C_RED}[force-quit: killing CLI subprocess "
                         "immediately -- last in-flight message may be "
-                        "lost from the JSONL]\033[0m"
+                        f"lost from the JSONL]{_C_RESET}"
                     )
                     sys.stdout.flush()
                     import os
@@ -6014,8 +6192,8 @@ class Orchestrator:
                     and self.state.busy
                 ):
                     print(
-                        f"\033[90m[/{kind} queued -- will run when the "
-                        f"current turn ends]\033[0m"
+                        f"{_C_DIM}[/{kind} queued -- will run when the "
+                        f"current turn ends]{_C_RESET}"
                     )
                 await self.event_queue.put((kind, payload))
         finally:
@@ -6041,7 +6219,7 @@ class Orchestrator:
             elif kind == "message":
                 injected.append(payload)
             elif kind == "compact":
-                print("\033[35m[orchestrator: compacting session]\033[0m")
+                print(f"{_C_MAGENTA}[orchestrator: compacting session]{_C_RESET}")
                 injected.append("/compact")
             elif kind == "wakeup":
                 # Async event arrived during/right at end of a turn; drop —
@@ -6087,13 +6265,13 @@ class Orchestrator:
                 self.show_todos()
             elif kind == "effort":
                 self.state.effort = None if payload == "auto" else payload
-                print(f"\033[35m[sys] effort -> {payload}\033[0m")
+                print(f"{_C_MAGENTA}[sys] effort -> {payload}{_C_RESET}")
                 reconnect_needed = True
             elif kind == "effort-show":
                 self.show_effort_info()
             elif kind == "model":
                 self.state.model = payload
-                print(f"\033[35m[sys] model -> {payload}\033[0m")
+                print(f"{_C_MAGENTA}[sys] model -> {payload}{_C_RESET}")
                 reconnect_needed = True
             elif kind == "model-show":
                 self.show_model_info()
@@ -6126,7 +6304,7 @@ class Orchestrator:
                 # driver loop if it's on AND Claude hasn't asked for
                 # user input ([WAITING]/[DONE]/burst). Otherwise just
                 # notify — user still needs to type to engage.
-                print(f"\033[36m[wakeup -- {payload}]\033[0m")
+                print(f"{_C_CYAN}[wakeup -- {payload}]{_C_RESET}")
                 resumable = (
                     payload.startswith("rate-limit")
                     or payload.startswith("api-status")
@@ -6182,13 +6360,13 @@ class Orchestrator:
                 self.show_todos()
             elif kind == "effort":
                 self.state.effort = None if payload == "auto" else payload
-                print(f"\033[35m[sys] effort -> {payload}\033[0m")
+                print(f"{_C_MAGENTA}[sys] effort -> {payload}{_C_RESET}")
                 await self._reconnect()
             elif kind == "effort-show":
                 self.show_effort_info()
             elif kind == "model":
                 self.state.model = payload
-                print(f"\033[35m[sys] model -> {payload}\033[0m")
+                print(f"{_C_MAGENTA}[sys] model -> {payload}{_C_RESET}")
                 await self._reconnect()
             elif kind == "model-show":
                 self.show_model_info()
@@ -6201,7 +6379,7 @@ class Orchestrator:
             if self.args.initial_prompt:
                 next_prompt: str | None = self.args.initial_prompt
             else:
-                print("\033[90m(type a first message, or /help)\033[0m")
+                print(f"{_C_DIM}(type a first message, or /help){_C_RESET}")
                 next_prompt = await self._await_user_or_quit()
 
             while next_prompt is not None and not self.stop_event.is_set():
@@ -6210,13 +6388,13 @@ class Orchestrator:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:  # noqa: BLE001
-                    print(f"\033[31m[error: {type(e).__name__}: {e}]\033[0m")
+                    print(f"{_C_RED}[error: {type(e).__name__}: {e}]{_C_RESET}")
                     if self.args.auto_reconnect:
-                        print("\033[33m[sys] auto-reconnecting...\033[0m")
+                        print(f"{_C_YELLOW}[sys] auto-reconnecting...{_C_RESET}")
                         try:
                             await self._reconnect()
                         except Exception as e2:  # noqa: BLE001
-                            print(f"\033[31m[reconnect failed: {e2}]\033[0m")
+                            print(f"{_C_RED}[reconnect failed: {e2}]{_C_RESET}")
                             next_prompt = await self._await_user_or_quit()
                             continue
                         next_prompt = self.state.continue_prompt
@@ -6243,7 +6421,7 @@ class Orchestrator:
 
                 if interrupted:
                     _ring_bell(self.state, "interrupt")
-                    print("\033[33m(interrupted -- your turn)\033[0m")
+                    print(f"{_C_YELLOW}(interrupted -- your turn){_C_RESET}")
                     next_prompt = await self._await_user_or_quit()
                     continue
 
@@ -6260,8 +6438,8 @@ class Orchestrator:
                         self.state.compact_during_last_turn = False
                         self.state.recent_turn_ends.clear()
                     print(
-                        "\033[36m[API-stalled -- waiting for Anthropic "
-                        "services to recover]\033[0m"
+                        f"{_C_CYAN}[API-stalled -- waiting for Anthropic "
+                        f"services to recover]{_C_RESET}"
                     )
                     next_prompt = await self._await_user_or_quit()
                     continue
@@ -6279,12 +6457,12 @@ class Orchestrator:
                     self.state.recent_turn_ends.clear()
                     if self.args.auto_continue:
                         print(
-                            "\033[90m[post-compact: auto-continuing]\033[0m"
+                            f"{_C_DIM}[post-compact: auto-continuing]{_C_RESET}"
                         )
                         next_prompt = self.state.continue_prompt
                     else:
                         print(
-                            "\033[90m[post-compact: waiting for your input]\033[0m"
+                            f"{_C_DIM}[post-compact: waiting for your input]{_C_RESET}"
                         )
                         next_prompt = await self._await_user_or_quit()
                     continue
@@ -6310,17 +6488,17 @@ class Orchestrator:
                     ):
                         remaining = cooldown - (self.state.turns - last)
                         print(
-                            f"\033[90m[ctx ~{self.state.context_tokens} tok "
+                            f"{_C_DIM}[ctx ~{self.state.context_tokens} tok "
                             f">= {self.args.compact_at}, but compacted "
                             f"{self.state.turns - last} turn(s) ago -- "
                             f"skipping re-compact ({remaining} more turn(s) "
-                            f"of cooldown)]\033[0m"
+                            f"of cooldown)]{_C_RESET}"
                         )
                     else:
                         print(
-                            f"\033[35m[orchestrator: compacting session "
+                            f"{_C_MAGENTA}[orchestrator: compacting session "
                             f"(ctx ~{self.state.context_tokens} tok >= "
-                            f"{self.args.compact_at})]\033[0m"
+                            f"{self.args.compact_at})]{_C_RESET}"
                         )
                         next_prompt = "/compact"
                         continue
@@ -6357,29 +6535,29 @@ class Orchestrator:
                 if waiting_emitted or done_emitted or burst:
                     if burst:
                         print(
-                            f"\033[33m[continue burst limit hit "
+                            f"{_C_YELLOW}[continue burst limit hit "
                             f"({self.args.continue_burst_limit} turns within "
                             f"{self.args.continue_burst_window:.0f}s without [WAITING]/[DONE]); "
-                            f"backing off]\033[0m"
+                            f"backing off]{_C_RESET}"
                         )
                         self.state.needs_user_attention = "burst"
                         msg_line = (
-                            "\033[36m[Claude is waiting -- your turn "
-                            "(or async wakeup on bg-task / requires-action)]\033[0m"
+                            f"{_C_CYAN}[Claude is waiting -- your turn "
+                            f"(or async wakeup on bg-task / requires-action)]{_C_RESET}"
                         )
                         _bell_event = "stalled"
                     elif done_emitted:
                         self.state.needs_user_attention = "done"
                         msg_line = (
-                            "\033[32m[Claude finished all tasks -- "
-                            "your turn]\033[0m"
+                            f"{_C_GREEN}[Claude finished all tasks -- "
+                            f"your turn]{_C_RESET}"
                         )
                         _bell_event = "done"
                     else:
                         self.state.needs_user_attention = "waiting"
                         msg_line = (
-                            "\033[36m[Claude is waiting -- your turn "
-                            "(or async wakeup on bg-task / requires-action)]\033[0m"
+                            f"{_C_CYAN}[Claude is waiting -- your turn "
+                            f"(or async wakeup on bg-task / requires-action)]{_C_RESET}"
                         )
                         _bell_event = "waiting"
                     self.state.recent_turn_ends.clear()
@@ -6389,8 +6567,8 @@ class Orchestrator:
                     continue
 
                 print(
-                    f"\033[90m[idle -- auto-continuing in {self.args.continue_response_delay:.1f}s; "
-                    f"type to interject]\033[0m"
+                    f"{_C_DIM}[idle -- auto-continuing in {self.args.continue_response_delay:.1f}s; "
+                    f"type to interject]{_C_RESET}"
                 )
                 grace_prompt = await self._await_user_or_quit(timeout=self.args.continue_response_delay)
                 if grace_prompt is None and self.stop_event.is_set():
@@ -6400,8 +6578,8 @@ class Orchestrator:
                 # not just toggle state for the next iteration.
                 if grace_prompt is None and not self.args.auto_continue:
                     print(
-                        "\033[90m[auto-continue turned off during grace "
-                        "window -- waiting for your input instead]\033[0m"
+                        f"{_C_DIM}[auto-continue turned off during grace "
+                        f"window -- waiting for your input instead]{_C_RESET}"
                     )
                     next_prompt = await self._await_user_or_quit()
                     continue
@@ -6419,13 +6597,13 @@ class Orchestrator:
         ok, reason = _check_authentication()
         if not ok:
             print(
-                f"\033[31m[auth error] {reason}\033[0m\n"
-                f"\033[33mTo authenticate, either:\n"
+                f"{_C_RED}[auth error] {reason}{_C_RESET}\n"
+                f"{_C_YELLOW}To authenticate, either:\n"
                 f"  • Run `claude login` in a terminal (subscription users), or\n"
                 f"  • Set ANTHROPIC_API_KEY in the environment (API users), or\n"
                 f"  • Set CLAUDE_CODE_USE_BEDROCK or CLAUDE_CODE_USE_VERTEX "
                 f"(enterprise cloud)\n"
-                f"Then start the orchestrator again.\033[0m"
+                f"Then start the orchestrator again.{_C_RESET}"
             )
             return
         # Resolve --resume FIRST (before PromptSession & history file are
@@ -6434,7 +6612,7 @@ class Orchestrator:
         if self.args.resume == _PICKER_SENTINEL:
             chosen = await self._pick_session()
             if chosen is None:
-                print("\033[33m[no session chosen — exiting]\033[0m")
+                print(f"{_C_YELLOW}[no session chosen — exiting]{_C_RESET}")
                 return
             self._initial_resume_id = chosen
         if self._initial_resume_id:
@@ -6587,9 +6765,9 @@ class Orchestrator:
                 show_tool_output=self.args.show_tool_output,
             )
             buffered = (
-                f"\033[90m[loading history from {history_jsonl.name} ...]\033[0m\n"
+                f"{_C_DIM}[loading history from {history_jsonl.name} ...]{_C_RESET}\n"
                 f"{history_text}"
-                f"\033[90m[end of history -- {n} message(s)]\033[0m\n"
+                f"{_C_DIM}[end of history -- {n} message(s)]{_C_RESET}\n"
             )
             # Orphan-bg detection was unreliable: the JSONL often lacks
             # task-notifications for bg bash tasks that were killed via
@@ -6615,7 +6793,7 @@ class Orchestrator:
         # Loud red warning about the unattended-mode footgun.
         if self.args.permission_mode == "bypassPermissions":
             print(
-                "\033[1;31m"
+                _C_BOLD_RED +
                 "!!  WARNING: bypass-permissions mode is ON.\n"
                 "!!  Claude can run ANY local command (Bash, including "
                 "`run_in_background=true`),\n"
@@ -6628,7 +6806,7 @@ class Orchestrator:
                 "!!  prompts you don't trust. Use --permission-mode default "
                 "(or acceptEdits) if you want\n"
                 "!!  approval prompts."
-                "\033[0m"
+                + _C_RESET
             )
 
         input_task = asyncio.create_task(self.input_loop(), name="input")
@@ -6648,7 +6826,7 @@ class Orchestrator:
         for t in done:
             exc = t.exception()
             if exc is not None and not isinstance(exc, asyncio.CancelledError):
-                print(f"\033[31m[fatal: {type(exc).__name__}: {exc}]\033[0m")
+                print(f"{_C_RED}[fatal: {type(exc).__name__}: {exc}]{_C_RESET}")
 
 
 def parse_args() -> argparse.Namespace:
