@@ -119,6 +119,23 @@ DEFAULT_COMPACT_THRESHOLD = 160_000
 DEFAULT_COMPACT_THRESHOLD_1M = 950_000
 
 
+_CMD_HINT_USE_BG = False  # flipped by --cmd-hint-style; see parse_args()
+
+
+def _cmd_hint(text: str) -> str:
+    """Render an inline slash-command hint (e.g. `/show 17 [-K]`) in
+    scrollback output. Style controlled by the module global
+    `_CMD_HINT_USE_BG`, set from --cmd-hint-style:
+      backticks (default) → `<text>`     — plain ASCII, copy-friendly.
+      bg                  → ANSI 256-color dark grey background around
+                            the text, no backticks.
+    Meant purely for visual A/B — either call site ultimately shows the
+    same command name."""
+    if _CMD_HINT_USE_BG:
+        return f"\033[48;5;236m{text}\033[49m"
+    return f"`{text}`"
+
+
 def _fmt_duration(seconds: float) -> str:
     """Compact duration: `4.2s`, `1m 23s`, `1h 4m 5s`, `18h 3m`."""
     if seconds < 60:
@@ -205,7 +222,10 @@ STYLE = Style.from_dict(
         "prompt": "ansibrightcyan bold",
         "bottom-toolbar": "bg:#222222 #aaaaaa",
         "bottom-toolbar.busy": "bg:#884400 #ffffff bold",
-        "bottom-toolbar.panel-hint": "bg:#111111 #888888",
+        # Note: `<panel-hint>` inside the toolbar adds this class; the
+        # plain "panel-hint" selector matches regardless of parent class,
+        # which is what prompt_toolkit's HTML processor expects.
+        "panel-hint": "bg:#111111 #888888",
         "claude": "ansigreen",
         "tool": "ansiblue",
         "tool-err": "ansired",
@@ -647,7 +667,11 @@ def _emit_bg_completion(
             turn_entry["usage"] = usage
     color = _BG_STATUS_COLORS.get(status, "\033[35m")
     marker = _BG_STATUS_MARKERS.get(status, "•")
-    seq_tag = f"[#{seq}] " if isinstance(seq, int) else ""
+    seq_tag = (
+        f"[#{seq} -- {_cmd_hint(f'/bg {seq} [-K]')}] "
+        if isinstance(seq, int)
+        else ""
+    )
     label = (name or summary or "(unnamed)").replace("\n", " ")
     # If this bg task originated from a Bash tool call, append the
     # command (inline if it fits, size hint otherwise).
@@ -1018,7 +1042,11 @@ def render_tool_use(
     # letter prefix needed.
     if seq is not None:
         if name == "Bash":
-            seq_prefix = f"\033[90m[#{seq} -- `/show {seq} [-K]`]\033[0m "
+            seq_prefix = (
+                f"\033[90m[#{seq} -- "
+                f"{_cmd_hint(f'/show {seq} [-K]')}"
+                f"]\033[0m "
+            )
         else:
             seq_prefix = f"\033[90m[#{seq}]\033[0m "
     else:
@@ -1270,7 +1298,11 @@ def _render_tool_result(
     Default is suppressed: a dim size indicator on success, a red one-liner
     on error — full content lives in the JSONL transcript and /export.
     `seq` (when provided) prints `[#N]` so the user can `/show N` later."""
-    seq_prefix = f"\033[90m[#{seq}]\033[0m " if seq is not None else ""
+    seq_prefix = (
+        f"\033[90m[#{seq} -- {_cmd_hint(f'/show {seq} [-K]')}]\033[0m "
+        if seq is not None
+        else ""
+    )
     if show_full:
         marker = (
             f"\033[31mtool-err:\033[0m"
@@ -2425,26 +2457,37 @@ PanelFn = Callable[["State"], "str | list[str]"]
 
 def _panel_session(state: "State") -> str:
     if state.busy:
-        busy = "<b><ansigreen>● WORKING</ansigreen></b>"
+        busy = "<b><ansigreen>WORKING</ansigreen></b>"
     elif state.needs_user_attention == "waiting":
-        busy = "<b><ansired>● WAITING</ansired></b>"
+        busy = "<b><ansiyellow>WAITING</ansiyellow></b>"
     elif state.needs_user_attention == "done":
-        busy = "<b><ansibrightcyan>● DONE</ansibrightcyan></b>"
+        busy = "<b><ansibrightcyan>done</ansibrightcyan></b>"
     elif state.needs_user_attention == "burst":
-        busy = "<b><ansibrightmagenta>● STALLED</ansibrightmagenta></b>"
+        busy = "<b><ansibrightmagenta>STALLED</ansibrightmagenta></b>"
     elif state.needs_user_attention == "api-error":
-        label = "● API-STALL"
+        label = "API-STALL"
         if state.api_status_description:
             desc = _tb_escape(state.api_status_description)[:40]
-            label = f"● API-STALL ({desc})"
+            label = f"API-STALL ({desc})"
         busy = f"<b><ansired>{label}</ansired></b>"
+    elif state.background_tasks:
+        # No foreground turn in flight, but bg shells / Task subagents
+        # are still running. The orchestrator is waiting on them before
+        # it would auto-continue; surface that as its own state so it
+        # isn't mistaken for plain idle.
+        busy = (
+            f"<ansimagenta>bg-wait "
+            f"({len(state.background_tasks)})</ansimagenta>"
+        )
     else:
         busy = "idle"
-    sid = (state.session_id or "(new)")[:8]
-    title_part = (
-        f"  <ansibrightcyan>★ {state.session_title}</ansibrightcyan>"
+    # Only surface the session name if one's been set (via /rename or
+    # Claude Code's auto-ai-title). Dropping the 8-char UUID prefix too,
+    # since it's not usable as --resume input and mostly added clutter.
+    session_field = (
+        f"session: <ansibrightcyan>{_tb_escape(state.session_title)}</ansibrightcyan>"
         if state.session_title
-        else ""
+        else None
     )
     if state.is_subscription:
         plan = state.subscription_plan or "sub"
@@ -2486,9 +2529,11 @@ def _panel_session(state: "State") -> str:
         ctx = f"ctx: ~?/{window_str} tok"
     # Returned as a list of self-contained sections so the toolbar
     # renderer can wrap section-by-section when the terminal is narrower
-    # than one full line.
-    return [
-        f"session: <b>{sid}</b>{title_part}",
+    # than one full line. Sections that resolve to None are dropped.
+    sections: list[str] = []
+    if session_field:
+        sections.append(session_field)
+    sections.extend([
         busy,
         ctx,
         f"turns: {state.turns}",
@@ -2496,7 +2541,8 @@ def _panel_session(state: "State") -> str:
         f"model: {_tb_escape(model_part)}",
         f"effort: {_tb_escape(effort_part)}",
         f"think: {think_part}",
-    ]
+    ])
+    return sections
 
 
 def _panel_tools(state: "State") -> str:
@@ -2859,7 +2905,7 @@ def format_session_label(s: dict[str, Any], width: int = 100) -> str:
     age = _format_session_age(s.get("mtime") or 0.0)
     title = s.get("title")
     if title:
-        msg = f"★ {title}"
+        msg = title
     else:
         msg = (
             s.get("last_user_msg")
@@ -2955,13 +3001,25 @@ class Orchestrator:
         width = _term_width(default=100)
         col = getattr(self, "_claude_col", 0)
         word = getattr(self, "_claude_word_buf", "")
+        pending_indent = getattr(self, "_claude_pending_indent", False)
         pad = " " * indent
         out: list[str] = []
+
+        def flush_pending() -> None:
+            """Lazy indent — only spend the padding spaces once a non-
+            newline char is about to be written. Empty lines stay empty
+            so they don't look like a gap before the prompt."""
+            nonlocal pending_indent, col
+            if pending_indent:
+                out.append(pad)
+                col = indent
+                pending_indent = False
 
         def emit_word(w: str) -> None:
             nonlocal col
             if not w:
                 return
+            flush_pending()
             # Word longer than a full line — split mid-word as a fallback.
             usable = max(1, width - indent)
             while col + len(w) > width and len(w) > usable:
@@ -2984,14 +3042,17 @@ class Orchestrator:
             if ch == "\n":
                 emit_word(word)
                 word = ""
-                out.append("\n" + pad)
-                col = indent
+                out.append("\n")
+                col = 0
+                pending_indent = True
             elif ch.isspace():
                 emit_word(word)
                 word = ""
+                flush_pending()
                 if col + 1 > width:
-                    out.append("\n" + pad)
-                    col = indent
+                    out.append("\n")
+                    col = 0
+                    pending_indent = True
                 else:
                     out.append(ch)
                     col += 1
@@ -3002,19 +3063,24 @@ class Orchestrator:
             word = ""
         self._claude_col = col
         self._claude_word_buf = word
+        self._claude_pending_indent = pending_indent
         sys.stdout.write("".join(out))
 
     def _flush_claude_text(self) -> None:
         """Close out a streamed claude text block: emit any buffered
         partial word at the indent recorded by the last `_write_indented`
-        call, then a trailing newline. Safe to call when nothing was
-        streamed."""
+        call, then a trailing newline *only if the cursor isn't already
+        at column 0*. Without this guard, a claude reply ending with
+        `\\n` would produce a blank line between the content and the
+        prompt; a reply ending with `\\n\\n` would produce two."""
         indent = getattr(self, "_claude_indent", 0)
         if getattr(self, "_claude_word_buf", ""):
             self._write_indented("", indent, flush=True)
-        sys.stdout.write("\n")
+        if getattr(self, "_claude_col", 0) != 0:
+            sys.stdout.write("\n")
         sys.stdout.flush()
         self._claude_col = 0
+        self._claude_pending_indent = False
 
     def _keybindings(self) -> KeyBindings:
         kb = KeyBindings()
@@ -4054,7 +4120,7 @@ class Orchestrator:
                     inp = h.get("input") or {}
                     print(
                         f"  originating tool: [#{t_seq}] {t_name} "
-                        f"(see /show {t_seq})"
+                        f"(see {_cmd_hint(f'/show {t_seq}')})"
                     )
                     if t_name == "Bash":
                         cmd = inp.get("command", "") or ""
@@ -4684,9 +4750,18 @@ class Orchestrator:
         turn_started = time.monotonic()
         self.turn_active.set()
 
-        preview = prompt_text if len(prompt_text) <= 160 else prompt_text[:157] + "..."
         print()
-        print(f"\033[36m> you:\033[0m {preview}")
+        # Echo the full prompt — no length cap; wrap continuation lines
+        # to line up under the first-line text after "> you: " (7 cols).
+        # Reset the streaming state explicitly so nothing from a prior
+        # claude-text block bleeds into the echo (stale word buffer or
+        # pending indent would drop/mangle the leading characters).
+        self._claude_col = 7
+        self._claude_word_buf = ""
+        self._claude_pending_indent = False
+        sys.stdout.write("\033[36m> you:\033[0m ")
+        self._write_indented(prompt_text, 7, flush=True)
+        self._flush_claude_text()
         print()
 
         watcher = asyncio.create_task(self._interrupt_watcher())
@@ -4804,7 +4879,9 @@ class Orchestrator:
                             )
                             if self.args.show_thinking:
                                 print(
-                                    f"\033[90m[#{seq} -- /think {seq}]\033[0m  "
+                                    f"\033[90m[#{seq} -- "
+                                    f"{_cmd_hint(f'/think {seq}')}"
+                                    f"]\033[0m  "
                                     f"\033[36m(thinking)\033[0m  "
                                     f"\033[90m{full_text.strip()}\033[0m"
                                 )
@@ -4813,7 +4890,9 @@ class Orchestrator:
                                 # /think N to fetch the full text, same way
                                 # Bash gets its command body via /show N.
                                 print(
-                                    f"\033[90m[#{seq} -- /think {seq}]\033[0m  "
+                                    f"\033[90m[#{seq} -- "
+                                    f"{_cmd_hint(f'/think {seq}')}"
+                                    f"]\033[0m  "
                                     f"\033[36m(thinking)\033[0m"
                                 )
                     # End-of-AssistantMessage: flush a newline if we left
@@ -5865,6 +5944,17 @@ def parse_args() -> argparse.Namespace:
         "unified diff. --inline-all-tools overrides this to 'full'.",
     )
     ap.add_argument(
+        "--cmd-hint-style",
+        choices=("backticks", "bg"),
+        default="backticks",
+        help="How inline slash-command hints render (e.g. the "
+        "`/show 17 [-K]` tag next to Bash tool calls). `backticks` "
+        "wraps the command in ASCII backticks (copy-friendly). `bg` "
+        "uses an ANSI 256-color dark-grey background behind the "
+        "command (no backticks). Purely visual; both forms reference "
+        "the same command.",
+    )
+    ap.add_argument(
         "--api-stall-limit",
         type=int,
         default=5,
@@ -5913,6 +6003,9 @@ def parse_args() -> argparse.Namespace:
     # Fill compact-at from the model when the user didn't specify.
     if args.compact_at is None:
         args.compact_at = _default_compact_at(args.model)
+    # Hoist --cmd-hint-style into the module global used by _cmd_hint().
+    global _CMD_HINT_USE_BG
+    _CMD_HINT_USE_BG = (args.cmd_hint_style == "bg")
     return args
 
 
