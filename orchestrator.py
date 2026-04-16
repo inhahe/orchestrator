@@ -205,6 +205,7 @@ STYLE = Style.from_dict(
         "prompt": "ansibrightcyan bold",
         "bottom-toolbar": "bg:#222222 #aaaaaa",
         "bottom-toolbar.busy": "bg:#884400 #ffffff bold",
+        "bottom-toolbar.panel-hint": "bg:#111111 #888888",
         "claude": "ansigreen",
         "tool": "ansiblue",
         "tool-err": "ansired",
@@ -417,6 +418,8 @@ def classify(line: str) -> tuple[str, str]:
     if cmd == "help":
         return "help", ""
     if cmd == "effort":
+        if not arg:
+            return "effort-show", ""
         val = arg.lower()
         if val in EFFORT_CHOICES:
             return "effort", val
@@ -424,7 +427,7 @@ def classify(line: str) -> tuple[str, str]:
     if cmd == "model":
         if arg:
             return "model", arg
-        return "error", "usage: /model <name>"
+        return "model-show", ""
     if cmd == "rename":
         return "rename", arg  # arg may be empty (means "show current title")
     if cmd in ("auto", "auto-continue"):
@@ -467,12 +470,31 @@ def classify(line: str) -> tuple[str, str]:
     if cmd in ("cost", "cwd"):
         return "status", ""
     # Unknown slash — send raw (the CLI may have skills that handle it).
-    return "message", s
+    return "passthrough-slash", s
 
 
 def brief_args(d: dict[str, Any], limit: int = 110) -> str:
     s = ", ".join(f"{k}={v!r}" for k, v in d.items())
     return s if len(s) <= limit else s[: limit - 3] + "..."
+
+
+def _print_one_line_tool(
+    header: str,
+    params_plain: str,
+    params_colored: str | None = None,
+) -> None:
+    """Print a tool's one-line header+params form. If the full visible
+    width fits within the terminal, print everything; otherwise collapse
+    the params to a compact `(N chars)` hint so the trailing portion
+    never wraps mid-line."""
+    if params_colored is None:
+        params_colored = params_plain
+    total = _visible_len(header) + len(params_plain)
+    if total <= _term_width(default=100) - 2:
+        print(header + params_colored)
+    else:
+        chars = len(params_plain.strip())
+        print(f"{header}  \033[90m({chars} chars)\033[0m")
 
 
 def _print_unified_diff(old: str, new: str, *, indent: str = "    ", max_lines: int = 80) -> None:
@@ -1010,22 +1032,33 @@ def render_tool_use(
         new = inp.get("new_string", "") or ""
         removed = len(old.splitlines()) or (1 if old else 0)
         added = len(new.splitlines()) or (1 if new else 0)
+        header = f"{seq_prefix}\033[34mtool \033[1m{tag}\033[0m"
         if effective_edits == "compact":
-            print(
-                f"{seq_prefix}\033[34mtool \033[1m{tag}\033[0m {path}  "
-                f"\033[90m(\033[32m+{added}\033[0m \033[31m-{removed}\033[0m"
-                f"\033[90m lines)\033[0m"
+            suffix_plain = f"  (+{added} -{removed} lines)"
+            suffix_colored = (
+                f"  \033[90m(\033[32m+{added}\033[0m "
+                f"\033[31m-{removed}\033[0m\033[90m lines)\033[0m"
+            )
+            _print_one_line_tool(
+                header,
+                f" {path}{suffix_plain}",
+                f" {path}{suffix_colored}",
             )
         else:
-            print(f"{seq_prefix}\033[34mtool \033[1m{tag}\033[0m {path}")
+            _print_one_line_tool(header, f" {path}")
             _print_unified_diff(old, new)
     elif name == "Write":
         path = inp.get("file_path", "?")
         content = inp.get("content", "") or ""
         line_count = len(content.splitlines())
-        print(
-            f"{seq_prefix}\033[34mtool \033[1mWrite\033[0m {path} "
-            f"\033[90m({line_count} lines, {len(content)} chars)\033[0m"
+        suffix_plain = f" ({line_count} lines, {len(content)} chars)"
+        suffix_colored = (
+            f" \033[90m({line_count} lines, {len(content)} chars)\033[0m"
+        )
+        _print_one_line_tool(
+            f"{seq_prefix}\033[34mtool \033[1mWrite\033[0m",
+            f" {path}{suffix_plain}",
+            f" {path}{suffix_colored}",
         )
         preview = content.splitlines()[:10]
         for ln in preview:
@@ -1036,7 +1069,10 @@ def render_tool_use(
         path = inp.get("notebook_path", "?")
         cell_id = inp.get("cell_id", "")
         mode = inp.get("edit_mode", "replace")
-        print(f"{seq_prefix}\033[34mtool \033[1mNotebookEdit\033[0m {path} cell={cell_id} mode={mode}")
+        _print_one_line_tool(
+            f"{seq_prefix}\033[34mtool \033[1mNotebookEdit\033[0m",
+            f" {path} cell={cell_id} mode={mode}",
+        )
         src = inp.get("new_source", "") or ""
         for ln in src.splitlines()[:12]:
             print(f"    \033[32m+{ln}\033[0m")
@@ -1048,38 +1084,48 @@ def render_tool_use(
         base = f"{seq_prefix}\033[34mtool \033[1m{tag}\033[0m"
         if desc:
             base += f" \033[90m— {desc}\033[0m"
-        # Inline the command itself when it's a single line that fits on
-        # the terminal. Otherwise fall back to a size hint. Keeps short
-        # Bash calls fully visible without the user having to /show.
         stripped = cmd.strip()
         cmd_lines = cmd.splitlines() or ([cmd] if cmd else [])
-        term_w = _term_width()
-        shown_inline = False
-        if stripped and len(cmd_lines) <= 1:
-            # Wrap the command in bright-cyan backticks so it's visually
-            # distinct from the dim description and the leading [#N] tag.
-            trial = f"{base}  \033[96m`{cmd}`\033[0m"
-            if _visible_len(trial) <= term_w:
-                print(trial)
-                shown_inline = True
-        if not shown_inline:
-            if stripped:
-                print(
-                    f"{base}  \033[90m({_cmd_size_hint(cmd)})\033[0m"
-                )
-            else:
-                print(base)
-        # --show-full-commands prints every line regardless of the inline
-        # fit heuristic (useful when you want verbatim even for short cmds).
-        if show_full_commands and not shown_inline:
+        if show_full_commands:
+            # Explicit full-command mode: always header + $-prefixed
+            # body, regardless of whether the command would have fit on
+            # the header line. Body lines align under each other.
+            print(base)
             for ln in cmd_lines or [cmd]:
                 print(f"    \033[36m$\033[0m {ln}")
+        else:
+            # Compact mode: inline the command on the header when it's a
+            # single line that fits; fall back to a size hint otherwise.
+            term_w = _term_width()
+            shown_inline = False
+            if stripped and len(cmd_lines) <= 1:
+                # Wrap in bright-cyan backticks so it's visually distinct
+                # from the dim description and the leading [#N] tag.
+                trial = f"{base}  \033[96m`{cmd}`\033[0m"
+                if _visible_len(trial) <= term_w:
+                    print(trial)
+                    shown_inline = True
+            if not shown_inline:
+                if stripped:
+                    # Show the command char/line count in place of the
+                    # command itself when it won't fit on one line.
+                    print(
+                        f"{base}  \033[90m({_cmd_size_hint(cmd)})\033[0m"
+                    )
+                else:
+                    print(base)
     elif name == "BashOutput":
         shell_id = inp.get("bash_id") or inp.get("shell_id") or "?"
-        print(f"{seq_prefix}\033[34mtool \033[1mBashOutput\033[0m shell={shell_id}")
+        _print_one_line_tool(
+            f"{seq_prefix}\033[34mtool \033[1mBashOutput\033[0m",
+            f" shell={shell_id}",
+        )
     elif name == "KillShell":
         shell_id = inp.get("shell_id") or inp.get("bash_id") or "?"
-        print(f"{seq_prefix}\033[34mtool \033[1mKillShell\033[0m shell={shell_id}")
+        _print_one_line_tool(
+            f"{seq_prefix}\033[34mtool \033[1mKillShell\033[0m",
+            f" shell={shell_id}",
+        )
     elif name == "TodoWrite":
         todos = inp.get("todos", []) or []
         print(f"{seq_prefix}\033[34mtool \033[1mTodoWrite\033[0m \033[90m({len(todos)} items)\033[0m")
@@ -1091,29 +1137,67 @@ def render_tool_use(
     elif name == "Task":
         desc = inp.get("description", "")
         subtype = inp.get("subagent_type", "general-purpose")
-        print(f"{seq_prefix}\033[34mtool \033[1mTask\033[0m \033[90m[{subtype}]\033[0m {desc}")
+        _print_one_line_tool(
+            f"{seq_prefix}\033[34mtool \033[1mTask\033[0m",
+            f" [{subtype}] {desc}",
+            f" \033[90m[{subtype}]\033[0m {desc}",
+        )
     elif name == "Read":
         path = inp.get("file_path", "?")
         offset = inp.get("offset")
         limit = inp.get("limit")
         tail = f" offset={offset} limit={limit}" if offset or limit else ""
-        print(f"{seq_prefix}\033[34mtool \033[1mRead\033[0m {path}{tail}")
+        _print_one_line_tool(
+            f"{seq_prefix}\033[34mtool \033[1mRead\033[0m",
+            f" {path}{tail}",
+        )
     elif name == "Grep":
         pattern = inp.get("pattern", "")
         path = inp.get("path", ".")
-        print(f"{seq_prefix}\033[34mtool \033[1mGrep\033[0m /{pattern}/ in {path}")
+        _print_one_line_tool(
+            f"{seq_prefix}\033[34mtool \033[1mGrep\033[0m",
+            f" /{pattern}/ in {path}",
+        )
     elif name == "Glob":
         pattern = inp.get("pattern", "")
         path = inp.get("path", ".")
-        print(f"{seq_prefix}\033[34mtool \033[1mGlob\033[0m {pattern} in {path}")
+        _print_one_line_tool(
+            f"{seq_prefix}\033[34mtool \033[1mGlob\033[0m",
+            f" {pattern} in {path}",
+        )
     elif name == "WebFetch":
         url = inp.get("url", "?")
-        print(f"{seq_prefix}\033[34mtool \033[1mWebFetch\033[0m {url}")
+        _print_one_line_tool(
+            f"{seq_prefix}\033[34mtool \033[1mWebFetch\033[0m",
+            f" {url}",
+        )
     elif name == "WebSearch":
         q = inp.get("query", "?")
-        print(f"{seq_prefix}\033[34mtool \033[1mWebSearch\033[0m {q!r}")
+        _print_one_line_tool(
+            f"{seq_prefix}\033[34mtool \033[1mWebSearch\033[0m",
+            f" {q!r}",
+        )
     else:
-        print(f"{seq_prefix}\033[34mtool \033[1m{name}\033[0m({brief_args(inp)})")
+        # Generic fallback (MCP tools, skill-provided tools, anything we
+        # don't have a dedicated renderer for): header on one line, each
+        # arg on its own line indented + aligned. Values are rendered via
+        # repr() so nested dicts/lists print structurally; long values
+        # wrap at terminal width to the same indent.
+        print(f"{seq_prefix}\033[34mtool \033[1m{name}\033[0m")
+        if inp:
+            keys = list(inp.keys())
+            keylen = max(len(str(k)) for k in keys)
+            for k in keys:
+                v = inp[k]
+                try:
+                    value_repr = repr(v)
+                except Exception:  # noqa: BLE001
+                    value_repr = str(v)
+                indent_n = 2 + keylen + 2  # "  " + key + ": "
+                wrapped = _wrap_text(value_repr, indent_n, indent_n)
+                print(
+                    f"  \033[90m{str(k):>{keylen}}:\033[0m {wrapped}"
+                )
 
 
 def summarize_tool_result(block: ToolResultBlock) -> str:
@@ -1193,13 +1277,19 @@ def _render_tool_result(
             if is_error
             else f"\033[34m->\033[0m"
         )
+        marker_visible = len("tool-err: ") if is_error else len("-> ")
+        indent_n = _visible_len(seq_prefix) + marker_visible
+        cont_indent = " " * indent_n
         lines = text.splitlines() or [text]
         if not lines or (len(lines) == 1 and not lines[0].strip()):
             print(f"{seq_prefix}{marker} (empty)")
             return
-        print(f"{seq_prefix}{marker} {lines[0]}")
+        # First line: after the prefix + marker + space. Subsequent lines
+        # get the continuation indent. Both go through _wrap_text so any
+        # line wider than the terminal wraps to the indent (not col 0).
+        print(f"{seq_prefix}{marker} {_wrap_text(lines[0], indent_n, indent_n)}")
         for ln in lines[1:]:
-            print(f"     {ln}")
+            print(f"{cont_indent}{_wrap_text(ln, indent_n, indent_n)}")
         return
     size = _humanize_size(text)
     if is_error:
@@ -1917,7 +2007,65 @@ def find_most_recent_session_for_cwd(cwd: str) -> Path | None:
     return max(candidates, key=lambda x: x[1])[0]
 
 
-def render_session_history_text(jsonl: Path) -> tuple[int, str]:
+def _wrap_text(text: str, indent: int, start_col: int = 0) -> str:
+    """Batch version of the streaming word-wrap used by `_write_indented`.
+    Wraps `text` at terminal width, breaking on word boundaries when
+    possible and inserting `indent` spaces after each wrap. `start_col`
+    is the visible column the text begins at (e.g., after a prefix like
+    "claude (history): "). Returns the wrapped string."""
+    width = _term_width(default=100)
+    if width - indent < 20:
+        return text
+    col = start_col
+    word = ""
+    out: list[str] = []
+    pad = " " * indent
+
+    def emit_word(w: str) -> None:
+        nonlocal col
+        if not w:
+            return
+        usable = max(1, width - indent)
+        while col + len(w) > width and len(w) > usable:
+            head = w[: max(1, width - col)]
+            if not head:
+                out.append("\n" + pad)
+                col = indent
+                continue
+            out.append(head)
+            w = w[len(head):]
+            out.append("\n" + pad)
+            col = indent
+        if col + len(w) > width:
+            out.append("\n" + pad)
+            col = indent
+        out.append(w)
+        col += len(w)
+
+    for ch in text:
+        if ch == "\n":
+            emit_word(word)
+            word = ""
+            out.append("\n" + pad)
+            col = indent
+        elif ch.isspace():
+            emit_word(word)
+            word = ""
+            if col + 1 > width:
+                out.append("\n" + pad)
+                col = indent
+            else:
+                out.append(ch)
+                col += 1
+        else:
+            word += ch
+    emit_word(word)
+    return "".join(out)
+
+
+def render_session_history_text(
+    jsonl: Path, *, show_tool_output: bool = False
+) -> tuple[int, str]:
     """Build the ANSI-colored backscroll for a session JSONL transcript.
     Returns (message_count, rendered_text). The caller is expected to write
     the whole string in one shot so the terminal doesn't scroll line-by-line
@@ -1950,8 +2098,25 @@ def render_session_history_text(jsonl: Path) -> tuple[int, str]:
                 content = msg.get("content")
                 if isinstance(content, str) and content.strip():
                     text = content.strip()
-                    if not (text.startswith("<bash") or text.startswith("<tool")):
-                        write(f"\n\033[36m> you (history):\033[0m {text}\n")
+                    # Filter out CLI-injected synthetic user messages.
+                    # Heuristic: real user input records carry a
+                    # `permissionMode` field; CLI-generated messages
+                    # (tool-result wrappers, task-notification pings,
+                    # "Unknown skill: X" slash-command errors,
+                    # local-command output, etc.) don't. Fall back to
+                    # tag-prefix sniffing for robustness across CLI
+                    # versions.
+                    has_perm_mode = "permissionMode" in rec
+                    looks_synthetic = (
+                        text.startswith("<bash")
+                        or text.startswith("<tool")
+                        or text.startswith("<task-notification")
+                        or text.startswith("<local-command")
+                    )
+                    if has_perm_mode and not looks_synthetic:
+                        # "> you: " is 7 visible chars.
+                        wrapped = _wrap_text(text, indent=7, start_col=7)
+                        write(f"\n\033[36m> you:\033[0m {wrapped}\n")
                         rendered += 1
                 elif isinstance(content, list):
                     for block in content:
@@ -1966,22 +2131,53 @@ def render_session_history_text(jsonl: Path) -> tuple[int, str]:
                                 else _extract_text(inner)
                             )
                             text = (text or "").strip()
-                            if text:
-                                if len(text) > 600:
-                                    text = (
-                                        text[:600]
-                                        + f"... [+{len(text) - 600} chars]"
+                            if not text:
+                                continue
+                            is_err = bool(block.get("is_error"))
+                            if not show_tool_output:
+                                # Match live default: dim "→ N lines, K chars"
+                                # on success, red error stub on failure.
+                                size = _humanize_size(text)
+                                if is_err:
+                                    write(
+                                        f"\033[31m✗ tool error\033[0m  "
+                                        f"\033[90m({size}; rerun with "
+                                        f"--show-tool-output to see)"
+                                        f"\033[0m\n"
                                     )
-                                tag = (
-                                    "\033[31m  tool-err:\033[0m"
-                                    if block.get("is_error")
-                                    else "\033[34m  ->\033[0m"
+                                else:
+                                    write(f"\033[90m→ {size}\033[0m\n")
+                                continue
+                            # show_tool_output on: full content (truncated
+                            # at 600 chars to keep the backscroll sane).
+                            if len(text) > 600:
+                                text = (
+                                    text[:600]
+                                    + f"... [+{len(text) - 600} chars]"
                                 )
-                                write(f"{tag} {text}\n")
+                            tag = (
+                                "\033[31mtool-err:\033[0m"
+                                if is_err
+                                else "\033[34m->\033[0m"
+                            )
+                            # Align continuation lines under the first
+                            # line's start (after tag + space).
+                            marker_visible = (
+                                len("tool-err: ") if is_err else len("-> ")
+                            )
+                            cont_indent = " " * marker_visible
+                            lines_out = text.splitlines() or [text]
+                            write(f"{tag} {lines_out[0]}\n")
+                            for ln in lines_out[1:]:
+                                write(f"{cont_indent}{ln}\n")
                         elif bt == "text" and isinstance(block.get("text"), str):
                             text = block["text"].strip()
                             if text:
-                                write(f"\n\033[36m> you (history):\033[0m {text}\n")
+                                wrapped = _wrap_text(text, indent=7, start_col=7)
+                                write(
+                                    f"\n\033[36m> you:\033[0m "
+                                    f"{wrapped}\n"
+                                )
                                 rendered += 1
             elif t == "assistant" and isinstance(msg, dict):
                 content = msg.get("content")
@@ -1996,21 +2192,57 @@ def render_session_history_text(jsonl: Path) -> tuple[int, str]:
                         text = (block.get("text") or "").strip()
                         if not text:
                             continue
+                        # "claude: " is 8 visible chars. When a second text
+                        # block follows in the same assistant message we
+                        # join with a space — column continues from where
+                        # the previous block left off.
                         if not started:
-                            write("\n\033[32mclaude (history):\033[0m ")
+                            write("\n\033[32mclaude:\033[0m ")
                             started = True
+                            wrapped = _wrap_text(text, indent=8, start_col=8)
                         else:
                             write(" ")
-                        write(text)
+                            wrapped = _wrap_text(text, indent=8, start_col=9)
+                        write(wrapped)
                     elif bt == "tool_use":
                         if started:
                             write("\n")
                             started = False
                         name = block.get("name", "?")
                         inp = block.get("input") or {}
-                        write(
-                            f"  \033[34mtool {name}\033[0m({brief_args(inp)})\n"
-                        )
+                        if show_tool_output:
+                            # Full detail: header + right-justified key/
+                            # value block (same as live generic fallback).
+                            write(f"\033[34mtool {name}\033[0m\n")
+                            if inp:
+                                keys = list(inp.keys())
+                                keylen = max(len(str(k)) for k in keys)
+                                for k in keys:
+                                    try:
+                                        value_repr = repr(inp[k])
+                                    except Exception:  # noqa: BLE001
+                                        value_repr = str(inp[k])
+                                    indent_n = 2 + keylen + 2
+                                    wrapped = _wrap_text(
+                                        value_repr, indent_n, indent_n
+                                    )
+                                    write(
+                                        f"  \033[90m{str(k):>{keylen}}:"
+                                        f"\033[0m {wrapped}\n"
+                                    )
+                        else:
+                            # Compact default: one-line `tool Foo(args)` with
+                            # args truncated to terminal width. Matches the
+                            # pre-key-value-block behavior.
+                            overhead = len(f"tool {name}(") + 1
+                            avail = max(
+                                10,
+                                _term_width(default=100) - overhead - 2,
+                            )
+                            write(
+                                f"\033[34mtool {name}\033[0m"
+                                f"({brief_args(inp, limit=avail)})\n"
+                            )
                     # thinking blocks intentionally skipped
                 if started:
                     write("\n")
@@ -2351,12 +2583,18 @@ def _describe_current_sub(info: dict[str, Any]) -> str:
 
 _LIVE_TASKS_CAP = 20  # max top-level tasks shown in the panel before overflow
 
+_PANEL_HEADER_BAND_WIDTH = 50  # dashes-around-title band, before centering
+
+
 def _panel_header(title: str) -> str:
-    """Center a section title inside a row of `-`s spanning the full
-    terminal width (minus the 2-char padding the toolbar adds on each
-    side). Makes the whole header line visually centered in the window."""
-    width = max(20, _term_width(default=100) - 2)
-    return f" {title} ".center(width, "-")
+    """A fixed-width band of dashes around the title (about 50 chars
+    total), padded with leading spaces to sit centered in the terminal.
+    Width-tunable via `_PANEL_HEADER_BAND_WIDTH`."""
+    band = f" {title} ".center(_PANEL_HEADER_BAND_WIDTH, "-")
+    # Toolbar wraps each row in 2 chars of padding; offset that.
+    avail = max(_PANEL_HEADER_BAND_WIDTH, _term_width(default=100) - 2)
+    pad = (avail - _PANEL_HEADER_BAND_WIDTH) // 2
+    return " " * pad + band
 
 
 def _panel_live_tasks(state: "State") -> list[str]:
@@ -2375,7 +2613,9 @@ def _panel_live_tasks(state: "State") -> list[str]:
     overflow = 0
     header_lines = [
         _panel_header("tasks"),
-        "(`/tasks`: all this turn, `/show N`: full detail)",
+        "<panel-hint>"
+        "(`/tasks`: list, `/show N`: detail, `/show N -K`: tail K lines of output)"
+        "</panel-hint>",
     ]
     for tid, info in state.active_tools.items():
         if info.get("parent_id"):
@@ -2520,9 +2760,9 @@ def _panel_live_bg(state: "State") -> list[str]:
     now = time.monotonic()
     out: list[str] = [
         _panel_header("background tasks"),
-        "<style bg='#111111'>"
-        "(`/bg`: list, `/bg N`: detail, `/bg N K`: tail K lines of output)"
-        "</style>",
+        "<panel-hint>"
+        "(`/bg`: list, `/bg N`: detail, `/bg N -K`: tail K lines of output)"
+        "</panel-hint>",
     ]
     overflow = 0
     rendered = 0
@@ -2697,6 +2937,84 @@ class Orchestrator:
         return servers
 
     # ---- prompt / UI ---------------------------------------------------
+
+    def _write_indented(self, text: str, indent: int, *, flush: bool = False) -> None:
+        """Stream `text` to stdout with continuation lines indented by
+        `indent` spaces. Real `\\n`s and visual wraps both land at the
+        indent column, and wrap points respect word boundaries — partial
+        words are buffered across chunks until a space/newline arrives.
+
+        State carried across calls:
+          self._claude_col — current visible column
+          self._claude_word_buf — characters of an in-progress word
+          self._claude_indent — last indent value seen, so the matching
+              `_flush_claude_text()` method knows what indent to use.
+        Pass flush=True at end-of-message to emit any trailing buffered
+        word before adding the closing newline."""
+        self._claude_indent = indent
+        width = _term_width(default=100)
+        col = getattr(self, "_claude_col", 0)
+        word = getattr(self, "_claude_word_buf", "")
+        pad = " " * indent
+        out: list[str] = []
+
+        def emit_word(w: str) -> None:
+            nonlocal col
+            if not w:
+                return
+            # Word longer than a full line — split mid-word as a fallback.
+            usable = max(1, width - indent)
+            while col + len(w) > width and len(w) > usable:
+                head = w[: max(1, width - col)]
+                if not head:  # already at end of line
+                    out.append("\n" + pad)
+                    col = indent
+                    continue
+                out.append(head)
+                w = w[len(head):]
+                out.append("\n" + pad)
+                col = indent
+            if col + len(w) > width:
+                out.append("\n" + pad)
+                col = indent
+            out.append(w)
+            col += len(w)
+
+        for ch in text:
+            if ch == "\n":
+                emit_word(word)
+                word = ""
+                out.append("\n" + pad)
+                col = indent
+            elif ch.isspace():
+                emit_word(word)
+                word = ""
+                if col + 1 > width:
+                    out.append("\n" + pad)
+                    col = indent
+                else:
+                    out.append(ch)
+                    col += 1
+            else:
+                word += ch
+        if flush:
+            emit_word(word)
+            word = ""
+        self._claude_col = col
+        self._claude_word_buf = word
+        sys.stdout.write("".join(out))
+
+    def _flush_claude_text(self) -> None:
+        """Close out a streamed claude text block: emit any buffered
+        partial word at the indent recorded by the last `_write_indented`
+        call, then a trailing newline. Safe to call when nothing was
+        streamed."""
+        indent = getattr(self, "_claude_indent", 0)
+        if getattr(self, "_claude_word_buf", ""):
+            self._write_indented("", indent, flush=True)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        self._claude_col = 0
 
     def _keybindings(self) -> KeyBindings:
         kb = KeyBindings()
@@ -3200,24 +3518,76 @@ class Orchestrator:
                                     "\033[32mclaude (btw):\033[0m "
                                 )
                                 in_text = True
-                            # Continuation lines line up under the text
-                            # after "claude (btw): " (14 visible chars).
-                            sys.stdout.write(
-                                block.text.replace("\n", "\n" + " " * 14)
-                            )
+                                self._claude_col = 14  # "claude (btw): " width
+                            # Continuation lines line up under the text;
+                            # also handles visual wraps on long lines.
+                            self._write_indented(block.text, 14)
                             sys.stdout.flush()
                 elif isinstance(msg, ResultMessage):
                     if in_text:
-                        print()
+                        self._flush_claude_text()
                         in_text = False
                     break
         except Exception as e:  # noqa: BLE001
             if in_text:
-                print()
+                self._flush_claude_text()
             print(f"\033[31m[btw failed: {e}]\033[0m")
             return
         if in_text:
-            print()
+            self._flush_claude_text()
+
+    # Known model IDs for `/model` listing. Not exhaustive — MCP/custom
+    # setups may have more — but covers the stock set the CLI ships with.
+    _KNOWN_MODELS = (
+        ("claude-opus-4-6", "Opus 4.6 (200k context)"),
+        ("claude-opus-4-6[1m]", "Opus 4.6, 1M-context variant"),
+        ("claude-sonnet-4-6", "Sonnet 4.6"),
+        ("claude-haiku-4-5-20251001", "Haiku 4.5"),
+        ("(omit --model / /model <blank>)", "CLI picks tier-appropriate default"),
+    )
+
+    def show_model_info(self) -> None:
+        pinned = self.state.model
+        active = self.state.active_model
+        print()
+        if pinned:
+            print(f"\033[1mcurrent model\033[0m (pinned): {pinned}")
+        elif active:
+            print(f"\033[1mcurrent model\033[0m (CLI-picked): {active}")
+        else:
+            print(
+                "\033[1mcurrent model\033[0m: (auto — no AssistantMessage "
+                "received yet)"
+            )
+        print()
+        print("\033[1mknown models\033[0m:")
+        for model_id, desc in self._KNOWN_MODELS:
+            print(f"  \033[34m{model_id}\033[0m  \033[90m— {desc}\033[0m")
+        print()
+        print("\033[90m/model <id> to change. Reconnects and resumes the session.\033[0m")
+        print()
+
+    def show_effort_info(self) -> None:
+        current = self.state.effort or "auto"
+        print()
+        print(f"\033[1mcurrent effort\033[0m: {current}")
+        print()
+        print("\033[1mavailable levels\033[0m:")
+        descs = {
+            "auto": "no override — model picks its default (typically 'high')",
+            "low": "minimal thinking budget",
+            "medium": "moderate thinking budget",
+            "high": "generous thinking budget",
+            "max": "maximum thinking budget",
+        }
+        for level in EFFORT_CHOICES:
+            print(
+                f"  \033[34m{level}\033[0m  "
+                f"\033[90m— {descs.get(level, '')}\033[0m"
+            )
+        print()
+        print("\033[90m/effort <level> to change. Reconnects and resumes the session.\033[0m")
+        print()
 
     def set_autocompact(self, payload: str) -> None:
         p = payload.strip().lower()
@@ -3569,36 +3939,47 @@ class Orchestrator:
         return index
 
     def show_bg_tasks(self, payload: str = "") -> None:
-        """`/bg` — one-liner summary of every bg task relevant to this turn
-        (started this turn + any carryover still running).
-        `/bg N` — full detail for task `[#N]`, including output_file and
-                  any stored summary.
-        `/bg N K` — same, plus tail the last K lines of the output_file."""
+        """`/bg` — summary of bg tasks (this turn + running carryover).
+        `/bg N` — full detail for task `[#N]`.
+        `/bg N -K` — detail + tail K lines of `output_file`.
+        `/bg N1 N2 N3` — detail for several bg tasks.
+        `/bg N1 -K1 N2 -K2` — mix freely; each negative arg is the tail
+                              count for the entry just before it.
+        Parallel to `/show` so the two commands behave identically."""
         parts = payload.split()
         index = self._bg_entry_index()
         if not parts:
             self._print_bg_summary(index)
             return
         try:
-            n = int(parts[0])
+            nums = [int(p) for p in parts]
         except ValueError:
             print(
-                "\033[31m[error: usage /bg [N [K]] — N is the bg task "
-                "number, K is lines to tail from output_file]\033[0m"
+                "\033[31m[error: usage /bg [N [-K]] [N2 [-K2]] ... — "
+                "positive ints are bg task numbers, -K (negative) is "
+                "tail lines for the entry just before it]\033[0m"
             )
             return
-        tail_lines: int | None = None
-        if len(parts) > 1:
-            try:
-                tail_lines = int(parts[1])
-            except ValueError:
-                print("\033[31m[error: K (tail lines) must be an integer]\033[0m")
+        i = 0
+        while i < len(nums):
+            n = nums[i]
+            if n < 0:
+                print(
+                    f"\033[31m[error: standalone negative {n} — "
+                    f"tail must follow a bg task number]\033[0m"
+                )
                 return
-        match = index.get(n)
-        if match is None:
-            print(f"\033[33m[bg #{n} not found]\033[0m")
-            return
-        self._print_bg_detail(match[0], match[1], tail_lines)
+            tail_k: int | None = None
+            if i + 1 < len(nums) and nums[i + 1] < 0:
+                tail_k = -nums[i + 1]
+                i += 2
+            else:
+                i += 1
+            match = index.get(n)
+            if match is None:
+                print(f"\033[33m[bg #{n} not found]\033[0m")
+                continue
+            self._print_bg_detail(match[0], match[1], tail_k)
 
     def _print_bg_summary(self, index: dict[int, tuple[str, dict[str, Any]]]) -> None:
         now = time.monotonic()
@@ -3740,8 +4121,14 @@ class Orchestrator:
             f"  \033[1mtail\033[0m -{n}  "
             f"\033[90m(showing {len(tail)} of {total} lines)\033[0m"
         )
+        # Each tail line is indented to 4 spaces so visual wraps of long
+        # lines land at the same column (matches the tool-output style).
+        indent_n = 4
+        cont_indent = " " * indent_n
         for ln in tail:
-            print(f"    {ln.rstrip()}")
+            print(
+                f"{cont_indent}{_wrap_text(ln.rstrip(), indent_n, indent_n)}"
+            )
 
     def show_tools(self) -> None:
         active = self.state.active_tools
@@ -4183,8 +4570,10 @@ class Orchestrator:
                 self.state.active_model = m
             for block in msg.content:
                 if isinstance(block, TextBlock):
-                    indented = block.text.replace("\n", "\n" + " " * 16)
-                    print(f"\033[32mclaude (async):\033[0m {indented}")
+                    sys.stdout.write("\033[32mclaude (async):\033[0m ")
+                    self._claude_col = 16  # "claude (async): " width
+                    self._write_indented(block.text, 16)
+                    self._flush_claude_text()
                 elif isinstance(block, ToolUseBlock):
                     render_tool_use(
                         block,
@@ -4250,6 +4639,14 @@ class Orchestrator:
                 tid = (d.get("task_id") or "?")[:8]
                 status = d.get("status", "?")
                 return f"bg-task {tid} {status}"
+            if sub == "task_updated":
+                # Newer patch-style completion event. Only wake on terminal
+                # statuses, mirroring the renderer's filter.
+                patch = d.get("patch") if isinstance(d.get("patch"), dict) else {}
+                status = patch.get("status")
+                if status in ("completed", "failed", "stopped", "cancelled"):
+                    tid = (d.get("task_id") or "?")[:8]
+                    return f"bg-task {tid} {status}"
             if sub == "session_state_changed" and d.get("state") == "requires_action":
                 return "session requires action"
         return None
@@ -4321,19 +4718,15 @@ class Orchestrator:
                             if not in_text:
                                 sys.stdout.write("\033[32mclaude:\033[0m ")
                                 in_text = True
-                            # Continuation lines indent to line up with the
-                            # text after "claude: " (8 visible chars). The
-                            # end-of-message `\n` flush below moves the
-                            # cursor back to column 0 regardless of any
-                            # trailing indent emitted here.
-                            sys.stdout.write(
-                                block.text.replace("\n", "\n" + " " * 8)
-                            )
+                                self._claude_col = 8  # "claude: " width
+                            # Continuation lines (real \n + visual wraps)
+                            # indent to line up with the first line.
+                            self._write_indented(block.text, 8)
                             sys.stdout.flush()
                             assistant_parts.append(block.text)
                         elif isinstance(block, ToolUseBlock):
                             if in_text:
-                                sys.stdout.write("\n")
+                                self._flush_claude_text()
                                 in_text = False
                             parent_id = getattr(msg, "parent_tool_use_id", None)
                             seq = self.state.next_tool_seq
@@ -4397,7 +4790,7 @@ class Orchestrator:
                             )
                         elif ThinkingBlock is not None and isinstance(block, ThinkingBlock):
                             if in_text:
-                                sys.stdout.write("\n")
+                                self._flush_claude_text()
                                 in_text = False
                             full_text = block.thinking or ""
                             seq = self.state.next_thinking_seq
@@ -4412,7 +4805,7 @@ class Orchestrator:
                             if self.args.show_thinking:
                                 print(
                                     f"\033[90m[#{seq} -- /think {seq}]\033[0m  "
-                                    f"\033[96m(thinking)\033[0m  "
+                                    f"\033[36m(thinking)\033[0m  "
                                     f"\033[90m{full_text.strip()}\033[0m"
                                 )
                             else:
@@ -4421,15 +4814,14 @@ class Orchestrator:
                                 # Bash gets its command body via /show N.
                                 print(
                                     f"\033[90m[#{seq} -- /think {seq}]\033[0m  "
-                                    f"\033[96m(thinking)\033[0m"
+                                    f"\033[36m(thinking)\033[0m"
                                 )
                     # End-of-AssistantMessage: flush a newline if we left
                     # an unterminated streamed-text line, otherwise
                     # patch_stdout buffers it and the prompt redraws on
                     # top of the partial line.
                     if in_text:
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
+                        self._flush_claude_text()
                         in_text = False
                     # The CLI sometimes emits transport/API errors as
                     # *assistant text* after its own retry budget runs out.
@@ -4464,7 +4856,7 @@ class Orchestrator:
                         for block in content:
                             if isinstance(block, ToolResultBlock):
                                 if in_text:
-                                    sys.stdout.write("\n")
+                                    self._flush_claude_text()
                                     in_text = False
                                 active = self.state.active_tools.pop(
                                     block.tool_use_id, None
@@ -4607,6 +4999,14 @@ class Orchestrator:
                 if line is None:
                     continue
                 kind, payload = classify(line)
+                if kind == "passthrough-slash":
+                    # Unknown slash — forward to the CLI as a message
+                    # (so /init, /skill-name, /agents, etc. still work).
+                    print(
+                        f"\033[90m[forwarding {payload.split()[0]} "
+                        f"to the CLI as a message]\033[0m"
+                    )
+                    kind = "message"
                 if kind == "empty":
                     continue
                 if kind == "interrupt":
@@ -4642,6 +5042,23 @@ class Orchestrator:
                     sys.stdout.flush()
                     import os
                     os._exit(0)
+                # Acknowledge slash-commands at queue time so the user
+                # sees that the orchestrator received them, even when
+                # the worker can't process them until the current turn
+                # ends. `message` is excluded because unknown-slash
+                # forwarding already printed a `[forwarding ...]` line
+                # above and a second receipt would be noise; non-slash
+                # plain-text inputs are filtered by the line.startswith
+                # check.
+                if (
+                    line.startswith("/")
+                    and kind not in ("message", "compact")
+                    and self.state.busy
+                ):
+                    print(
+                        f"\033[90m[/{kind} queued -- will run when the "
+                        f"current turn ends]\033[0m"
+                    )
                 await self.event_queue.put((kind, payload))
         finally:
             self.stop_event.set()
@@ -4666,6 +5083,7 @@ class Orchestrator:
             elif kind == "message":
                 injected.append(payload)
             elif kind == "compact":
+                print("\033[35m[orchestrator: compacting session]\033[0m")
                 injected.append("/compact")
             elif kind == "wakeup":
                 # Async event arrived during/right at end of a turn; drop —
@@ -4709,10 +5127,14 @@ class Orchestrator:
                 self.state.effort = None if payload == "auto" else payload
                 print(f"\033[35m[sys] effort -> {payload}\033[0m")
                 reconnect_needed = True
+            elif kind == "effort-show":
+                self.show_effort_info()
             elif kind == "model":
                 self.state.model = payload
                 print(f"\033[35m[sys] model -> {payload}\033[0m")
                 reconnect_needed = True
+            elif kind == "model-show":
+                self.show_model_info()
         return injected, reconnect_needed, quit_requested
 
     async def _await_user_or_quit(self, timeout: float | None = None) -> str | None:
@@ -4777,10 +5199,14 @@ class Orchestrator:
                 self.state.effort = None if payload == "auto" else payload
                 print(f"\033[35m[sys] effort -> {payload}\033[0m")
                 await self._reconnect()
+            elif kind == "effort-show":
+                self.show_effort_info()
             elif kind == "model":
                 self.state.model = payload
                 print(f"\033[35m[sys] model -> {payload}\033[0m")
                 await self._reconnect()
+            elif kind == "model-show":
+                self.show_model_info()
             # loop and keep waiting
 
     async def worker_loop(self) -> None:
@@ -4902,8 +5328,9 @@ class Orchestrator:
                         )
                     else:
                         print(
-                            f"\033[35m[ctx ~{self.state.context_tokens} tok "
-                            f">= {self.args.compact_at}; compacting]\033[0m"
+                            f"\033[35m[orchestrator: compacting session "
+                            f"(ctx ~{self.state.context_tokens} tok >= "
+                            f"{self.args.compact_at})]\033[0m"
                         )
                         next_prompt = "/compact"
                         continue
@@ -4957,6 +5384,19 @@ class Orchestrator:
                     next_prompt = await self._await_user_or_quit()
                     continue
 
+                # Don't nudge Claude with the continue prompt while bg
+                # tasks are still running — wait for them to finish (or
+                # for you to interject). The async wakeup that fires on
+                # task_notification will land here and re-evaluate.
+                if self.state.background_tasks:
+                    print(
+                        f"\033[90m[bg tasks running "
+                        f"({len(self.state.background_tasks)}); waiting -- "
+                        f"will wake on bg completion or your input]\033[0m"
+                    )
+                    next_prompt = await self._await_user_or_quit()
+                    continue
+
                 print(
                     f"\033[90m[idle -- auto-continuing in {self.args.continue_response_delay:.1f}s; "
                     f"type to interject]\033[0m"
@@ -4964,6 +5404,16 @@ class Orchestrator:
                 grace_prompt = await self._await_user_or_quit(timeout=self.args.continue_response_delay)
                 if grace_prompt is None and self.stop_event.is_set():
                     break
+                # Re-check auto_continue after the wait — `/auto off` typed
+                # during the grace window should cancel the queued nudge,
+                # not just toggle state for the next iteration.
+                if grace_prompt is None and not self.args.auto_continue:
+                    print(
+                        "\033[90m[auto-continue turned off during grace "
+                        "window -- waiting for your input instead]\033[0m"
+                    )
+                    next_prompt = await self._await_user_or_quit()
+                    continue
                 next_prompt = grace_prompt if grace_prompt is not None else CONTINUE_PROMPT
         finally:
             await self._disconnect()
@@ -5021,24 +5471,33 @@ class Orchestrator:
             refresh_interval=0.5,  # keep toolbar's busy/ctx/cost fields fresh
         )
 
-        # Force a layout invalidation only when the buffer's line count
-        # *shrinks*. Without this, prompt_toolkit doesn't always reduce
-        # its rendered footprint after a deletion — the toolbar visibly
-        # stays at the deeper position until the next external event.
-        # Per-keystroke invalidation isn't needed: typing/expanding lines
-        # already triggers prompt_toolkit's own redraw path.
+        # When the buffer's line count *shrinks*, prompt_toolkit's
+        # renderer doesn't drop the previously-claimed height by itself —
+        # `app.invalidate()` alone marks the layout dirty but the
+        # renderer keeps its old footprint, so the toolbar stays pushed
+        # down. `renderer.reset()` resets the renderer's internal state
+        # (last-screen height etc.) so the next render computes a fresh
+        # layout — typically lighter-weight than `renderer.erase()`.
+        # Per-keystroke work isn't needed: typing/expanding lines is
+        # handled fine by prompt_toolkit's own redraw path.
         try:
             buf = self.session.default_buffer
             self._last_input_line_count = buf.document.line_count
-            def _invalidate_on_shrink(_buf):  # type: ignore[no-untyped-def]
+            def _shrink_redraw(_buf):  # type: ignore[no-untyped-def]
                 lc = _buf.document.line_count
                 prev = getattr(self, "_last_input_line_count", lc)
                 self._last_input_line_count = lc
-                if lc < prev:
-                    app = self.session.app if self.session else None
-                    if app is not None:
-                        app.invalidate()
-            buf.on_text_changed += _invalidate_on_shrink
+                if lc >= prev:
+                    return
+                app = self.session.app if self.session else None
+                if app is None:
+                    return
+                try:
+                    app.renderer.reset()
+                except Exception:  # noqa: BLE001
+                    pass
+                app.invalidate()
+            buf.on_text_changed += _shrink_redraw
         except Exception:  # noqa: BLE001
             pass  # buffer not available yet on this prompt_toolkit version
 
@@ -5118,7 +5577,10 @@ class Orchestrator:
         # syscall so the terminal doesn't appear to scroll line-by-line
         # while we're populating it.
         if history_jsonl is not None:
-            n, history_text = render_session_history_text(history_jsonl)
+            n, history_text = render_session_history_text(
+                history_jsonl,
+                show_tool_output=self.args.show_tool_output,
+            )
             buffered = (
                 f"\033[90m[loading history from {history_jsonl.name} ...]\033[0m\n"
                 f"{history_text}"
