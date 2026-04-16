@@ -140,6 +140,7 @@ def _cmd_hint(text: str) -> str:
 _BELL_EVENT_NAMES = frozenset({
     "turn-done", "waiting", "done", "stalled",
     "api-stall", "api-ok", "interrupt", "bg-done", "requires-action",
+    "rate-hit", "rate-reset",
 })
 
 
@@ -219,6 +220,19 @@ def _fire_pending_bell(state: "State") -> None:
     if ev in state.bell_events:
         sys.stdout.write("\a")
         sys.stdout.flush()
+
+
+def _fmt_reset_time(ts: int) -> str:
+    """Format a unix timestamp as a compact local date/time relative to
+    now. Same-day: `H:MM am/pm`. Other day: `MMM DD H:MM`."""
+    try:
+        when = time.localtime(ts)
+    except (OverflowError, OSError, ValueError):
+        return str(ts)
+    now = time.localtime()
+    if when.tm_year == now.tm_year and when.tm_yday == now.tm_yday:
+        return time.strftime("%I:%M%p", when).lstrip("0").lower()
+    return time.strftime("%b %d %I:%M%p", when).replace(" 0", " ").lower()
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -472,6 +486,13 @@ class State:
     pending_bell: str | None = None
     rate_limit_util: float | None = None
     rate_limit_label: str | None = None
+    # Populated when rate_limit_info.status == "rejected" (rate limit hit).
+    # Cleared once resets_at has passed.
+    rate_limit_status: str | None = None  # "allowed" / "allowed_warning" / "rejected" / None
+    rate_limit_resets_at: int | None = None  # unix timestamp
+    # True once we've rung the bell for the most recent rate-limit reset
+    # passing, so we don't ring on every toolbar refresh after the fact.
+    rate_limit_reset_bell_fired: bool = False
 
 
 _SUBSCRIPTION_RL_TYPES = frozenset(
@@ -493,6 +514,37 @@ def _detect_subscription() -> bool:
         if val and val not in ("0", "false", "no"):
             return False
     return True
+
+
+def _check_authentication() -> tuple[bool, str]:
+    """Check whether Claude Code has credentials available. Returns
+    (ok, reason) — `ok=False` means the CLI subprocess won't be able
+    to authenticate and the orchestrator should exit with a clear
+    error instead of hanging in the SDK."""
+    # API / cloud-routing env vars — accept any of the three.
+    if os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        return True, "ANTHROPIC_API_KEY set"
+    for v in ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"):
+        val = os.environ.get(v, "").strip().lower()
+        if val and val not in ("0", "false", "no"):
+            return True, f"{v} set"
+    # Subscription OAuth — the CLI's credentials.json.
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    path = Path(base if base else Path.home() / ".claude") / ".credentials.json"
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+            if isinstance(oauth, dict) and oauth.get("accessToken"):
+                return True, f"OAuth credentials at {path}"
+        except (OSError, ValueError) as e:
+            return False, f"credentials file {path} exists but is unreadable: {e}"
+    return False, (
+        "no Claude Code credentials found — neither ANTHROPIC_API_KEY "
+        "nor cloud-routing env vars are set, and there's no OAuth "
+        f"token at {path}"
+    )
 
 
 def _detect_subscription_plan() -> str | None:
@@ -543,15 +595,29 @@ def _apply_rate_limit_info(state: "State", info: Any) -> None:
     if isinstance(info, dict):
         rl_type = info.get("rate_limit_type")
         util = info.get("utilization")
+        status = info.get("status")
+        resets_at = info.get("resets_at")
     else:
         rl_type = getattr(info, "rate_limit_type", None)
         util = getattr(info, "utilization", None)
+        status = getattr(info, "status", None)
+        resets_at = getattr(info, "resets_at", None)
     if rl_type in _SUBSCRIPTION_RL_TYPES:
         state.is_subscription = True
     if isinstance(util, (int, float)):
         state.rate_limit_util = float(util)
     if isinstance(rl_type, str):
         state.rate_limit_label = _RL_TYPE_LABEL.get(rl_type, rl_type)
+    if isinstance(status, str):
+        # On transition into `rejected`, ring the rate-hit bell and
+        # reset the "rate-reset bell already fired" latch so the next
+        # resets_at pass fires cleanly.
+        if status == "rejected" and state.rate_limit_status != "rejected":
+            state.rate_limit_reset_bell_fired = False
+            _ring_bell(state, "rate-hit")
+        state.rate_limit_status = status
+    if isinstance(resets_at, (int, float)):
+        state.rate_limit_resets_at = int(resets_at)
 
 
 def classify(line: str) -> tuple[str, str]:
@@ -1607,7 +1673,8 @@ def _render_tool_result(
     on error — full content lives in the JSONL transcript and /export.
     `seq` (when provided) prints `[#N]` so the user can `/show N` later."""
     seq_prefix = (
-        f"\033[90m[#{seq} -- {_cmd_hint(f'/show {seq} [-tail N]')}]\033[0m "
+        f"\033[90m[#{seq} -- {_cmd_hint(f'/show {seq} [-tail N]')}"
+        f"\033[90m]\033[0m "
         if seq is not None
         else ""
     )
@@ -2794,7 +2861,22 @@ def _panel_session(state: "State") -> str:
     if state.is_subscription:
         plan = state.subscription_plan or "sub"
         plan_field = f"plan: {plan}"
-        if state.rate_limit_util is not None:
+        # If rate limit is currently hit and we know the reset time,
+        # show the reset time (so the user knows when Claude will be
+        # available again) instead of the percentage-used gauge.
+        now_ts = int(time.time())
+        is_hit = (
+            state.rate_limit_status == "rejected"
+            and state.rate_limit_resets_at
+            and state.rate_limit_resets_at > now_ts
+        )
+        if is_hit:
+            resets = state.rate_limit_resets_at or 0
+            rate_field = (
+                f"<status-error>rate-limit reset: "
+                f"{_fmt_reset_time(resets)}</status-error>"
+            )
+        elif state.rate_limit_util is not None:
             label = state.rate_limit_label or "limit"
             rate_field = f"{state.rate_limit_util * 100:.0f}% / {label}"
     else:
@@ -3407,6 +3489,9 @@ class Orchestrator:
         # request here and let input_loop handle it on the next keystroke
         # (resolving the Future once the user types y/n/a).
         self._pending_permission: asyncio.Future[Any] | None = None
+        # Periodic task that rings the `rate-reset` bell + wakes the
+        # worker when a subscription rate-limit's resets_at passes.
+        self._rate_watcher_task: asyncio.Task[None] | None = None
 
     def _load_mcp_config(self) -> dict[str, Any] | None:
         """Load MCP server config from --mcp-config path, or auto-detect .mcp.json in cwd."""
@@ -5014,6 +5099,39 @@ class Orchestrator:
         self.dispatcher_task = asyncio.create_task(
             self._message_dispatcher(), name="msg-dispatcher"
         )
+        # Start the rate-limit reset watcher (one-shot per stall).
+        if getattr(self, "_rate_watcher_task", None) is None:
+            self._rate_watcher_task = asyncio.create_task(
+                self._rate_limit_watcher(), name="rate-watcher"
+            )
+
+    async def _rate_limit_watcher(self) -> None:
+        """Poll every second while a subscription rate limit is in the
+        `rejected` state. When `resets_at` passes, ring the `rate-reset`
+        bell, clear the rejected flag, and push a wakeup so an idle
+        worker loop (or blocking auto-continue) resumes."""
+        try:
+            while not self.stop_event.is_set():
+                st = self.state
+                if (
+                    st.rate_limit_status == "rejected"
+                    and st.rate_limit_resets_at
+                    and st.rate_limit_resets_at <= int(time.time())
+                    and not st.rate_limit_reset_bell_fired
+                ):
+                    st.rate_limit_reset_bell_fired = True
+                    st.rate_limit_status = None
+                    _ring_bell(st, "rate-reset")
+                    print("\033[32m[rate-limit reset — ready to resume]\033[0m")
+                    try:
+                        self.event_queue.put_nowait(
+                            ("wakeup", "rate-limit reset")
+                        )
+                    except asyncio.QueueFull:
+                        pass
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            raise
 
     async def _disconnect(self) -> None:
         if self.dispatcher_task is not None:
@@ -5970,10 +6088,19 @@ class Orchestrator:
             if kind == "compact":
                 return "/compact"
             if kind == "wakeup":
-                # Currently only fires for `requires-action` and
-                # `api-status-recovered`. Bg-task completions are handled
-                # by the SDK directly (no orchestrator-level wakeup).
+                # Fires for `requires-action`, `api-status-recovered`,
+                # and `rate-limit reset`. Bg-task completions are
+                # handled by the SDK directly (no orchestrator-level
+                # wakeup). If this is a capacity-restored event AND
+                # auto-continue is on, resume the driver loop. Otherwise
+                # just notify and keep waiting for user input.
                 print(f"\033[36m[wakeup -- {payload}]\033[0m")
+                resumable = (
+                    payload.startswith("rate-limit")
+                    or payload.startswith("api-status")
+                )
+                if resumable and self.args.auto_continue:
+                    return self.state.continue_prompt
                 continue
             if kind == "status":
                 self.print_status()
@@ -6253,6 +6380,22 @@ class Orchestrator:
     # ---- entry point ---------------------------------------------------
 
     async def run(self) -> None:
+        # Pre-flight auth check — the CLI subprocess can't handle an
+        # interactive login when its stdin/stdout are piped through the
+        # SDK, so if there are no credentials we bail cleanly with a
+        # helpful message instead of hanging or cryptic-erroring.
+        ok, reason = _check_authentication()
+        if not ok:
+            print(
+                f"\033[31m[auth error] {reason}\033[0m\n"
+                f"\033[33mTo authenticate, either:\n"
+                f"  • Run `claude login` in a terminal (subscription users), or\n"
+                f"  • Set ANTHROPIC_API_KEY in the environment (API users), or\n"
+                f"  • Set CLAUDE_CODE_USE_BEDROCK or CLAUDE_CODE_USE_VERTEX "
+                f"(enterprise cloud)\n"
+                f"Then start the orchestrator again.\033[0m"
+            )
+            return
         # Resolve --resume FIRST (before PromptSession & history file are
         # created and before we connect), so a session whose recorded cwd
         # differs from --cwd can switch us cleanly.
@@ -6748,7 +6891,7 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--bell-on",
-        default="waiting,done,stalled,api-stall,requires-action",
+        default="waiting,done,stalled,api-stall,requires-action,rate-hit,rate-reset",
         metavar="EVENTS",
         help="Comma-separated list of events that ring the terminal bell "
         "(\\a). Each event can have an optional `on` or `off` suffix (e.g. "
@@ -6758,7 +6901,9 @@ def parse_args() -> argparse.Namespace:
         "api-stall (entering API-stall mode), api-ok (API recovered), "
         "interrupt (user Ctrl-C'd a turn), bg-done (background task "
         "completed), requires-action (session_state_changed → "
-        "requires_action). Shortcuts: `all`, `none`. Default skips "
+        "requires_action), rate-hit (subscription rate limit was just hit "
+        "— Claude is blocked until reset), rate-reset (rate limit's reset "
+        "time passed — Claude can resume). Shortcuts: `all`, `none`. Default skips "
         "turn-done to avoid ringing on every interactive reply; use "
         "/bell at runtime to toggle individual events (e.g. enable "
         "turn-done temporarily for a long turn, then disable it).",
