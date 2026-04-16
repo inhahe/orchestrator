@@ -82,6 +82,14 @@ from claude_agent_sdk import (
     UserMessage,
     query as _sdk_query,
 )
+try:  # Permission-callback types — present on recent SDKs.
+    from claude_agent_sdk import (  # type: ignore
+        PermissionResultAllow,
+        PermissionResultDeny,
+    )
+except ImportError:  # pragma: no cover
+    PermissionResultAllow = None  # type: ignore
+    PermissionResultDeny = None  # type: ignore
 
 try:  # Extended-thinking blocks — present on recent SDKs.
     from claude_agent_sdk import ThinkingBlock  # type: ignore
@@ -178,9 +186,37 @@ def _parse_bell_events(spec: str) -> set[str]:
     return {k for k, v in result.items() if v}
 
 
+# Events that represent "Claude finished speaking" — these should only
+# ring once the orchestrator is truly idle (no bg tasks left running).
+# If bg tasks are still active, the bell is deferred on state.pending_bell
+# and fires when the last bg task completes.
+_BELL_DEFER_WHEN_BG_RUNNING = frozenset({
+    "turn-done", "waiting", "done", "stalled",
+})
+
+
 def _ring_bell(state: "State", event: str) -> None:
-    """Ring the terminal bell (\\a) if `event` is enabled by --bell-on."""
+    """Ring the terminal bell (\\a) if `event` is enabled by --bell-on.
+    Turn-completion events (turn-done/waiting/done/stalled) are deferred
+    while bg tasks are still running — the bell then fires from
+    `_emit_bg_completion` when the last task finishes, so the user only
+    gets one `needs attention` signal per logical batch of work."""
+    if event in _BELL_DEFER_WHEN_BG_RUNNING and state.background_tasks:
+        state.pending_bell = event
+        return
     if event in state.bell_events:
+        sys.stdout.write("\a")
+        sys.stdout.flush()
+
+
+def _fire_pending_bell(state: "State") -> None:
+    """Ring a previously-deferred turn-end bell. Called from
+    `_emit_bg_completion` when the last bg task finishes."""
+    ev = state.pending_bell
+    if ev is None:
+        return
+    state.pending_bell = None
+    if ev in state.bell_events:
         sys.stdout.write("\a")
         sys.stdout.flush()
 
@@ -429,6 +465,11 @@ class State:
     completed_panel_bg: dict[str, dict[str, Any]] = field(default_factory=dict)
     # Mirror of --bell-on — set of event names that trigger a \a bell.
     bell_events: set[str] = field(default_factory=set)
+    # When a turn ends (turn-done/waiting/done/stalled) with bg tasks
+    # still running, we defer the bell here and ring it only when the
+    # last bg task completes (i.e. the orchestrator becomes truly idle).
+    # `None` = no deferred bell.
+    pending_bell: str | None = None
     rate_limit_util: float | None = None
     rate_limit_label: str | None = None
 
@@ -607,7 +648,11 @@ def _print_one_line_tool(
     """Print a tool's one-line header+params form. If the full visible
     width fits within the terminal, print everything; otherwise truncate
     the BEGINNING of the params with a leading `...` so the tail (usually
-    the interesting part — filename, line counts) stays visible."""
+    the interesting part — filename, line counts) stays visible.
+
+    Kept for tools that don't have a clear "truncatable filename" part
+    (Bash, TodoWrite, Task, BashOutput, KillShell). Tools with a path
+    parameter should use `_print_path_tool` for precise truncation."""
     if params_colored is None:
         params_colored = params_plain
     term_w = _term_width(default=100) - 2
@@ -626,6 +671,36 @@ def _print_one_line_tool(
         return
     tail = plain_stripped[-keep:]
     print(f"{header} \033[90m...{tail}\033[0m")
+
+
+def _truncate_left(s: str, budget: int) -> str:
+    """Keep the LAST `budget` visible chars of `s`, prefixing with
+    `...` when truncation happened. `budget` must be >= 4."""
+    if len(s) <= budget:
+        return s
+    return "..." + s[-(budget - 3):]
+
+
+def _print_path_tool(
+    prefix: str,
+    path: str,
+    suffix: str = "",
+) -> None:
+    """Print a one-line tool call as `prefix <path> [suffix]`. If the
+    line is too wide for the terminal, truncate the BEGINNING of `path`
+    with `...` — never touches `prefix` or `suffix`. `prefix` and
+    `suffix` carry their own ANSI; `path` is wrapped in dim gray."""
+    term_w = _term_width(default=100) - 2
+    prefix_w = _visible_len(prefix)
+    suffix_w = _visible_len(suffix)
+    # Spaces: one before the path, one before suffix if present.
+    gap_w = 1 + (1 if suffix else 0)
+    path_budget = max(4, term_w - prefix_w - suffix_w - gap_w)
+    path_display = _truncate_left(path, path_budget)
+    line = f"{prefix} \033[90m{path_display}\033[0m"
+    if suffix:
+        line += f" {suffix}"
+    print(line)
 
 
 def _print_unified_diff(old: str, new: str, *, indent: str = "    ", max_lines: int = 80) -> None:
@@ -821,6 +896,12 @@ def _emit_bg_completion(
         f"{color}[bg {marker} {seq_tag}{task_id} -- {status}]\033[0m "
         f"{label}{cmd_suffix}"
     )
+    # Per-task ring (opt-in via bell-on bg-done).
+    _ring_bell(state, "bg-done")
+    # If the orchestrator is now truly idle (turn ended earlier while this
+    # was the last outstanding bg task), fire the deferred turn-end bell.
+    if not state.background_tasks:
+        _fire_pending_bell(state)
     if out_file:
         print(f"    \033[90moutput: {out_file}\033[0m")
     if usage:
@@ -1281,32 +1362,23 @@ def render_tool_use(
         added = len(new.splitlines()) or (1 if new else 0)
         header = f"{seq_prefix}\033[1;34m{tag}\033[0m"
         if effective_edits == "compact":
-            suffix_plain = f"  (+{added} -{removed} lines)"
-            suffix_colored = (
-                f"\033[90m  (\033[32m+{added}\033[0m "
+            suffix = (
+                f"\033[90m(\033[32m+{added}\033[0m "
                 f"\033[31m-{removed}\033[0m\033[90m lines)\033[0m"
             )
-            _print_one_line_tool(
-                header,
-                f" {path}{suffix_plain}",
-                f" \033[90m{path}\033[0m{suffix_colored}",
-            )
+            _print_path_tool(header, path, suffix)
         else:
-            _print_one_line_tool(
-                header,
-                f" {path}",
-                f" \033[90m{path}\033[0m",
-            )
+            _print_path_tool(header, path)
             _print_unified_diff(old, new)
     elif name == "Write":
         path = inp.get("file_path", "?")
         content = inp.get("content", "") or ""
         line_count = len(content.splitlines())
-        suffix_plain = f" ({line_count} lines, {len(content)} chars)"
-        _print_one_line_tool(
+        suffix = f"\033[90m({line_count} lines, {len(content)} chars)\033[0m"
+        _print_path_tool(
             f"{seq_prefix}\033[1;34mWrite\033[0m",
-            f" {path}{suffix_plain}",
-            f" \033[90m{path} ({line_count} lines, {len(content)} chars)\033[0m",
+            path,
+            suffix,
         )
         # Skip the file-content preview in compact mode — keep it to one line.
         if show_tasks != "compact":
@@ -1319,10 +1391,11 @@ def render_tool_use(
         path = inp.get("notebook_path", "?")
         cell_id = inp.get("cell_id", "")
         mode = inp.get("edit_mode", "replace")
-        _print_one_line_tool(
+        suffix = f"\033[90mcell={cell_id} mode={mode}\033[0m"
+        _print_path_tool(
             f"{seq_prefix}\033[1;34mNotebookEdit\033[0m",
-            f" {path} cell={cell_id} mode={mode}",
-            f" \033[90m{path} cell={cell_id} mode={mode}\033[0m",
+            path,
+            suffix,
         )
         if show_tasks != "compact":
             src = inp.get("new_source", "") or ""
@@ -1400,41 +1473,45 @@ def render_tool_use(
         path = inp.get("file_path", "?")
         offset = inp.get("offset")
         limit = inp.get("limit")
-        tail = f" offset={offset} limit={limit}" if offset or limit else ""
-        _print_one_line_tool(
+        suffix = (
+            f"\033[90moffset={offset} limit={limit}\033[0m"
+            if offset or limit
+            else ""
+        )
+        _print_path_tool(
             f"{seq_prefix}\033[1;34mRead\033[0m",
-            f" {path}{tail}",
-            f" \033[90m{path}{tail}\033[0m",
+            path,
+            suffix,
         )
     elif name == "Grep":
         pattern = inp.get("pattern", "")
         path = inp.get("path", ".")
-        _print_one_line_tool(
-            f"{seq_prefix}\033[1;34mGrep\033[0m",
-            f" /{pattern}/  {path}",
-            f" \033[90m/{pattern}/  {path}\033[0m",
+        # Pattern goes in the prefix (never truncated) — only the search
+        # path is truncatable.
+        prefix = (
+            f"{seq_prefix}\033[1;34mGrep\033[0m "
+            f"\033[90m/{pattern}/\033[0m"
         )
+        _print_path_tool(prefix, path)
     elif name == "Glob":
         pattern = inp.get("pattern", "")
         path = inp.get("path", ".")
-        _print_one_line_tool(
-            f"{seq_prefix}\033[1;34mGlob\033[0m",
-            f" {pattern}  {path}",
-            f" \033[90m{pattern}  {path}\033[0m",
+        prefix = (
+            f"{seq_prefix}\033[1;34mGlob\033[0m "
+            f"\033[90m{pattern}\033[0m"
         )
+        _print_path_tool(prefix, path)
     elif name == "WebFetch":
         url = inp.get("url", "?")
-        _print_one_line_tool(
+        _print_path_tool(
             f"{seq_prefix}\033[1;34mWebFetch\033[0m",
-            f" {url}",
-            f" \033[90m{url}\033[0m",
+            url,
         )
     elif name == "WebSearch":
         q = inp.get("query", "?")
-        _print_one_line_tool(
+        _print_path_tool(
             f"{seq_prefix}\033[1;34mWebSearch\033[0m",
-            f" {q!r}",
-            f" \033[90m{q!r}\033[0m",
+            repr(q),
         )
     else:
         # Generic fallback (MCP tools, skill-provided tools, anything we
@@ -2888,7 +2965,8 @@ def _panel_live_tasks(state: "State") -> list[str]:
     header_lines = [
         _panel_header("tasks"),
         "<panel-hint>"
-        "(`/tasks`: list, `/show N`: detail, `/show N -tail K`: last K lines of output)"
+        "(<b>/tasks</b>: list, <b>/show N</b>: detail, "
+        "<b>/show N -tail K</b>: last K lines of output)"
         "</panel-hint>",
     ]
     for tid, info in state.active_tools.items():
@@ -3163,7 +3241,8 @@ def _panel_live_bg(state: "State") -> list[str]:
         out[0:0] = [
             _panel_header("background tasks"),
             "<panel-hint>"
-            "(`/bg`: list, `/bg N`: detail, `/bg N -tail K`: last K lines of output)"
+            "(<b>/bg</b>: list, <b>/bg N</b>: detail, "
+            "<b>/bg N -tail K</b>: last K lines of output)"
             "</panel-hint>",
         ]
     return out
@@ -3324,6 +3403,10 @@ class Orchestrator:
         self._initial_resume_id: str | None = None
         if args.resume and args.resume != _PICKER_SENTINEL:
             self._initial_resume_id = args.resume
+        # When the SDK's can_use_tool callback fires, we park the pending
+        # request here and let input_loop handle it on the next keystroke
+        # (resolving the Future once the user types y/n/a).
+        self._pending_permission: asyncio.Future[Any] | None = None
 
     def _load_mcp_config(self) -> dict[str, Any] | None:
         """Load MCP server config from --mcp-config path, or auto-detect .mcp.json in cwd."""
@@ -4876,12 +4959,49 @@ class Orchestrator:
             kwargs["append_system_prompt"] = self.args.append_system_prompt
         if self._mcp_servers is not None:
             kwargs["mcp_servers"] = self._mcp_servers
+        # When permission mode is anything other than bypass, wire up our
+        # can_use_tool callback so the user can approve/deny tool calls.
+        # Requires a recent SDK (PermissionResultAllow must import).
+        if (
+            self.args.permission_mode != "bypassPermissions"
+            and PermissionResultAllow is not None
+        ):
+            kwargs["can_use_tool"] = self._handle_tool_permission
         # Note on history replay: the CLI's --replay-user-messages flag is
         # NOT for historical playback (it just echoes inputs we send back at
         # us). Claude Code's TUI loads the session JSONL from disk and
         # renders it itself; we do the same in run() before connecting,
         # gated by --no-replay.
         return ClaudeAgentOptions(**kwargs)
+
+    async def _handle_tool_permission(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        context: Any,
+    ) -> Any:
+        """SDK `can_use_tool` callback. Prints the pending tool call and
+        parks a Future that input_loop resolves once the user types
+        y/n/a. Returns a PermissionResultAllow or PermissionResultDeny."""
+        if PermissionResultAllow is None or PermissionResultDeny is None:
+            # Shouldn't happen — _make_options gated on these being present.
+            return None  # type: ignore[return-value]
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future[Any] = loop.create_future()
+        header = _format_tool_header(tool_name, tool_input or {})
+        _ring_bell(self.state, "requires-action")
+        print(f"\n\033[33m[permission] Claude wants to run:\033[0m")
+        print(f"  {header}")
+        print(
+            f"\033[90m  reply 'y' to allow, 'n' (or anything else) "
+            f"to deny, 'a' to allow and remember this tool\033[0m"
+        )
+        self._pending_permission = fut
+        try:
+            result = await fut
+        finally:
+            self._pending_permission = None
+        return result
 
     async def _connect(self, resume_id: str | None = None) -> None:
         options = self._make_options(resume_id=resume_id)
@@ -5182,18 +5302,13 @@ class Orchestrator:
         if isinstance(msg, SystemMessage):
             sub = msg.subtype
             d = _msg_fields(msg)
-            if sub == "task_notification":
-                tid = (d.get("task_id") or "?")[:8]
-                status = d.get("status", "?")
-                return f"bg-task {tid} {status}"
-            if sub == "task_updated":
-                # Newer patch-style completion event. Only wake on terminal
-                # statuses, mirroring the renderer's filter.
-                patch = d.get("patch") if isinstance(d.get("patch"), dict) else {}
-                status = patch.get("status")
-                if status in ("completed", "failed", "stopped", "cancelled"):
-                    tid = (d.get("task_id") or "?")[:8]
-                    return f"bg-task {tid} {status}"
+            # Bg task completions (task_notification / task_updated) are
+            # NOT queued as wakeups here — the SDK/CLI handles them by
+            # injecting the <task-notification> into Claude's context,
+            # and Claude's auto-response arrives as `claude (async):` via
+            # _handle_async_message. A manual wakeup would just produce
+            # a redundant `[wakeup -- ...]` line. The bell for bg-done
+            # rings from `_emit_bg_completion` instead.
             if sub == "session_state_changed" and d.get("state") == "requires_action":
                 return "session requires action"
         return None
@@ -5542,19 +5657,12 @@ class Orchestrator:
                         cost = msg.total_cost_usd or 0.0
                         cost_part = f"${cost:.4f} -- "
                     elapsed = time.monotonic() - turn_started
-                    # Show a clean label when the user interrupted vs a
-                    # real error. The SDK reports both as subtypes like
-                    # "error_during_execution"; the interrupt_event flag
-                    # tells us which it was.
-                    subtype = msg.subtype
-                    if (
-                        self.interrupt_event.is_set()
-                        and subtype
-                        and "error" in subtype
-                    ):
-                        subtype = "interrupted"
+                    # Show the SDK's subtype verbatim (e.g.
+                    # "error_during_execution") — the worker loop prints a
+                    # separate "(interrupted -- your turn)" line when the
+                    # user Ctrl-C'd, so the distinction is already clear.
                     print(
-                        f"\033[90m[turn done -- {subtype} -- "
+                        f"\033[90m[turn done -- {msg.subtype} -- "
                         f"{cost_part}ctx~{self.state.context_tokens} tok -- "
                         f"{_fmt_duration(elapsed)}]\033[0m"
                     )
@@ -5642,6 +5750,32 @@ class Orchestrator:
                 if self.stop_event.is_set():
                     break
                 if line is None:
+                    continue
+                # Intercept input as a permission response when the SDK's
+                # can_use_tool callback is waiting on us. The line won't
+                # be routed anywhere else — it resolves the Future and
+                # nothing more, regardless of its content.
+                if self._pending_permission is not None and not self._pending_permission.done():
+                    fut = self._pending_permission
+                    low = line.strip().lower()
+                    if low in ("y", "yes", "allow"):
+                        fut.set_result(PermissionResultAllow())
+                        print("\033[32m[permission: allowed]\033[0m")
+                    elif low in ("a", "always"):
+                        fut.set_result(PermissionResultAllow())
+                        print(
+                            "\033[32m[permission: allowed "
+                            "(note: per-tool remembering not yet implemented)]"
+                            "\033[0m"
+                        )
+                    else:
+                        fut.set_result(
+                            PermissionResultDeny(
+                                message=f"User denied (response: {line!r})",
+                                interrupt=False,
+                            )
+                        )
+                        print("\033[31m[permission: denied]\033[0m")
                     continue
                 # Multi-line paste: if any line is a standalone slash
                 # command (like /i), split the input — send the text
@@ -5836,16 +5970,10 @@ class Orchestrator:
             if kind == "compact":
                 return "/compact"
             if kind == "wakeup":
-                _ring_bell(self.state, "bg-done")
+                # Currently only fires for `requires-action` and
+                # `api-status-recovered`. Bg-task completions are handled
+                # by the SDK directly (no orchestrator-level wakeup).
                 print(f"\033[36m[wakeup -- {payload}]\033[0m")
-                # Don't start a new orchestrator turn.  The SDK/CLI has
-                # already injected the task-completion notification into
-                # Claude's context and, in most cases, Claude auto-
-                # responds — that response arrives via `_handle_async_message`
-                # and renders as `claude (async):`.  Starting our own turn
-                # here would be redundant (and cause the double-response
-                # effect).  Just ring the bell and keep waiting for real
-                # user input.
                 continue
             if kind == "status":
                 self.print_status()
@@ -6037,6 +6165,12 @@ class Orchestrator:
                 # autonomously.
                 if not self.args.auto_continue:
                     _ring_bell(self.state, "turn-done")
+                    if self.state.background_tasks:
+                        print(
+                            f"\033[90m[bg tasks running "
+                            f"({len(self.state.background_tasks)}); "
+                            f"will wake on bg completion or your input]\033[0m"
+                        )
                     next_prompt = await self._await_user_or_quit()
                     continue
 
