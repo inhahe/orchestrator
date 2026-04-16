@@ -2827,7 +2827,16 @@ PanelFn = Callable[["State"], "str | list[str]"]
 
 
 def _panel_session(state: "State") -> str:
-    if state.busy:
+    # Rate-limit rejection takes precedence over most other statuses —
+    # Claude literally can't do anything until the reset time.
+    _rate_limited = (
+        state.rate_limit_status == "rejected"
+        and state.rate_limit_resets_at
+        and state.rate_limit_resets_at > int(time.time())
+    )
+    if _rate_limited:
+        busy = "<status-error>RATE-LIMIT</status-error>"
+    elif state.busy:
         busy = "<status-working>WORKING</status-working>"
     elif state.needs_user_attention == "waiting":
         busy = "<status-waiting>WAITING</status-waiting>"
@@ -2875,10 +2884,9 @@ def _panel_session(state: "State") -> str:
         )
         if is_hit:
             resets = state.rate_limit_resets_at or 0
-            rate_field = (
-                f"<status-error>rate-limit reset: "
-                f"{_fmt_reset_time(resets)}</status-error>"
-            )
+            # Normal foreground — informational; the red RATE-LIMIT in the
+            # state field already flags the critical status.
+            rate_field = f"rate-limit reset: {_fmt_reset_time(resets)}"
         elif state.rate_limit_util is not None:
             label = state.rate_limit_label or "limit"
             rate_field = f"{state.rate_limit_util * 100:.0f}% / {label}"
