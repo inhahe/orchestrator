@@ -3247,7 +3247,18 @@ def _panel_session(state: "State") -> str:
     return sections
 
 
+# Set to True to re-enable the `tools: N ...` status badge in the
+# compact status line. Off by default because in typical sessions
+# Claude runs one foreground tool at a time, so the badge just
+# duplicates info already visible in --tasks-panel and scrollback.
+# The implementation + _TOOLBAR_LAYOUT entry are preserved so this
+# is a one-line flip to restore.
+_SHOW_TOOLS_BADGE = False
+
+
 def _panel_tools(state: "State") -> str:
+    if not _SHOW_TOOLS_BADGE:
+        return ""
     active = state.active_tools
     if not active:
         return "tools: -"
