@@ -636,6 +636,7 @@ SLASH_COMMANDS = [
     "/i",
     "/compact",
     "/effort",
+    "/thinking",
     "/model",
     "/rename",
     "/auto",
@@ -829,6 +830,12 @@ class State:
     # "5h: 30%" and "7d: 80%" — so we keep a dict instead of a single
     # value that would clobber on the next event.
     rate_limit_utils: dict[str, float] = field(default_factory=dict)
+    # API-level extended-thinking toggle. True (default) = let the SDK
+    # pick its default (thinking on for 4.x models, budget controlled
+    # by `state.effort`). False = send `thinking={"type":"disabled"}`
+    # so Claude skips thinking entirely — faster replies, lower cost,
+    # no reasoning overhead. `effort` becomes a no-op while disabled.
+    thinking_enabled: bool = True
     # Populated when rate_limit_info.status == "rejected" (rate limit hit).
     # Cleared once resets_at has passed.
     rate_limit_status: str | None = None  # "allowed" / "allowed_warning" / "rejected" / None
@@ -1011,6 +1018,15 @@ def classify(line: str) -> tuple[str, str]:
         if val in ("", "toggle"):
             return "auto", ""  # toggle (or show if no current state info)
         return "error", "usage: /auto [on|off|toggle]"
+    if cmd == "thinking":
+        val = arg.lower()
+        if val in ("on", "true", "1", "yes", "enable"):
+            return "thinking", "on"
+        if val in ("off", "false", "0", "no", "disable"):
+            return "thinking", "off"
+        if val in ("", "toggle"):
+            return "thinking", ""  # toggle
+        return "error", "usage: /thinking [on|off|toggle]"
     if cmd == "burst":
         return "burst", arg  # "" = show; "N" = set count; "N T" = set both
     if cmd == "export":
@@ -1230,13 +1246,15 @@ def render_unknown_message(msg: Any, state: "State | None" = None) -> None:
 
 
 _BG_STATUS_COLORS = {
-    # "completed" uses MAGENTA (same as the "started" line's colour) so
-    # the normal lifecycle (start → end) reads as one visual thread.
-    # Error-ish outcomes get their own colours to pop.
-    "completed": _C_MAGENTA,
+    # Marker colours only (the status word is always MAGENTA — see
+    # `_emit_bg_completion`). `completed` = GREEN ✓ (traditional
+    # success). `failed` = RED ✗ (error). `stopped`/`cancelled` = RED
+    # ◼ since both are "task was interrupted" signals worth popping
+    # in red alongside the word's magenta.
+    "completed": _C_GREEN,
     "failed": _C_RED,
-    "stopped": _C_YELLOW,
-    "cancelled": _C_YELLOW,
+    "stopped": _C_RED,
+    "cancelled": _C_RED,
 }
 
 # Swappable glyph set for status markers, result arrows, bullets, etc.
@@ -1253,10 +1271,14 @@ _MARKERS: dict[str, tuple[str, str]] = {
     # key: (unicode, ascii). All ASCII variants are 1-char so column
     # alignment is preserved regardless of mode.
     "start":        ("▶", ">"),   # bg-task started
-    "completed":    ("▶", ">"),   # bg-task ended normally (same as start — single lifecycle thread)
+    "completed":    ("✓", "v"),   # bg-task ended normally — green ✓ is the traditional success signal
     "failed":       ("✗", "x"),   # bg-task ended with non-zero / error
-    "stopped":      ("⏹", "-"),   # bg-task was stopped
-    "cancelled":    ("⏹", "-"),   # bg-task was cancelled
+    # `◼` (BLACK MEDIUM SQUARE, U+25FC) is a narrow, text-only glyph —
+    # renders at 1 cell everywhere, respects the ANSI fg colour (unlike
+    # `🛑` / `⏹` which get emoji-fied on some terminals and override
+    # our colour to red).
+    "stopped":      ("◼", "!"),   # bg-task was stopped
+    "cancelled":    ("◼", "!"),   # bg-task was cancelled
     "check":        ("✓", "v"),   # generic tick for todo-complete / tool-success
     "arrow_result": ("→", ">"),   # tool-result "→ N lines"
     "arrow_cur":    ("→", ">"),   # panel current-sub arrow
@@ -1355,7 +1377,7 @@ def _emit_bg_completion(
                     # width check reflects what will be emitted.
                     base = (
                         f"{seq_prefix}{_C_MAGENTA}bg-task{_C_RESET} "
-                        f"{color}{marker} {status}{_C_RESET} "
+                        f"{color}{marker}{_C_RESET} {_C_MAGENTA}{status}{_C_RESET} "
                         f"{_C_DESC}-- {label}{_C_RESET}"
                     )
                     if len(lines) <= 1:
@@ -1367,15 +1389,18 @@ def _emit_bg_completion(
                             f"  {_C_DIM}({_cmd_size_hint(orig_cmd)}){_C_RESET}"
                         )
                 break
-    # End format mirrors the start: hint tag, "bg-task" marker (MAGENTA),
-    # then the status pair (✓ completed / ✗ failed / ⏹ stopped) coloured
-    # by status. Parallel structure with "▶ started" on the start line.
-    # Label + cmd_suffix go in DESC so only the status pair visually
-    # pops; cmd_suffix carries its own COMMAND / DIM colour for the
-    # embedded backtick cmd or the (size) hint, which remains distinct.
+    # End format mirrors the start: hint tag, "bg-task" (MAGENTA), then
+    # the status marker coloured by status (GREEN ✓ / RED ✗ / MAGENTA 🛑),
+    # then the status WORD always in MAGENTA so the lifecycle thread
+    # (bg-task ... <word> -- label) reads as one colour, with only the
+    # marker doing the "what happened" signal. Parallel structure with
+    # "▶ started" on the start line (where marker+word are both magenta
+    # since "started" has no outcome distinction to convey yet). Label
+    # + cmd_suffix go in DESC; cmd_suffix carries its own COMMAND / DIM
+    # colour for the embedded backtick cmd or the (size) hint.
     print(
         f"{seq_prefix}{_C_MAGENTA}bg-task{_C_RESET} "
-        f"{color}{marker} {status}{_C_RESET} "
+        f"{color}{marker}{_C_RESET} {_C_MAGENTA}{status}{_C_RESET} "
         f"{_C_DESC}-- {label}{_C_RESET}{cmd_suffix}"
     )
     # Per-task ring (opt-in via bell-on bg-done).
@@ -3366,6 +3391,10 @@ def _panel_session(state: "State") -> str:
     )
     model_part = short_model if short_model else "(auto)"
     effort_part = state.effort if state.effort else "auto"
+    # API-level thinking toggle — shows "off" only when the user
+    # explicitly disabled thinking via --no-thinking or /thinking off.
+    # When on (the default), `effort` governs the budget as usual.
+    thinking_part = "on" if state.thinking_enabled else "off"
     # Approximate "current resident context": cap the last turn's cumulative
     # input-tokens figure at the model's actual window. Window is shown as
     # "?" when we haven't identified the model yet (no --model pinned and
@@ -3394,6 +3423,7 @@ def _panel_session(state: "State") -> str:
     sections.extend([
         f"model: {_tb_escape(model_part)}",
         f"effort: {_tb_escape(effort_part)}",
+        f"thinking: {thinking_part}",
     ])
     return sections
 
@@ -3988,6 +4018,7 @@ class Orchestrator:
             inline_all_tools=bool(getattr(args, "inline_all_tools", False)),
             show_edits=getattr(args, "show_edits", "compact") or "compact",
             show_thinking=bool(getattr(args, "show_thinking", False)),
+            thinking_enabled=not bool(getattr(args, "no_thinking", False)),
             show_tasks_panel=bool(getattr(args, "tasks_panel", False)),
             show_bg_panel=bool(getattr(args, "bg_panel", True)),
             show_tasks=getattr(args, "show_tasks", "compact") or "compact",
@@ -4236,6 +4267,7 @@ class Orchestrator:
         print("  /interrupt  /i                  stop the current turn (or press Ctrl-C)")
         print("  /compact                        force a /compact now")
         print(f"  /effort <level>                 one of {', '.join(EFFORT_CHOICES)}  (auto = no override)")
+        print("  /thinking [on|off|toggle]       enable/disable API-level extended thinking (reconnects)")
         print("  /model <name>                   e.g. claude-opus-4-6, claude-sonnet-4-6")
         print("  /rename <name>                  set a custom title for this session")
         print("  /auto [on|off|toggle]           enable/disable autonomous continue prompting")
@@ -5604,6 +5636,14 @@ class Orchestrator:
             kwargs["effort"] = self.state.effort
         if self.state.model:
             kwargs["model"] = self.state.model
+        # Hard-disable extended thinking at the API level. When
+        # `thinking_enabled` is True (default), omit the field and let
+        # the SDK/model defaults apply (typically adaptive, budget
+        # controlled by `effort`). When False, send the disabled
+        # ThinkingConfig so Claude skips thinking entirely — this takes
+        # precedence over `effort` per the SDK spec.
+        if not self.state.thinking_enabled:
+            kwargs["thinking"] = {"type": "disabled"}
         if self.args.allowed_tool:
             kwargs["allowed_tools"] = list(self.args.allowed_tool)
         if self.args.disallowed_tool:
@@ -5953,15 +5993,19 @@ class Orchestrator:
                                 tool_name = h.get("name")
                                 tool_input = h.get("input") or {}
                                 break
-                        # Skip background-Bash "results" — see the matching
-                        # branch inside run_turn for the reasoning.
-                        is_bg_bash = (
+                        # Skip the bg-Bash launch ACK (success case) — see
+                        # the matching branch inside run_turn. But keep
+                        # error results: if the launch itself failed the
+                        # user needs to see that, and task_started never
+                        # fires so no bg-task notification will fill in.
+                        is_bg_bash_ack = (
                             tool_name == "Bash"
                             and bool(tool_input.get("run_in_background"))
+                            and not bool(block.is_error)
                         )
                         _show_tasks = getattr(self.args, "show_tasks", "compact")
                         if (
-                            not is_bg_bash
+                            not is_bg_bash_ack
                             and (
                                 tool_name == "Bash"
                                 or self.args.inline_all_tools
@@ -6306,24 +6350,27 @@ class Orchestrator:
                                         h["is_error"] = is_err
                                         h["ended_at"] = time.monotonic()
                                         break
-                                # Background-Bash "result" is just the CLI's
-                                # launch ack (no stdout yet, it's still running)
-                                # — meaningless to render. The real output
-                                # shows up later via `/bg N -tail K` or the
-                                # task_notification completion message. Skip
-                                # the ack line entirely so the bg-task start
-                                # notice isn't paired with a misleading
-                                # "→ 1 line, 217 chars" ghost.
-                                is_bg_bash = (
+                                # Background-Bash success "result" is just
+                                # the CLI's launch ack (no stdout yet, still
+                                # running) — meaningless to render. The real
+                                # output shows up later via `/show bN -tail K`
+                                # or the task_notification completion line.
+                                # BUT: if the result is an ERROR, the launch
+                                # itself failed — task_started won't fire, no
+                                # bg-task notification will reach the user,
+                                # so this is the only signal they get. Keep
+                                # errors, drop the success acks.
+                                is_bg_bash_ack = (
                                     tool_name == "Bash"
                                     and bool(tool_input.get("run_in_background"))
+                                    and not is_err
                                 )
                                 # Match the tool-use side: Bash always prints
                                 # inline; others only with --inline-all-tools
                                 # or --show-tasks.
                                 _show_tasks = getattr(self.args, "show_tasks", "compact")
                                 if (
-                                    not is_bg_bash
+                                    not is_bg_bash_ack
                                     and (
                                         tool_name == "Bash"
                                         or self.args.inline_all_tools
@@ -6680,6 +6727,20 @@ class Orchestrator:
                 reconnect_needed = True
             elif kind == "effort-show":
                 self.show_effort_info()
+            elif kind == "thinking":
+                # payload is "on" / "off" / "" (toggle).
+                if payload == "on":
+                    new_val = True
+                elif payload == "off":
+                    new_val = False
+                else:
+                    new_val = not self.state.thinking_enabled
+                self.state.thinking_enabled = new_val
+                print(
+                    f"{_C_MAGENTA}[sys] thinking -> "
+                    f"{'on' if new_val else 'off'}{_C_RESET}"
+                )
+                reconnect_needed = True
             elif kind == "model":
                 self.state.model = payload
                 print(f"{_C_MAGENTA}[sys] model -> {payload}{_C_RESET}")
@@ -6786,6 +6847,19 @@ class Orchestrator:
                 await self._reconnect()
             elif kind == "effort-show":
                 self.show_effort_info()
+            elif kind == "thinking":
+                if payload == "on":
+                    new_val = True
+                elif payload == "off":
+                    new_val = False
+                else:
+                    new_val = not self.state.thinking_enabled
+                self.state.thinking_enabled = new_val
+                print(
+                    f"{_C_MAGENTA}[sys] thinking -> "
+                    f"{'on' if new_val else 'off'}{_C_RESET}"
+                )
+                await self._reconnect()
             elif kind == "model":
                 self.state.model = payload
                 print(f"{_C_MAGENTA}[sys] model -> {payload}{_C_RESET}")
@@ -7449,7 +7523,19 @@ def parse_args() -> argparse.Namespace:
         "--show-thinking",
         action="store_true",
         help="Print the full text of extended-thinking blocks "
-        "(default shows a one-line collapsed snippet).",
+        "(default shows a one-line collapsed snippet). Purely a "
+        "display flag — doesn't affect whether Claude thinks; see "
+        "--no-thinking for that.",
+    )
+    ap.add_argument(
+        "--no-thinking",
+        action="store_true",
+        help="Disable extended thinking at the API level — sends "
+        "`thinking={'type':'disabled'}` to the SDK so Claude skips the "
+        "reasoning phase entirely. Faster replies, lower cost, no "
+        "tradeoff if you don't need the deliberation. `--effort` "
+        "becomes a no-op while this is set. Runtime toggle: "
+        "`/thinking off` / `/thinking on`.",
     )
     ap.add_argument(
         "--show-full-commands",
