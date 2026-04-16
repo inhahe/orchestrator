@@ -115,24 +115,22 @@ from prompt_toolkit.styles import Style
 # Terminal with `intenseTextStyle=bright` (the default), bold + 8-color
 # bright (90-97) is a visual no-op. 256-color indices sidestep that.
 #
-# Users can override any of these by creating a file at
-# `~/.claude/orchestrator-colors.conf` (or $CLAUDE_CONFIG_DIR + "/"
-# "orchestrator-colors.conf") with one `NAME=ANSI_PARAMS` per line:
+# Users can override any of these by editing `orchestrator-colors.conf`
+# in the same directory as this script (auto-created on first run if
+# absent). Format: one `NAME=<spec>` per line, where `<spec>` is any
+# combination of `fg=PARAMS`, `bg=PARAMS`, `bold`, and `$ref` tokens:
 #
-#   # One line per colour; NAME is from the list below.
-#   # ANSI_PARAMS is the text between `\033[` and `m`.
-#   DIM=38;5;244
-#   DIM_BOLD=1;38;5;244
-#   RED=31
+#   DIM=fg=38;5;244
+#   DIM_BOLD=$dim bold          # reuse another entry, force bold on top
+#   $accent=fg=38;5;208         # define a variable
+#   PATTERN=$accent             # reference it
 #
 # Unknown names are ignored; missing names fall back to the defaults.
-# A file with defaults is auto-created on first run if absent.
+# See `_load_colors_config` for the full resolution rules.
 #
 # Each entry: dict with keys {"fg", "bg", "bold"}.
 #   fg / bg are SGR param strings (e.g. "31", "38;5;244") or None (unset).
 #   bold is a boolean flag.
-# Config file format mirrors this: `NAME=fg=PARAMS bg=PARAMS bold` with
-# any subset of the three parts (space-separated, any order).
 _ColorSpec = dict[str, "str | bool | None"]
 _DEFAULT_COLORS: dict[str, _ColorSpec] = {
     # RESET uses SGR "0" as an fg param (by convention — SGR 0 clears all attrs).
@@ -149,6 +147,25 @@ _DEFAULT_COLORS: dict[str, _ColorSpec] = {
     "CYAN":        {"fg": "36",       "bg": None, "bold": False},
     "BRIGHT_CYAN": {"fg": "96",       "bg": None, "bold": False},
     "BOLD":        {"fg": None,       "bg": None, "bold": True},
+    # Standalone tool-call operands (the "what is this tool acting on").
+    # PATH: file paths (Read/Edit/Write/NotebookEdit/Grep's path/Glob's
+    #   path). Slightly brighter than DIM so the path separates visually
+    #   from the [#N --] metadata.
+    # URL: WebFetch URL. Defaults to the same shade as PATH since URLs
+    #   are "location operands" too, but kept separate so users who want
+    #   to distinguish them can.
+    # PATTERN: Grep regex, Glob pattern, WebSearch query — "the active
+    #   expression." Defaults to the same bright-cyan as the Bash
+    #   command body for semantic parallelism; separate entry so users
+    #   can theme them independently.
+    # COMMAND: Bash command body (in backticks). Defaults to bright cyan.
+    # DESC: freeform descriptions (Bash `— desc`, Task `[subtype] desc`).
+    #   Secondary info, defaults to DIM.
+    "PATH":        {"fg": "38;5;250", "bg": None, "bold": False},
+    "URL":         {"fg": "38;5;250", "bg": None, "bold": False},
+    "PATTERN":     {"fg": "96",       "bg": None, "bold": False},
+    "COMMAND":     {"fg": "96",       "bg": None, "bold": False},
+    "DESC":        {"fg": "38;5;244", "bg": None, "bold": False},
 }
 
 
@@ -170,19 +187,46 @@ def _spec_to_sgr(spec: _ColorSpec) -> str:
 
 
 def _colors_config_path() -> "Path":
-    base = os.environ.get("CLAUDE_CONFIG_DIR")
-    return Path(base if base else Path.home() / ".claude") / "orchestrator-colors.conf"
+    # Colocated with the script so the file is trivially discoverable
+    # (no hunting through ~/.claude). Follows the script if it moves.
+    return Path(__file__).resolve().parent / "orchestrator-colors.conf"
 
 
-def _parse_color_spec(rhs: str) -> _ColorSpec:
+def _parse_color_spec(
+    rhs: str,
+    resolver: dict[str, _ColorSpec] | None = None,
+) -> tuple[_ColorSpec, list[str]]:
     """Parse the right-hand side of a `NAME=...` config line.
-    Accepts any combination of `fg=PARAMS`, `bg=PARAMS`, and `bold`
-    tokens separated by whitespace; order doesn't matter. Unknown
-    tokens are ignored. Returns a dict with keys fg/bg/bold."""
+    Accepts any combination of `fg=PARAMS`, `bg=PARAMS`, `bold`, and
+    `$var_name` reference tokens separated by whitespace. Later tokens
+    override earlier ones field-by-field (so `$base bold` = base's spec
+    with bold forced on).
+
+    `resolver`, when given, maps lowercased name -> spec for
+    `$name` lookups (shared namespace: colors and user-defined
+    variables both live there). Unknown references and unknown tokens
+    are silently recorded in the returned warnings list. Returns
+    (spec, warnings)."""
     spec: _ColorSpec = {"fg": None, "bg": None, "bold": False}
+    warnings: list[str] = []
     for tok in rhs.split():
         tok_lower = tok.lower()
-        if tok_lower == "bold":
+        if tok.startswith("$"):
+            ref_key = tok[1:].strip().lower()
+            src = resolver.get(ref_key) if resolver else None
+            if src is None:
+                warnings.append(f"unknown reference '{tok}'")
+                continue
+            # Merge-in: copy any fields the referenced spec has set.
+            # bool `bold` only sticks when True — a referenced spec
+            # without bold doesn't clobber our already-set bold.
+            if src.get("fg") is not None:
+                spec["fg"] = src["fg"]
+            if src.get("bg") is not None:
+                spec["bg"] = src["bg"]
+            if src.get("bold"):
+                spec["bold"] = True
+        elif tok_lower == "bold":
             spec["bold"] = True
         elif tok_lower.startswith("fg="):
             v = tok[3:].strip()
@@ -190,8 +234,9 @@ def _parse_color_spec(rhs: str) -> _ColorSpec:
         elif tok_lower.startswith("bg="):
             v = tok[3:].strip()
             spec["bg"] = v if v else None
-        # Unknown tokens silently ignored.
-    return spec
+        else:
+            warnings.append(f"unknown token '{tok}'")
+    return spec, warnings
 
 
 def _format_color_spec(spec: _ColorSpec) -> str:
@@ -210,22 +255,60 @@ def _format_color_spec(spec: _ColorSpec) -> str:
 
 def _load_colors_config() -> dict[str, _ColorSpec]:
     """Parse the user's colour overrides file. Returns {NAME: spec}
-    for any recognised names; unknown/invalid lines are dropped. Missing
-    or unreadable file → empty dict (caller falls back to defaults)."""
+    for any recognised colour names; unknown/invalid colour lines are
+    dropped. Missing or unreadable file → empty dict (caller falls back
+    to defaults).
+
+    Supports `$name=<spec>` variable definitions alongside the main
+    `NAME=<spec>` colour entries. Variables share a case-insensitive
+    namespace with colours (seeded with built-in defaults), so a later
+    line can write e.g. `PATH=$dim bold` to reuse DIM's fg/bg and add
+    bold on top. Resolution is single-pass top-down: forward references
+    emit a stderr warning and are dropped."""
     path = _colors_config_path()
     out: dict[str, _ColorSpec] = {}
+    # Seed the resolver with built-in defaults (lowercase-keyed) so
+    # users can `$dim`, `$path`, etc. without redefining them first.
+    resolver: dict[str, _ColorSpec] = {
+        name.lower(): dict(spec) for name, spec in _DEFAULT_COLORS.items()
+    }
     try:
         with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
+            for lineno, raw in enumerate(f, start=1):
+                line = raw.strip()
                 if not line or line.startswith("#"):
                     continue
                 if "=" not in line:
                     continue
                 key, _, val = line.partition("=")
-                key = key.strip().upper()
-                if key in _DEFAULT_COLORS:
-                    out[key] = _parse_color_spec(val)
+                key = key.strip()
+                if not key:
+                    continue
+                is_variable = key.startswith("$")
+                if is_variable:
+                    ref_name = key[1:].strip()
+                    if not ref_name:
+                        continue
+                    store_key = ref_name.lower()
+                    color_key: str | None = None
+                else:
+                    color_key = key.upper()
+                    store_key = color_key.lower()
+                spec, warnings = _parse_color_spec(val, resolver)
+                for w in warnings:
+                    print(
+                        f"[{path.name}:{lineno}] {w}",
+                        file=sys.stderr,
+                    )
+                # Register under the shared-namespace key so later
+                # lines can reference this one.
+                resolver[store_key] = spec
+                # Colour entries also go into the returned override
+                # dict, but only when the name matches a built-in
+                # colour (typos are dropped silently — same behavior
+                # as the pre-variable version).
+                if color_key is not None and color_key in _DEFAULT_COLORS:
+                    out[color_key] = spec
     except OSError:
         pass
     return out
@@ -241,15 +324,23 @@ def _maybe_write_default_colors_config() -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         lines = [
             "# Orchestrator colour scheme.",
-            "# Format: NAME=[fg=PARAMS] [bg=PARAMS] [bold]",
+            "# Format: NAME=[fg=PARAMS] [bg=PARAMS] [bold] [$ref ...]",
             "#   fg=PARAMS - foreground SGR params (e.g. 31, 38;5;244)",
             "#   bg=PARAMS - background SGR params (e.g. 41, 48;5;235)",
             "#   bold      - adds the bold attribute",
-            "# All three fields are OPTIONAL. Omit bg= and the terminal's",
-            "# default background shows through (same for toolbar context).",
+            "#   $ref      - pulls in every field set on another entry",
+            "#               (variable or colour, case-insensitive); later",
+            "#               tokens on the same line override those fields.",
+            "# All fields are OPTIONAL. Omit bg= and the terminal's default",
+            "# background shows through (same for toolbar context).",
             "# Whitespace-separated in any order. Lines starting with # are",
-            "# ignored. Unknown NAMEs are ignored; missing NAMEs fall back",
-            "# to internal defaults.",
+            "# ignored. Unknown colour NAMEs are dropped; missing NAMEs",
+            "# fall back to internal defaults.",
+            "#",
+            "# Variables: `$name=<spec>` defines a reusable spec. Variables",
+            "# share a namespace with colours (so `$dim`, `$path`, etc. are",
+            "# predefined and usable immediately). Resolution is top-down:",
+            "# a `$ref` only sees entries defined above it.",
             "#",
             "# Examples:",
             "#   RED=fg=31                     -> \\033[31m",
@@ -257,6 +348,9 @@ def _maybe_write_default_colors_config() -> None:
             "#   DIM=fg=38;5;244               -> \\033[38;5;244m  (256-color gray)",
             "#   HIGHLIGHT=fg=37 bg=41 bold    -> \\033[1;37;41m   (bold white on red)",
             "#   BG_ONLY=bg=44                 -> \\033[44m        (blue background)",
+            "#   $accent=fg=38;5;208           (variable: warm orange)",
+            "#   PATTERN=$accent bold          (reuse $accent, force bold)",
+            "#   DIM_BOLD=$dim bold            (reuse DIM, add bold)",
             "",
         ]
         for name, spec in _DEFAULT_COLORS.items():
@@ -284,6 +378,11 @@ _C_MAGENTA     = _spec_to_sgr(_COLORS["MAGENTA"])
 _C_CYAN        = _spec_to_sgr(_COLORS["CYAN"])
 _C_BRIGHT_CYAN = _spec_to_sgr(_COLORS["BRIGHT_CYAN"])
 _C_BOLD        = _spec_to_sgr(_COLORS["BOLD"])
+_C_PATH        = _spec_to_sgr(_COLORS["PATH"])
+_C_URL         = _spec_to_sgr(_COLORS["URL"])
+_C_PATTERN     = _spec_to_sgr(_COLORS["PATTERN"])
+_C_COMMAND     = _spec_to_sgr(_COLORS["COMMAND"])
+_C_DESC        = _spec_to_sgr(_COLORS["DESC"])
 
 EFFORT_LEVELS = ("low", "medium", "high", "max")
 # "auto" is not a real API value; it means "don't pass effort, let the model
@@ -505,6 +604,7 @@ SLASH_COMMANDS = [
     "/max-context",
     "/continue-prompt",
     "/bell",
+    "/queue",
     "/todos",
     "/plan",
     "/quit",
@@ -583,6 +683,12 @@ class State:
     recent_turn_ends: deque[float] = field(default_factory=deque)
     # Foreground tools currently in flight: tool_use_id -> {name, input, started_at, seq}
     active_tools: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # User messages typed while Claude is busy — queued up to be sent in
+    # order once the current turn finishes. Display in the toolbar via
+    # _panel_queued_prompts; manage with /queue commands. Cleared on
+    # interrupt (Ctrl-C): the assumption is that interrupting means
+    # redirecting, so the old queue is probably stale.
+    queued_prompts: deque[str] = field(default_factory=deque)
     # Background Bash shells / Task subagents: task_id -> {name, started_at, task_type}
     background_tasks: dict[str, dict[str, Any]] = field(default_factory=dict)
     # Capped history of tool calls + results, used by /show <N>.
@@ -877,6 +983,8 @@ def classify(line: str) -> tuple[str, str]:
         return "continue-prompt", arg  # "" = show; "default" = reset; anything else = set
     if cmd == "bell":
         return "bell", arg  # "" = show; "all"/"none"; else comma-list with on/off suffixes
+    if cmd == "queue":
+        return "queue", arg  # "" = list; "N" = view full; "drop N" = remove; "clear" = clear all
     if cmd == "clear":
         return "clear-context", ""
     if cmd == "cls":
@@ -937,11 +1045,14 @@ def _print_path_tool(
     prefix: str,
     path: str,
     suffix: str = "",
+    *,
+    path_color: str = _C_PATH,
 ) -> None:
     """Print a one-line tool call as `prefix <path> [suffix]`. If the
     line is too wide for the terminal, truncate the BEGINNING of `path`
     with `...` — never touches `prefix` or `suffix`. `prefix` and
-    `suffix` carry their own ANSI; `path` is wrapped in dim gray."""
+    `suffix` carry their own ANSI; `path` is wrapped in `path_color`
+    (default `_C_PATH`; callers rendering a URL pass `_C_URL`)."""
     term_w = _term_width(default=100) - 2
     prefix_w = _visible_len(prefix)
     suffix_w = _visible_len(suffix)
@@ -949,7 +1060,7 @@ def _print_path_tool(
     gap_w = 1 + (1 if suffix else 0)
     path_budget = max(4, term_w - prefix_w - suffix_w - gap_w)
     path_display = _truncate_left(path, path_budget)
-    line = f"{prefix} {_C_DIM}{path_display}{_C_RESET}"
+    line = f"{prefix} {path_color}{path_display}{_C_RESET}"
     if suffix:
         line += f" {suffix}"
     print(line)
@@ -1484,13 +1595,19 @@ def _task_summary_line(name: str, inp: dict[str, Any]) -> str:
 _DIM = _C_DIM
 _RST = _C_RESET
 _TNAME = _C_BOLD_BLUE
+_PATH = _C_PATH
+_URL = _C_URL
+_PAT = _C_PATTERN
+_CMD = _C_COMMAND
+_DESC = _C_DESC
 
 
 def _format_tool_header(name: str, inp: dict[str, Any]) -> str:
     """ANSI-colored one-liner for a tool call, used by both the live
-    renderer and the session replay.  Tool names are bold blue; parameters
-    (paths, patterns, counts) are dim gray so they don't compete with
-    Claude's output text."""
+    renderer and the session replay. Tool names are bold blue; file
+    paths/URLs are `_C_PATH`; search patterns/queries are `_C_PATTERN`;
+    `k=v` suffixes and descriptions stay in `_C_DIM` so they don't
+    compete with Claude's output text."""
     if name == "Edit":
         path = inp.get("file_path", "?")
         old = inp.get("old_string", "") or ""
@@ -1500,8 +1617,8 @@ def _format_tool_header(name: str, inp: dict[str, Any]) -> str:
         ra = "replace_all" if inp.get("replace_all") else ""
         tag = f"Edit ({ra})" if ra else "Edit"
         return (
-            f"{_TNAME}{tag}{_RST} {_DIM}{path}  "
-            f"({_C_GREEN}+{added}{_RST}{_DIM} "
+            f"{_TNAME}{tag}{_RST} {_PATH}{path}{_RST}  "
+            f"{_DIM}({_C_GREEN}+{added}{_RST}{_DIM} "
             f"{_C_RED}-{removed}{_RST}{_DIM} lines){_RST}"
         )
     if name == "Write":
@@ -1509,41 +1626,44 @@ def _format_tool_header(name: str, inp: dict[str, Any]) -> str:
         content = inp.get("content", "") or ""
         lc = len(content.splitlines())
         return (
-            f"{_TNAME}Write{_RST} {_DIM}{path}  "
-            f"({lc} lines, {len(content)} chars){_RST}"
+            f"{_TNAME}Write{_RST} {_PATH}{path}{_RST}  "
+            f"{_DIM}({lc} lines, {len(content)} chars){_RST}"
         )
     if name == "Grep":
         pat = inp.get("pattern", "")
         path = inp.get("path", ".")
-        return f"{_TNAME}Grep{_RST} {_DIM}/{pat}/  {path}{_RST}"
+        return f"{_TNAME}Grep{_RST} {_PAT}/{pat}/{_RST}  {_PATH}{path}{_RST}"
     if name == "Glob":
         pat = inp.get("pattern", "")
         path = inp.get("path", ".")
-        return f"{_TNAME}Glob{_RST} {_DIM}{pat}  {path}{_RST}"
+        return f"{_TNAME}Glob{_RST} {_PAT}{pat}{_RST}  {_PATH}{path}{_RST}"
     if name == "Read":
         path = inp.get("file_path", "?")
         offset = inp.get("offset")
         limit = inp.get("limit")
-        tail = f" offset={offset} limit={limit}" if offset or limit else ""
-        return f"{_TNAME}Read{_RST} {_DIM}{path}{tail}{_RST}"
+        tail = (
+            f" {_DIM}offset={offset} limit={limit}{_RST}"
+            if offset or limit else ""
+        )
+        return f"{_TNAME}Read{_RST} {_PATH}{path}{_RST}{tail}"
     if name == "Task":
         subtype = inp.get("subagent_type", "general-purpose")
         desc = (inp.get("description") or "").strip()[:60]
-        return f"{_TNAME}Task{_RST} {_DIM}[{subtype}] {desc}{_RST}"
+        return f"{_TNAME}Task{_RST} {_DESC}[{subtype}] {desc}{_RST}"
     if name == "Bash":
         desc = inp.get("description", "")
         bg = " (background)" if inp.get("run_in_background") else ""
         label = f"{_TNAME}Bash{bg}{_RST}"
         if desc:
-            label += f" {_DIM}— {desc}{_RST}"
+            label += f" {_DESC}— {desc}{_RST}"
         return label
     if name == "WebFetch":
-        return f"{_TNAME}WebFetch{_RST} {_DIM}{inp.get('url', '?')}{_RST}"
+        return f"{_TNAME}WebFetch{_RST} {_URL}{inp.get('url', '?')}{_RST}"
     if name == "WebSearch":
-        return f"{_TNAME}WebSearch{_RST} {_DIM}{inp.get('query', '?')!r}{_RST}"
+        return f"{_TNAME}WebSearch{_RST} {_PAT}{inp.get('query', '?')!r}{_RST}"
     if name == "NotebookEdit":
         path = inp.get("notebook_path", "?")
-        return f"{_TNAME}NotebookEdit{_RST} {_DIM}{path}{_RST}"
+        return f"{_TNAME}NotebookEdit{_RST} {_PATH}{path}{_RST}"
     if name == "TodoWrite":
         n = len(inp.get("todos", []) or [])
         return f"{_TNAME}TodoWrite{_RST} {_DIM}({n} items){_RST}"
@@ -1662,7 +1782,7 @@ def render_tool_use(
         tag = "Bash (background)" if bg else "Bash"
         base = f"{seq_prefix}{_C_BOLD_BLUE}{tag}{_C_RESET}"
         if desc:
-            base += f" {_C_DIM}— {desc}{_C_RESET}"
+            base += f" {_C_DESC}— {desc}{_C_RESET}"
         stripped = cmd.strip()
         cmd_lines = cmd.splitlines() or ([cmd] if cmd else [])
         if show_full_commands:
@@ -1678,9 +1798,9 @@ def render_tool_use(
             term_w = _term_width()
             shown_inline = False
             if stripped and len(cmd_lines) <= 1:
-                # Wrap in bright-cyan backticks so it's visually distinct
-                # from the dim description and the leading [#N] tag.
-                trial = f"{base}  {_C_BRIGHT_CYAN}`{cmd}`{_C_RESET}"
+                # Wrap in backticks with COMMAND colour so it's visually
+                # distinct from the dim description and the leading [#N] tag.
+                trial = f"{base}  {_C_COMMAND}`{cmd}`{_C_RESET}"
                 if _visible_len(trial) <= term_w:
                     print(trial)
                     shown_inline = True
@@ -1721,7 +1841,7 @@ def render_tool_use(
         _print_one_line_tool(
             f"{seq_prefix}{_C_BOLD_BLUE}Task{_C_RESET}",
             f" [{subtype}] {desc}",
-            f" {_C_DIM}[{subtype}] {desc}{_C_RESET}",
+            f" {_C_DESC}[{subtype}] {desc}{_C_RESET}",
         )
     elif name == "Read":
         path = inp.get("file_path", "?")
@@ -1744,7 +1864,7 @@ def render_tool_use(
         # path is truncatable.
         prefix = (
             f"{seq_prefix}{_C_BOLD_BLUE}Grep{_C_RESET} "
-            f"{_C_DIM}/{pattern}/{_C_RESET}"
+            f"{_C_PATTERN}/{pattern}/{_C_RESET}"
         )
         _print_path_tool(prefix, path)
     elif name == "Glob":
@@ -1752,7 +1872,7 @@ def render_tool_use(
         path = inp.get("path", ".")
         prefix = (
             f"{seq_prefix}{_C_BOLD_BLUE}Glob{_C_RESET} "
-            f"{_C_DIM}{pattern}{_C_RESET}"
+            f"{_C_PATTERN}{pattern}{_C_RESET}"
         )
         _print_path_tool(prefix, path)
     elif name == "WebFetch":
@@ -1760,12 +1880,16 @@ def render_tool_use(
         _print_path_tool(
             f"{seq_prefix}{_C_BOLD_BLUE}WebFetch{_C_RESET}",
             url,
+            path_color=_C_URL,
         )
     elif name == "WebSearch":
         q = inp.get("query", "?")
-        _print_path_tool(
-            f"{seq_prefix}{_C_BOLD_BLUE}WebSearch{_C_RESET}",
-            repr(q),
+        # Query is a search expression (not a filesystem path) — colour
+        # it PATTERN like Grep/Glob. Short enough that truncation isn't
+        # worth the structural gymnastics.
+        print(
+            f"{seq_prefix}{_C_BOLD_BLUE}WebSearch{_C_RESET} "
+            f"{_C_PATTERN}{repr(q)}{_C_RESET}"
         )
     else:
         # Generic fallback (MCP tools, skill-provided tools, anything we
@@ -3527,6 +3651,44 @@ def _panel_live_bg(state: "State") -> list[str]:
     return out
 
 
+_LIVE_QUEUE_CAP = 20  # max queued-prompt rows before overflow
+
+
+def _panel_queued_prompts(state: "State") -> list[str]:
+    """One row per user message queued while Claude is busy. Each row
+    is the (truncated) first line of the message, prefixed with [#N]."""
+    if not state.queued_prompts:
+        return []
+    out: list[str] = []
+    overflow = 0
+    # Budget: terminal width minus toolbar padding (2) minus the seq
+    # prefix (~6 chars: "[#N] ").
+    width = _term_width(default=100)
+    budget = max(20, width - 8)
+    for i, prompt in enumerate(state.queued_prompts, start=1):
+        if i > _LIVE_QUEUE_CAP:
+            overflow += 1
+            continue
+        # First line only, truncated with … if too long.
+        first = (prompt or "").splitlines()[0] if (prompt or "") else ""
+        if len(first) > budget:
+            first = first[: budget - 1] + "…"
+        out.append(f"[<b>#{i}</b>] {_tb_escape(first)}")
+    if overflow > 0:
+        out.append(
+            f"… +{overflow} more queued prompt"
+            f"{'s' if overflow != 1 else ''} (/queue for all)"
+        )
+    out[0:0] = [
+        _panel_header("queued prompts"),
+        "<panel-hint>"
+        "(<b>/queue</b>: list, <b>/queue N</b>: view full, "
+        "<b>/queue drop N</b>: remove, <b>/queue clear</b>: clear all)"
+        "</panel-hint>",
+    ]
+    return out
+
+
 # Last toolbar line-count — used to detect when the toolbar shrinks so we
 # can force a full re-render (prompt_toolkit's renderer never lets the
 # layout height decrease and doesn't erase vacated rows, leaving ghost
@@ -3594,6 +3756,8 @@ def _render_toolbar(state: "State") -> str:
         for row in _panel_live_tasks(state):
             lines.append(_wrap_panel_row(row))
     for row in _panel_live_bg(state):
+        lines.append(_wrap_panel_row(row))
+    for row in _panel_queued_prompts(state):
         lines.append(_wrap_panel_row(row))
     # Every user-provided cell (Task desc, Grep pattern, Bash command
     # preview, API-status description, session title, etc.) can carry an
@@ -3924,6 +4088,7 @@ class Orchestrator:
         print("  /max-context [off|N]            cap context at N tokens (rolling-window trim)")
         print("  /continue-prompt [text|default] view/set/reset the auto-continue prompt")
         print("  /bell [all|none|EVENTS]       view/change bell events (e.g. /bell turn-done on)")
+        print("  /queue [N|drop N|clear]       view/manage prompts queued while Claude is busy")
         print("  /todos  /plan                   show Claude's current TodoWrite plan")
         print("  /quit  /exit                    graceful exit (waits up to ~10s for CLI flush)")
         print("  /quit! /exit!                   force exit immediately (may lose last message)")
@@ -4299,6 +4464,65 @@ class Orchestrator:
                     self.state.bell_events.discard(name)
         events = ",".join(sorted(self.state.bell_events)) or "(none)"
         print(f"{_C_MAGENTA}[bell] {events}{_C_RESET}")
+
+    def manage_queue(self, payload: str) -> None:
+        """`/queue` — view/manage the queued-prompt list.
+        Bare `/queue` lists all queued prompts (full, numbered).
+        `/queue N` prints prompt #N's full text.
+        `/queue drop N` removes prompt #N (others shift).
+        `/queue clear` empties the queue.
+        state.queued_prompts is the source of truth — matching message
+        signals sitting in event_queue are harmless wakeup noise and
+        get dropped by `_drain_between_turns`."""
+        payload = (payload or "").strip()
+        q = self.state.queued_prompts
+        if not payload:
+            if not q:
+                print(f"{_C_DIM}[queued prompts: none]{_C_RESET}")
+                return
+            print(f"{_C_BOLD}queued prompts ({len(q)}){_C_RESET}:")
+            for i, prompt in enumerate(q, start=1):
+                first = prompt.splitlines()[0] if prompt else ""
+                more = ""
+                n_lines = len(prompt.splitlines())
+                if n_lines > 1:
+                    more = f" {_C_DIM}(+{n_lines - 1} more line{'s' if n_lines > 2 else ''}){_C_RESET}"
+                print(f"  [{_C_BOLD}#{i}{_C_RESET}] {first}{more}")
+            return
+        parts = payload.split()
+        if parts[0].lower() == "clear":
+            n = len(q)
+            q.clear()
+            print(f"{_C_MAGENTA}[queue cleared ({n} prompt{'s' if n != 1 else ''} removed)]{_C_RESET}")
+            return
+        if parts[0].lower() == "drop" and len(parts) >= 2:
+            try:
+                idx = int(parts[1]) - 1
+            except ValueError:
+                print(f"{_C_RED}[error: /queue drop N — N must be an integer]{_C_RESET}")
+                return
+            if idx < 0 or idx >= len(q):
+                print(f"{_C_RED}[error: /queue drop {idx + 1} — out of range (queue has {len(q)}){_C_RESET}")
+                return
+            removed = q[idx]
+            del q[idx]
+            first = removed.splitlines()[0] if removed else ""
+            if len(first) > 60:
+                first = first[:57] + "..."
+            print(f"{_C_MAGENTA}[dropped #{idx + 1}: {first}]{_C_RESET}")
+            return
+        # Assume numeric: show full prompt N
+        try:
+            idx = int(parts[0]) - 1
+        except ValueError:
+            print(f"{_C_RED}[error: usage /queue [N] [drop N] [clear]]{_C_RESET}")
+            return
+        if idx < 0 or idx >= len(q):
+            print(f"{_C_RED}[error: /queue {idx + 1} — out of range (queue has {len(q)}){_C_RESET}")
+            return
+        print(f"{_C_BOLD}queued prompt #{idx + 1}{_C_RESET}:")
+        for line in q[idx].splitlines() or [q[idx]]:
+            print(f"  {line}")
 
     def toggle_auto_continue(self, payload: str) -> None:
         if payload == "on":
@@ -5814,7 +6038,7 @@ class Orchestrator:
                                 print(
                                     f"{_C_DIM}[#{seq} -- "
                                     f"{_cmd_hint(f'/think {seq}')}"
-                                    f"]{_C_RESET}  "
+                                    f"{_C_DIM}]{_C_RESET}  "
                                     f"{_C_CYAN}(thinking){_C_RESET}  "
                                     f"{_C_DIM}{full_text.strip()}{_C_RESET}"
                                 )
@@ -5825,7 +6049,7 @@ class Orchestrator:
                                 print(
                                     f"{_C_DIM}[#{seq} -- "
                                     f"{_cmd_hint(f'/think {seq}')}"
-                                    f"]{_C_RESET}  "
+                                    f"{_C_DIM}]{_C_RESET}  "
                                     f"{_C_CYAN}(thinking){_C_RESET}"
                                 )
                     # End-of-AssistantMessage: flush a newline if we left
@@ -6040,6 +6264,7 @@ class Orchestrator:
         "max-context":      "set_max_context",
         "continue-prompt":  "set_continue_prompt",
         "bell":             "set_bell",
+        "queue":            "manage_queue",
         "todos":            "show_todos",
         "effort-show":      "show_effort_info",
         "model-show":       "show_model_info",
@@ -6195,6 +6420,14 @@ class Orchestrator:
                         f"{_C_DIM}[/{kind} queued -- will run when the "
                         f"current turn ends]{_C_RESET}"
                     )
+                # state.queued_prompts is the source of truth for
+                # pending user prompts — the worker pops from it at
+                # turn boundaries. The event_queue message is just a
+                # wakeup signal (so the worker unblocks from
+                # `_await_user_or_quit`); its payload is redundant and
+                # gets dropped by `_drain_between_turns`.
+                if kind == "message":
+                    self.state.queued_prompts.append(payload)
                 await self.event_queue.put((kind, payload))
         finally:
             self.stop_event.set()
@@ -6207,9 +6440,13 @@ class Orchestrator:
 
     async def _drain_between_turns(
         self,
-    ) -> tuple[list[str], bool, bool]:
-        """Empty the event queue. Returns (injected_messages, reconnect_needed, quit)."""
-        injected: list[str] = []
+    ) -> tuple[bool, bool, bool]:
+        """Empty the event queue of side-effect events (status, help,
+        effort, etc.).  Message events are just signals — state.queued_prompts
+        is the source of truth for queued prompts — so we drop them here
+        and pop from state.queued_prompts at the turn boundary instead.
+        Returns (has_pending_compact, reconnect_needed, quit_requested)."""
+        has_compact = False
         reconnect_needed = False
         quit_requested = False
         while not self.event_queue.empty():
@@ -6217,10 +6454,12 @@ class Orchestrator:
             if kind == "quit":
                 quit_requested = True
             elif kind == "message":
-                injected.append(payload)
+                # Just a wakeup signal; payload is redundant with
+                # state.queued_prompts. Nothing to do here.
+                pass
             elif kind == "compact":
                 print(f"{_C_MAGENTA}[orchestrator: compacting session]{_C_RESET}")
-                injected.append("/compact")
+                has_compact = True
             elif kind == "wakeup":
                 # Async event arrived during/right at end of a turn; drop —
                 # the next turn's response will already include it via the SDK.
@@ -6261,6 +6500,8 @@ class Orchestrator:
                 self.set_continue_prompt(payload)
             elif kind == "bell":
                 self.set_bell(payload)
+            elif kind == "queue":
+                self.manage_queue(payload)
             elif kind == "todos":
                 self.show_todos()
             elif kind == "effort":
@@ -6275,7 +6516,7 @@ class Orchestrator:
                 reconnect_needed = True
             elif kind == "model-show":
                 self.show_model_info()
-        return injected, reconnect_needed, quit_requested
+        return has_compact, reconnect_needed, quit_requested
 
     async def _await_user_or_quit(self, timeout: float | None = None) -> str | None:
         """Wait for a user message. Returns the next prompt, or None on quit."""
@@ -6293,6 +6534,17 @@ class Orchestrator:
                 self.stop_event.set()
                 return None
             if kind == "message":
+                # input_loop always appends to state.queued_prompts,
+                # so we need to dequeue this one here (we're consuming
+                # it directly instead of via popleft() in worker_loop).
+                # remove() uses equality; if a duplicate message text
+                # also sits ahead in the queue we'd remove the wrong
+                # slot, but the event order guarantees this one is the
+                # oldest matching entry — same result either way.
+                try:
+                    self.state.queued_prompts.remove(payload)
+                except ValueError:
+                    pass
                 return payload
             if kind == "compact":
                 return "/compact"
@@ -6356,6 +6608,8 @@ class Orchestrator:
                 self.set_continue_prompt(payload)
             elif kind == "bell":
                 self.set_bell(payload)
+            elif kind == "queue":
+                self.manage_queue(payload)
             elif kind == "todos":
                 self.show_todos()
             elif kind == "effort":
@@ -6402,25 +6656,44 @@ class Orchestrator:
                     next_prompt = await self._await_user_or_quit()
                     continue
 
-                injected, reconnect_needed, quit_requested = await self._drain_between_turns()
+                has_compact, reconnect_needed, quit_requested = await self._drain_between_turns()
                 if quit_requested:
                     self.stop_event.set()
                     break
                 if reconnect_needed:
                     await self._reconnect()
 
-                if injected:
-                    # Send only the first message as this turn's prompt.
-                    # Re-queue any extras so they become separate turns
-                    # (and separate records in the JSONL) instead of being
-                    # \n-joined into one blob.
-                    next_prompt = injected[0]
-                    for extra in injected[1:]:
-                        await self.event_queue.put(("message", extra))
+                # /compact takes priority over any queued prompts — the
+                # user's latest intent is to shrink context before
+                # continuing. Queued prompts remain queued for the
+                # post-compact turn.
+                if has_compact:
+                    next_prompt = "/compact"
+                    continue
+
+                # Exactly one prompt per turn: pop the oldest queued
+                # message (if any). Extras stay in the queue and become
+                # their own turns — each one is a separate SDK request
+                # and a separate JSONL record, not a \n-joined blob.
+                if self.state.queued_prompts:
+                    next_prompt = self.state.queued_prompts.popleft()
                     continue
 
                 if interrupted:
                     _ring_bell(self.state, "interrupt")
+                    # Interrupt means the user is redirecting; drop any
+                    # queued prompts since they're likely stale. (The
+                    # matching message signals still sitting in
+                    # event_queue are harmless — _drain_between_turns
+                    # drops them next turn.)
+                    if self.state.queued_prompts:
+                        n = len(self.state.queued_prompts)
+                        self.state.queued_prompts.clear()
+                        print(
+                            f"{_C_DIM}[queue cleared ({n} prompt"
+                            f"{'s' if n != 1 else ''} dropped on interrupt)]"
+                            f"{_C_RESET}"
+                        )
                     print(f"{_C_YELLOW}(interrupted -- your turn){_C_RESET}")
                     next_prompt = await self._await_user_or_quit()
                     continue
