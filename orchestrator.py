@@ -127,12 +127,11 @@ def _cmd_hint(text: str) -> str:
     scrollback output. Style controlled by the module global
     `_CMD_HINT_USE_BG`, set from --cmd-hint-style:
       backticks (default) → `<text>`     — plain ASCII, copy-friendly.
-      bg                  → ANSI 256-color dark grey background around
-                            the text, no backticks.
+      bg                  → dark green, no backticks — pops as interactive.
     Meant purely for visual A/B — either call site ultimately shows the
     same command name."""
     if _CMD_HINT_USE_BG:
-        return f"\033[48;5;236m{text}\033[49m"
+        return f"\033[32m{text}\033[0m"
     return f"`{text}`"
 
 
@@ -158,26 +157,35 @@ def _fmt_tok(n: int) -> str:
     return str(n)
 
 
-def _model_context_window(model: str | None) -> int:
+def _model_context_window(model: str | None) -> int | None:
     """Best-effort context-window size (tokens) for the given model id.
 
-    1M-context variants (id contains `[1m]` / `-1m` / ends in `1m`) → 1M.
-    Everything else → 200k (the default window for Claude 3+/4+ models).
-    When model is None we don't know what the CLI will pick; use 200k as
-    a safe lower bound so the displayed ctx~ doesn't silently overrun.
+    Returns None when the window can't be determined (unknown model).
+    Explicit 1M-context variants (id contains `[1m]` / `-1m` / ends
+    in `1m`) → 1M.  Opus 4+ models default to 1M.  Other known Claude
+    models → 200k.  Unknown → None.
     """
-    if model and ("[1m]" in model or "-1m" in model or model.endswith("1m")):
+    if not model:
+        return None
+    m = model.lower()
+    if "[1m]" in m or "-1m" in m or m.endswith("1m"):
         return 1_000_000
-    return 200_000
+    # Opus 4+ models have 1M context by default.
+    if "opus" in m and ("4" in m or "5" in m or "6" in m):
+        return 1_000_000
+    # Other recognised Claude models → 200k.
+    if "claude" in m or "sonnet" in m or "haiku" in m:
+        return 200_000
+    return None
 
 
 def _default_compact_at(model: str | None) -> int:
     """Pick a sensible auto-compact trigger based on the selected model.
 
-    1M-context variants (model id contains `[1m]` or `1m`) get a much larger
-    threshold so you actually use the extra window. Everything else stays at
-    the conservative default."""
-    if model and ("[1m]" in model or "-1m" in model or model.endswith("1m")):
+    1M-context models get a much larger threshold so you actually use the
+    extra window. Everything else stays at the conservative default."""
+    window = _model_context_window(model)
+    if window is not None and window >= 1_000_000:
         return DEFAULT_COMPACT_THRESHOLD_1M
     return DEFAULT_COMPACT_THRESHOLD
 CONTINUE_RESPONSE_DELAY_SECONDS = 2.0
@@ -209,6 +217,7 @@ SLASH_COMMANDS = [
     "/btw",
     "/autocompact",
     "/max-context",
+    "/continue-prompt",
     "/todos",
     "/plan",
     "/quit",
@@ -219,19 +228,36 @@ SLASH_COMMANDS = [
 
 STYLE = Style.from_dict(
     {
-        "prompt": "ansibrightcyan bold",
-        "bottom-toolbar": "bg:#222222 #aaaaaa",
-        "bottom-toolbar.busy": "bg:#884400 #ffffff bold",
+        "prompt": "fg:ansibrightcyan bold",
+        "bottom-toolbar": "bg:#cccccc fg:#333333 noreverse",
+        "bottom-toolbar.busy": "bg:#884400 fg:#ffffff bold noreverse",
         # Note: `<panel-hint>` inside the toolbar adds this class; the
         # plain "panel-hint" selector matches regardless of parent class,
         # which is what prompt_toolkit's HTML processor expects.
-        "panel-hint": "bg:#111111 #888888",
-        "claude": "ansigreen",
-        "tool": "ansiblue",
-        "tool-err": "ansired",
-        "dim": "ansibrightblack",
-        "warn": "ansiyellow",
-        "sys": "ansimagenta",
+        "panel-hint": "bg:#333333 fg:#999999",
+        # Panel rows (task/bg detail lines) use this darker background
+        # to visually separate them from the status line above.
+        "panel-row": "bg:#333333 fg:#cccccc",
+        "bg-wait-label": "fg:ansimagenta",
+        # Status indicator classes — colors chosen to contrast against
+        # the light gray (#cccccc) toolbar background.
+        "status-working": "fg:#006600 bold",
+        "status-waiting": "fg:#886600 bold",
+        "status-done": "fg:#007777 bold",
+        "status-stalled": "fg:#880088 bold",
+        "status-error": "fg:#cc0000 bold",
+        "highlight": "fg:#005555 bold",
+        # Toolbar panel element classes — explicit fg: prefix so ANSI
+        # color names can't be misinterpreted as background colors.
+        "tool-label": "fg:ansiyellow",
+        "done-marker": "fg:ansigreen",
+        "panel-dim": "fg:ansibrightblack",
+        "claude": "fg:ansigreen",
+        "tool": "fg:ansiblue",
+        "tool-err": "fg:ansired",
+        "dim": "fg:ansibrightblack",
+        "warn": "fg:ansiyellow",
+        "sys": "fg:ansimagenta",
         "err": "ansired bold",
     }
 )
@@ -241,6 +267,8 @@ STYLE = Style.from_dict(
 class State:
     session_id: str | None = None
     session_title: str | None = None  # cached title from JSONL custom-title/ai-title
+    init_seen: bool = False  # True after the first SDK init message
+    continue_prompt: str = CONTINUE_PROMPT
     context_tokens: int = 0
     total_cost_usd: float = 0.0
     turns: int = 0
@@ -325,13 +353,29 @@ class State:
     inline_all_tools: bool = False
     # Mirror of --show-edits ("off" | "compact" | "full"). Non-"off" means
     # Edit renders inline and should be omitted from the live-tasks panel.
-    show_edits: str = "off"
+    show_edits: str = "compact"
     # Mirror of --show-thinking so the toolbar can surface it without
     # reaching into argparse state.
     show_thinking: bool = False
     # Toolbar panel visibility (mirrors --tasks-panel / --bg-panel flags).
-    show_tasks_panel: bool = True
+    show_tasks_panel: bool = False
     show_bg_panel: bool = True
+    # Mirror of --show-tasks ("off"|"compact"|"full"|"full+output"). When not
+    # "off", non-Bash tool calls and their results print to the scrolling log.
+    show_tasks: str = "compact"
+    # Mirror of --panel-delay (seconds). Tools running shorter than this are
+    # never shown in the toolbar panels, reducing noise from sub-second ops.
+    # Default 0 (show immediately) — the grace period handles flicker now.
+    panel_delay: float = 0.0
+    # Mirror of --panel-grace (seconds). Minimum time a task stays visible
+    # in the panel after first appearing. Tasks that complete before the
+    # grace period show a ✓ marker until the grace period elapses.
+    panel_grace: float = 10.0
+    # Tools that completed but haven't been visible long enough.  Keyed by
+    # tool_use_id → {all original info fields + "completed_at", "first_shown_at"}.
+    completed_panel_tools: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Same for background tasks.
+    completed_panel_bg: dict[str, dict[str, Any]] = field(default_factory=dict)
     rate_limit_util: float | None = None
     rate_limit_label: str | None = None
 
@@ -483,6 +527,8 @@ def classify(line: str) -> tuple[str, str]:
         return "autocompact", arg  # "" = show; "on"/"off" = toggle; "N" = set threshold
     if cmd in ("max-context", "maxcontext", "max-ctx"):
         return "max-context", arg  # "" = show; "off" = unlimited; "N" = set cap
+    if cmd in ("continue-prompt", "cprompt"):
+        return "continue-prompt", arg  # "" = show; "default" = reset; anything else = set
     if cmd == "clear":
         return "clear-context", ""
     if cmd == "cls":
@@ -504,17 +550,27 @@ def _print_one_line_tool(
     params_colored: str | None = None,
 ) -> None:
     """Print a tool's one-line header+params form. If the full visible
-    width fits within the terminal, print everything; otherwise collapse
-    the params to a compact `(N chars)` hint so the trailing portion
-    never wraps mid-line."""
+    width fits within the terminal, print everything; otherwise truncate
+    the BEGINNING of the params with a leading `...` so the tail (usually
+    the interesting part — filename, line counts) stays visible."""
     if params_colored is None:
         params_colored = params_plain
-    total = _visible_len(header) + len(params_plain)
-    if total <= _term_width(default=100) - 2:
+    term_w = _term_width(default=100) - 2
+    header_w = _visible_len(header)
+    params_w = _visible_len(params_plain)
+    total = header_w + params_w
+    if total <= term_w:
         print(header + params_colored)
-    else:
-        chars = len(params_plain.strip())
-        print(f"{header}  \033[90m({chars} chars)\033[0m")
+        return
+    # Need to trim from the left of params. Keep `keep` visible chars
+    # plus a leading "..." — all in dim gray to match parameter style.
+    keep = max(4, term_w - header_w - 3)  # 3 for "..."
+    plain_stripped = _ANSI_RE.sub("", params_plain).lstrip()
+    if len(plain_stripped) <= keep:
+        print(header + params_colored)
+        return
+    tail = plain_stripped[-keep:]
+    print(f"{header} \033[90m...{tail}\033[0m")
 
 
 def _print_unified_diff(old: str, new: str, *, indent: str = "    ", max_lines: int = 80) -> None:
@@ -655,7 +711,15 @@ def _emit_bg_completion(
     elif bg_entry is not None:
         seq = bg_entry.get("seq")
         name = bg_entry.get("name")
-    state.background_tasks.pop(task_id_full, None)
+    bg_popped = state.background_tasks.pop(task_id_full, None)
+    # Panel grace: keep the task visible with a ✓ if it hasn't been shown
+    # long enough in the toolbar panel.
+    if bg_popped and bg_popped.get("first_shown_at") is not None and state.panel_grace > 0:
+        shown_for = time.monotonic() - bg_popped["first_shown_at"]
+        if shown_for < state.panel_grace:
+            bg_popped["completed_at"] = time.monotonic()
+            bg_popped["status"] = status
+            state.completed_panel_bg[task_id_full] = bg_popped
     if turn_entry is not None:
         turn_entry["ended_at"] = time.monotonic()
         turn_entry["status"] = status
@@ -730,6 +794,21 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
         old_sid = state.session_id
         old_title = state.session_title
         state.session_id = new_sid
+        # Diagnostic: log session info on first init (startup) or when
+        # the ID changes (fork/model switch). The SDK sends init every
+        # turn — suppress the repeat noise for the common same-session case.
+        first = not state.init_seen
+        state.init_seen = True
+        if first or old_sid != new_sid:
+            short_new = new_sid[:12]
+            if old_sid is None or (first and old_sid == new_sid):
+                print(f"\033[90m[init] session {short_new}\033[0m")
+            else:
+                short_old = old_sid[:12]
+                print(
+                    f"\033[33m[init] SDK forked: expected {short_old}, "
+                    f"got {short_new} (context was carried over)\033[0m"
+                )
         # First check disk for this (possibly fresh) session id.
         disk_title = _read_session_title(new_sid)
         if disk_title:
@@ -828,6 +907,7 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
                 "task_type": task_type,
                 "started_at": started,
                 "tool_use_id": d.get("tool_use_id"),
+                "first_shown_at": started if state.panel_delay <= 0 else None,
             }
             state.current_turn_bg[task_id_full] = {
                 "seq": seq,
@@ -1012,6 +1092,75 @@ def _task_summary_line(name: str, inp: dict[str, Any]) -> str:
     return ""
 
 
+_DIM = "\033[90m"  # tool-parameter color (dark gray / dim)
+_RST = "\033[0m"
+_TNAME = "\033[1;34m"  # tool-name color (bold blue)
+
+
+def _format_tool_header(name: str, inp: dict[str, Any]) -> str:
+    """ANSI-colored one-liner for a tool call, used by both the live
+    renderer and the session replay.  Tool names are bold blue; parameters
+    (paths, patterns, counts) are dim gray so they don't compete with
+    Claude's output text."""
+    if name == "Edit":
+        path = inp.get("file_path", "?")
+        old = inp.get("old_string", "") or ""
+        new = inp.get("new_string", "") or ""
+        removed = len(old.splitlines()) or (1 if old else 0)
+        added = len(new.splitlines()) or (1 if new else 0)
+        ra = "replace_all" if inp.get("replace_all") else ""
+        tag = f"Edit ({ra})" if ra else "Edit"
+        return (
+            f"{_TNAME}{tag}{_RST} {_DIM}{path}  "
+            f"(\033[32m+{added}{_RST}{_DIM} "
+            f"\033[31m-{removed}{_RST}{_DIM} lines){_RST}"
+        )
+    if name == "Write":
+        path = inp.get("file_path", "?")
+        content = inp.get("content", "") or ""
+        lc = len(content.splitlines())
+        return (
+            f"{_TNAME}Write{_RST} {_DIM}{path}  "
+            f"({lc} lines, {len(content)} chars){_RST}"
+        )
+    if name == "Grep":
+        pat = inp.get("pattern", "")
+        path = inp.get("path", ".")
+        return f"{_TNAME}Grep{_RST} {_DIM}/{pat}/  {path}{_RST}"
+    if name == "Glob":
+        pat = inp.get("pattern", "")
+        path = inp.get("path", ".")
+        return f"{_TNAME}Glob{_RST} {_DIM}{pat}  {path}{_RST}"
+    if name == "Read":
+        path = inp.get("file_path", "?")
+        offset = inp.get("offset")
+        limit = inp.get("limit")
+        tail = f" offset={offset} limit={limit}" if offset or limit else ""
+        return f"{_TNAME}Read{_RST} {_DIM}{path}{tail}{_RST}"
+    if name == "Task":
+        subtype = inp.get("subagent_type", "general-purpose")
+        desc = (inp.get("description") or "").strip()[:60]
+        return f"{_TNAME}Task{_RST} {_DIM}[{subtype}] {desc}{_RST}"
+    if name == "Bash":
+        desc = inp.get("description", "")
+        bg = " (background)" if inp.get("run_in_background") else ""
+        label = f"{_TNAME}Bash{bg}{_RST}"
+        if desc:
+            label += f" {_DIM}— {desc}{_RST}"
+        return label
+    if name == "WebFetch":
+        return f"{_TNAME}WebFetch{_RST} {_DIM}{inp.get('url', '?')}{_RST}"
+    if name == "WebSearch":
+        return f"{_TNAME}WebSearch{_RST} {_DIM}{inp.get('query', '?')!r}{_RST}"
+    if name == "NotebookEdit":
+        path = inp.get("notebook_path", "?")
+        return f"{_TNAME}NotebookEdit{_RST} {_DIM}{path}{_RST}"
+    if name == "TodoWrite":
+        n = len(inp.get("todos", []) or [])
+        return f"{_TNAME}TodoWrite{_RST} {_DIM}({n} items){_RST}"
+    return f"{_TNAME}{name}{_RST}"
+
+
 def render_tool_use(
     block: ToolUseBlock,
     *,
@@ -1019,6 +1168,7 @@ def render_tool_use(
     seq: int | None = None,
     inline_all: bool = False,
     edits_mode: str = "off",
+    show_tasks: str = "compact",
 ) -> None:
     """Default behavior is *Bash-only* inline rendering; everything else
     lives in the live-tasks panel until it completes. Pass inline_all=True
@@ -1028,12 +1178,30 @@ def render_tool_use(
     `edits_mode` ("off"|"compact"|"full") lets Edit render inline even when
     `inline_all` is False — useful when you want file-change activity in
     your scrollback but don't need every Read/Grep there too. `inline_all`
-    forces Edit to "full"."""
+    forces Edit to "full".
+
+    `show_tasks` ("off"|"compact"|"full"|"full+output") enables inline
+    rendering for *all* tool types when not "off". "compact" prints
+    one-liners, "full"/"full+output" add detail (Edit diffs, Write
+    previews). The "+output" part only affects tool *results*, not this
+    function."""
     name = block.name
-    effective_edits = "full" if inline_all else edits_mode
+    # Determine effective Edit rendering mode: inline_all > explicit
+    # --show-edits > show_tasks level > default.
+    if inline_all:
+        effective_edits = "full"
+    elif edits_mode != "off":
+        effective_edits = edits_mode
+    elif show_tasks == "compact":
+        effective_edits = "compact"
+    elif show_tasks in ("full", "full+output"):
+        effective_edits = "full"
+    else:
+        effective_edits = "off"
+    # Gate: which tool types render inline?
     if name == "Edit" and effective_edits != "off":
         pass  # fall through to render
-    elif name != "Bash" and not inline_all:
+    elif name != "Bash" and not inline_all and show_tasks == "off":
         return
     inp = block.input or {}
     # Leading-position seq prefix so the [#N] tag lines up with the
@@ -1060,56 +1228,61 @@ def render_tool_use(
         new = inp.get("new_string", "") or ""
         removed = len(old.splitlines()) or (1 if old else 0)
         added = len(new.splitlines()) or (1 if new else 0)
-        header = f"{seq_prefix}\033[34mtool \033[1m{tag}\033[0m"
+        header = f"{seq_prefix}\033[1;34m{tag}\033[0m"
         if effective_edits == "compact":
             suffix_plain = f"  (+{added} -{removed} lines)"
             suffix_colored = (
-                f"  \033[90m(\033[32m+{added}\033[0m "
+                f"\033[90m  (\033[32m+{added}\033[0m "
                 f"\033[31m-{removed}\033[0m\033[90m lines)\033[0m"
             )
             _print_one_line_tool(
                 header,
                 f" {path}{suffix_plain}",
-                f" {path}{suffix_colored}",
+                f" \033[90m{path}\033[0m{suffix_colored}",
             )
         else:
-            _print_one_line_tool(header, f" {path}")
+            _print_one_line_tool(
+                header,
+                f" {path}",
+                f" \033[90m{path}\033[0m",
+            )
             _print_unified_diff(old, new)
     elif name == "Write":
         path = inp.get("file_path", "?")
         content = inp.get("content", "") or ""
         line_count = len(content.splitlines())
         suffix_plain = f" ({line_count} lines, {len(content)} chars)"
-        suffix_colored = (
-            f" \033[90m({line_count} lines, {len(content)} chars)\033[0m"
-        )
         _print_one_line_tool(
-            f"{seq_prefix}\033[34mtool \033[1mWrite\033[0m",
+            f"{seq_prefix}\033[1;34mWrite\033[0m",
             f" {path}{suffix_plain}",
-            f" {path}{suffix_colored}",
+            f" \033[90m{path} ({line_count} lines, {len(content)} chars)\033[0m",
         )
-        preview = content.splitlines()[:10]
-        for ln in preview:
-            print(f"    \033[32m+{ln}\033[0m")
-        if line_count > 10:
-            print(f"    \033[90m... [+{line_count - 10} more lines]\033[0m")
+        # Skip the file-content preview in compact mode — keep it to one line.
+        if show_tasks != "compact":
+            preview = content.splitlines()[:10]
+            for ln in preview:
+                print(f"    \033[32m+{ln}\033[0m")
+            if line_count > 10:
+                print(f"    \033[90m... [+{line_count - 10} more lines]\033[0m")
     elif name == "NotebookEdit":
         path = inp.get("notebook_path", "?")
         cell_id = inp.get("cell_id", "")
         mode = inp.get("edit_mode", "replace")
         _print_one_line_tool(
-            f"{seq_prefix}\033[34mtool \033[1mNotebookEdit\033[0m",
+            f"{seq_prefix}\033[1;34mNotebookEdit\033[0m",
             f" {path} cell={cell_id} mode={mode}",
+            f" \033[90m{path} cell={cell_id} mode={mode}\033[0m",
         )
-        src = inp.get("new_source", "") or ""
-        for ln in src.splitlines()[:12]:
-            print(f"    \033[32m+{ln}\033[0m")
+        if show_tasks != "compact":
+            src = inp.get("new_source", "") or ""
+            for ln in src.splitlines()[:12]:
+                print(f"    \033[32m+{ln}\033[0m")
     elif name == "Bash":
         cmd = inp.get("command", "") or ""
         bg = bool(inp.get("run_in_background"))
         desc = inp.get("description", "")
         tag = "Bash (background)" if bg else "Bash"
-        base = f"{seq_prefix}\033[34mtool \033[1m{tag}\033[0m"
+        base = f"{seq_prefix}\033[1;34m{tag}\033[0m"
         if desc:
             base += f" \033[90m— {desc}\033[0m"
         stripped = cmd.strip()
@@ -1145,18 +1318,20 @@ def render_tool_use(
     elif name == "BashOutput":
         shell_id = inp.get("bash_id") or inp.get("shell_id") or "?"
         _print_one_line_tool(
-            f"{seq_prefix}\033[34mtool \033[1mBashOutput\033[0m",
+            f"{seq_prefix}\033[1;34mBashOutput\033[0m",
             f" shell={shell_id}",
+            f" \033[90mshell={shell_id}\033[0m",
         )
     elif name == "KillShell":
         shell_id = inp.get("shell_id") or inp.get("bash_id") or "?"
         _print_one_line_tool(
-            f"{seq_prefix}\033[34mtool \033[1mKillShell\033[0m",
+            f"{seq_prefix}\033[1;34mKillShell\033[0m",
             f" shell={shell_id}",
+            f" \033[90mshell={shell_id}\033[0m",
         )
     elif name == "TodoWrite":
         todos = inp.get("todos", []) or []
-        print(f"{seq_prefix}\033[34mtool \033[1mTodoWrite\033[0m \033[90m({len(todos)} items)\033[0m")
+        print(f"{seq_prefix}\033[1;34mTodoWrite\033[0m \033[90m({len(todos)} items)\033[0m")
         markers = {"completed": "\033[32m✓\033[0m", "in_progress": "\033[33m→\033[0m", "pending": "\033[90m·\033[0m"}
         for t in todos:
             m = markers.get(t.get("status", "pending"), "?")
@@ -1166,9 +1341,9 @@ def render_tool_use(
         desc = inp.get("description", "")
         subtype = inp.get("subagent_type", "general-purpose")
         _print_one_line_tool(
-            f"{seq_prefix}\033[34mtool \033[1mTask\033[0m",
+            f"{seq_prefix}\033[1;34mTask\033[0m",
             f" [{subtype}] {desc}",
-            f" \033[90m[{subtype}]\033[0m {desc}",
+            f" \033[90m[{subtype}] {desc}\033[0m",
         )
     elif name == "Read":
         path = inp.get("file_path", "?")
@@ -1176,34 +1351,39 @@ def render_tool_use(
         limit = inp.get("limit")
         tail = f" offset={offset} limit={limit}" if offset or limit else ""
         _print_one_line_tool(
-            f"{seq_prefix}\033[34mtool \033[1mRead\033[0m",
+            f"{seq_prefix}\033[1;34mRead\033[0m",
             f" {path}{tail}",
+            f" \033[90m{path}{tail}\033[0m",
         )
     elif name == "Grep":
         pattern = inp.get("pattern", "")
         path = inp.get("path", ".")
         _print_one_line_tool(
-            f"{seq_prefix}\033[34mtool \033[1mGrep\033[0m",
-            f" /{pattern}/ in {path}",
+            f"{seq_prefix}\033[1;34mGrep\033[0m",
+            f" /{pattern}/  {path}",
+            f" \033[90m/{pattern}/  {path}\033[0m",
         )
     elif name == "Glob":
         pattern = inp.get("pattern", "")
         path = inp.get("path", ".")
         _print_one_line_tool(
-            f"{seq_prefix}\033[34mtool \033[1mGlob\033[0m",
-            f" {pattern} in {path}",
+            f"{seq_prefix}\033[1;34mGlob\033[0m",
+            f" {pattern}  {path}",
+            f" \033[90m{pattern}  {path}\033[0m",
         )
     elif name == "WebFetch":
         url = inp.get("url", "?")
         _print_one_line_tool(
-            f"{seq_prefix}\033[34mtool \033[1mWebFetch\033[0m",
+            f"{seq_prefix}\033[1;34mWebFetch\033[0m",
             f" {url}",
+            f" \033[90m{url}\033[0m",
         )
     elif name == "WebSearch":
         q = inp.get("query", "?")
         _print_one_line_tool(
-            f"{seq_prefix}\033[34mtool \033[1mWebSearch\033[0m",
+            f"{seq_prefix}\033[1;34mWebSearch\033[0m",
             f" {q!r}",
+            f" \033[90m{q!r}\033[0m",
         )
     else:
         # Generic fallback (MCP tools, skill-provided tools, anything we
@@ -1211,8 +1391,8 @@ def render_tool_use(
         # arg on its own line indented + aligned. Values are rendered via
         # repr() so nested dicts/lists print structurally; long values
         # wrap at terminal width to the same indent.
-        print(f"{seq_prefix}\033[34mtool \033[1m{name}\033[0m")
-        if inp:
+        print(f"{seq_prefix}\033[1;34m{name}\033[0m")
+        if inp and show_tasks != "compact":
             keys = list(inp.keys())
             keylen = max(len(str(k)) for k in keys)
             for k in keys:
@@ -1327,7 +1507,7 @@ def _render_tool_result(
     if is_error:
         print(
             f"{seq_prefix}\033[31m✗ tool error\033[0m  "
-            f"\033[90m({size}; rerun with --show-tool-output to see)\033[0m"
+            f"\033[90m({size})\033[0m"
         )
     else:
         print(f"{seq_prefix}\033[90m→ {size}\033[0m")
@@ -2146,9 +2326,9 @@ def render_session_history_text(
                         or text.startswith("<local-command")
                     )
                     if has_perm_mode and not looks_synthetic:
-                        # "> you: " is 7 visible chars.
-                        wrapped = _wrap_text(text, indent=7, start_col=7)
-                        write(f"\n\033[36m> you:\033[0m {wrapped}\n")
+                        # "you: " is 5 visible chars.
+                        wrapped = _wrap_text(text, indent=5, start_col=5)
+                        write(f"\033[36myou:\033[0m {wrapped}\n")
                         rendered += 1
                 elif isinstance(content, list):
                     for block in content:
@@ -2173,9 +2353,7 @@ def render_session_history_text(
                                 if is_err:
                                     write(
                                         f"\033[31m✗ tool error\033[0m  "
-                                        f"\033[90m({size}; rerun with "
-                                        f"--show-tool-output to see)"
-                                        f"\033[0m\n"
+                                        f"\033[90m({size})\033[0m\n"
                                     )
                                 else:
                                     write(f"\033[90m→ {size}\033[0m\n")
@@ -2207,7 +2385,7 @@ def render_session_history_text(
                             if text:
                                 wrapped = _wrap_text(text, indent=7, start_col=7)
                                 write(
-                                    f"\n\033[36m> you:\033[0m "
+                                    f"\033[36myou:\033[0m "
                                     f"{wrapped}\n"
                                 )
                                 rendered += 1
@@ -2229,7 +2407,7 @@ def render_session_history_text(
                         # join with a space — column continues from where
                         # the previous block left off.
                         if not started:
-                            write("\n\033[32mclaude:\033[0m ")
+                            write("\033[32mclaude:\033[0m ")
                             started = True
                             wrapped = _wrap_text(text, indent=8, start_col=8)
                         else:
@@ -2242,39 +2420,7 @@ def render_session_history_text(
                             started = False
                         name = block.get("name", "?")
                         inp = block.get("input") or {}
-                        if show_tool_output:
-                            # Full detail: header + right-justified key/
-                            # value block (same as live generic fallback).
-                            write(f"\033[34mtool {name}\033[0m\n")
-                            if inp:
-                                keys = list(inp.keys())
-                                keylen = max(len(str(k)) for k in keys)
-                                for k in keys:
-                                    try:
-                                        value_repr = repr(inp[k])
-                                    except Exception:  # noqa: BLE001
-                                        value_repr = str(inp[k])
-                                    indent_n = 2 + keylen + 2
-                                    wrapped = _wrap_text(
-                                        value_repr, indent_n, indent_n
-                                    )
-                                    write(
-                                        f"  \033[90m{str(k):>{keylen}}:"
-                                        f"\033[0m {wrapped}\n"
-                                    )
-                        else:
-                            # Compact default: one-line `tool Foo(args)` with
-                            # args truncated to terminal width. Matches the
-                            # pre-key-value-block behavior.
-                            overhead = len(f"tool {name}(") + 1
-                            avail = max(
-                                10,
-                                _term_width(default=100) - overhead - 2,
-                            )
-                            write(
-                                f"\033[34mtool {name}\033[0m"
-                                f"({brief_args(inp, limit=avail)})\n"
-                            )
+                        write(f"{_format_tool_header(name, inp)}\n")
                     # thinking blocks intentionally skipped
                 if started:
                     write("\n")
@@ -2457,27 +2603,27 @@ PanelFn = Callable[["State"], "str | list[str]"]
 
 def _panel_session(state: "State") -> str:
     if state.busy:
-        busy = "<b><ansigreen>WORKING</ansigreen></b>"
+        busy = "<status-working>WORKING</status-working>"
     elif state.needs_user_attention == "waiting":
-        busy = "<b><ansiyellow>WAITING</ansiyellow></b>"
+        busy = "<status-waiting>WAITING</status-waiting>"
     elif state.needs_user_attention == "done":
-        busy = "<b><ansibrightcyan>done</ansibrightcyan></b>"
+        busy = "<status-done>done</status-done>"
     elif state.needs_user_attention == "burst":
-        busy = "<b><ansibrightmagenta>STALLED</ansibrightmagenta></b>"
+        busy = "<status-stalled>STALLED</status-stalled>"
     elif state.needs_user_attention == "api-error":
         label = "API-STALL"
         if state.api_status_description:
             desc = _tb_escape(state.api_status_description)[:40]
             label = f"API-STALL ({desc})"
-        busy = f"<b><ansired>{label}</ansired></b>"
+        busy = f"<status-error>{label}</status-error>"
     elif state.background_tasks:
         # No foreground turn in flight, but bg shells / Task subagents
         # are still running. The orchestrator is waiting on them before
         # it would auto-continue; surface that as its own state so it
         # isn't mistaken for plain idle.
         busy = (
-            f"<ansimagenta>bg-wait "
-            f"({len(state.background_tasks)})</ansimagenta>"
+            f"<bg-wait-label>bg-wait "
+            f"({len(state.background_tasks)})</bg-wait-label>"
         )
     else:
         busy = "idle"
@@ -2485,19 +2631,17 @@ def _panel_session(state: "State") -> str:
     # Claude Code's auto-ai-title). Dropping the 8-char UUID prefix too,
     # since it's not usable as --resume input and mostly added clutter.
     session_field = (
-        f"session: <ansibrightcyan>{_tb_escape(state.session_title)}</ansibrightcyan>"
+        f"session: <highlight>{_tb_escape(state.session_title)}</highlight>"
         if state.session_title
         else None
     )
+    rate_field: str | None = None
     if state.is_subscription:
         plan = state.subscription_plan or "sub"
+        plan_field = f"plan: {plan}"
         if state.rate_limit_util is not None:
             label = state.rate_limit_label or "limit"
-            plan_field = (
-                f"plan: {plan} {state.rate_limit_util * 100:.0f}% / {label}"
-            )
-        else:
-            plan_field = f"plan: {plan}"
+            rate_field = f"{state.rate_limit_util * 100:.0f}% / {label}"
     else:
         plan_field = f"cost: ${state.total_cost_usd:.4f}"
     # Model: prefer user-pinned (--model) over the CLI-reported active model
@@ -2516,12 +2660,8 @@ def _panel_session(state: "State") -> str:
     # input-tokens figure at the model's actual window. Window is shown as
     # "?" when we haven't identified the model yet (no --model pinned and
     # no AssistantMessage received) — better than silently guessing 200k.
-    if effective_model:
-        window = _model_context_window(effective_model)
-        window_str = _fmt_tok(window)
-    else:
-        window = None
-        window_str = "?"
+    window = _model_context_window(effective_model)
+    window_str = _fmt_tok(window) if window else "?"
     if state.context_tokens:
         resident = min(state.context_tokens, window) if window else state.context_tokens
         ctx = f"ctx: ~{_fmt_tok(resident)}/{window_str} tok"
@@ -2538,6 +2678,10 @@ def _panel_session(state: "State") -> str:
         ctx,
         f"turns: {state.turns}",
         plan_field,
+    ])
+    if rate_field:
+        sections.append(rate_field)
+    sections.extend([
         f"model: {_tb_escape(model_part)}",
         f"effort: {_tb_escape(effort_part)}",
         f"think: {think_part}",
@@ -2649,11 +2793,17 @@ def _panel_live_tasks(state: "State") -> list[str]:
     resizable live display). Returns [] when idle or when the user opted
     into the classic scrolling log via --inline-all-tools.
 
+    When ``state.panel_delay`` > 0, tools running for fewer seconds than
+    the delay are hidden — they scroll past in the log but never cause the
+    toolbar to resize, eliminating the "flicker" of short-lived tasks.
+
     Hard-capped at _LIVE_TASKS_CAP top-level entries so a runaway burst of
     concurrent tools can't push the prompt off-screen. Overflow shows a
     trailing `… +N more (/tasks for all)` line."""
     if state.inline_all_tools or not state.show_tasks_panel:
         return []
+    now = time.monotonic()
+    delay = state.panel_delay
     lines: list[str] = []
     rendered_count = 0
     overflow = 0
@@ -2674,6 +2824,15 @@ def _panel_live_tasks(state: "State") -> list[str]:
             continue
         if name == "Edit" and state.show_edits != "off":
             continue
+        # Panel-delay: skip tools that haven't been running long enough.
+        # They'll still appear in the scrolling log if --show-tasks is on.
+        elapsed = now - info.get("started_at", now)
+        if delay > 0 and elapsed < delay:
+            continue
+        # Stamp the moment this tool first appeared in the panel (for
+        # the grace-period logic that keeps it visible after completion).
+        if "first_shown_at" not in info:
+            info["first_shown_at"] = now
         if rendered_count >= _LIVE_TASKS_CAP:
             overflow += 1
             continue
@@ -2691,7 +2850,7 @@ def _panel_live_tasks(state: "State") -> list[str]:
             reads = [s for s in trail if s["name"] == "Read"]
             globs = [s for s in trail if s["name"] == "Glob"]
             head = (
-                f'[<b>#{seq}</b>] <ansiyellow>task</ansiyellow> '
+                f'[<b>#{seq}</b>] <tool-label>task</tool-label> '
                 f'<b>{subtype}</b>: "{desc}"'
             )
             if grep_calls:
@@ -2713,39 +2872,39 @@ def _panel_live_tasks(state: "State") -> list[str]:
             cur_id = info.get("current_sub_id")
             cur = state.active_tools.get(cur_id) if cur_id else None
             if cur is not None:
-                lines.append(f"  <ansibrightblack>→</ansibrightblack> {_describe_current_sub(cur)}")
+                lines.append(f"  <panel-dim>→</panel-dim> {_describe_current_sub(cur)}")
             else:
                 lines.append(
-                    "  <ansibrightblack>→ (subagent thinking...)</ansibrightblack>"
+                    "  <panel-dim>→ (subagent thinking...)</panel-dim>"
                 )
         elif name == "Grep":
             pat = _tb_escape(str(inp.get("pattern", "")))
             path = _tb_escape(str(inp.get("path", ".")))
             lines.append(
-                f"[<b>#{seq}</b>] <ansiyellow>search</ansiyellow> "
+                f"[<b>#{seq}</b>] <tool-label>search</tool-label> "
                 f"/<b>{pat}</b>/ in {path}{_grep_filter_suffix(inp)}"
             )
         elif name == "Glob":
             pat = _tb_escape(str(inp.get("pattern", "")))
             path = _tb_escape(str(inp.get("path", ".")))
             lines.append(
-                f"[<b>#{seq}</b>] <ansiyellow>glob</ansiyellow> "
+                f"[<b>#{seq}</b>] <tool-label>glob</tool-label> "
                 f"<b>{pat}</b> in {path}"
             )
         elif name == "Read":
             path = _tb_escape(str(inp.get("file_path", "?")))
             lines.append(
-                f"[<b>#{seq}</b>] <ansiyellow>read</ansiyellow> {path}"
+                f"[<b>#{seq}</b>] <tool-label>read</tool-label> {path}"
             )
         elif name == "WebFetch":
             url = _tb_escape(str(inp.get("url", "?")))
             lines.append(
-                f"[<b>#{seq}</b>] <ansiyellow>fetch</ansiyellow> {url}"
+                f"[<b>#{seq}</b>] <tool-label>fetch</tool-label> {url}"
             )
         elif name == "WebSearch":
             q = _tb_escape(str(inp.get("query", "?")))
             lines.append(
-                f"[<b>#{seq}</b>] <ansiyellow>web</ansiyellow> {q}"
+                f"[<b>#{seq}</b>] <tool-label>web</tool-label> {q}"
             )
         elif name == "Edit":
             # Edit under --show-edits!=off is filtered out at the top of the
@@ -2753,27 +2912,73 @@ def _panel_live_tasks(state: "State") -> list[str]:
             path = _tb_escape(str(inp.get("file_path", "?")))
             tag = "edit-all" if inp.get("replace_all") else "edit"
             lines.append(
-                f"[<b>#{seq}</b>] <ansiyellow>{tag}</ansiyellow> {path}"
+                f"[<b>#{seq}</b>] <tool-label>{tag}</tool-label> {path}"
             )
         elif name == "Write":
             path = _tb_escape(str(inp.get("file_path", "?")))
             lines.append(
-                f"[<b>#{seq}</b>] <ansiyellow>write</ansiyellow> {path}"
+                f"[<b>#{seq}</b>] <tool-label>write</tool-label> {path}"
             )
         elif name == "NotebookEdit":
             path = _tb_escape(str(inp.get("notebook_path", "?")))
             lines.append(
-                f"[<b>#{seq}</b>] <ansiyellow>nb-edit</ansiyellow> {path}"
+                f"[<b>#{seq}</b>] <tool-label>nb-edit</tool-label> {path}"
             )
         else:
             lines.append(
-                f"[<b>#{seq}</b>] <ansiyellow>tool</ansiyellow> "
-                f"{_tb_escape(name)}"
+                f"[<b>#{seq}</b>] tool "
+                f"<b>{_tb_escape(name)}</b>"
             )
+    # Grace-period: render recently-completed tools that haven't been
+    # visible long enough yet. Show a ✓ marker so the user knows it's done.
+    grace = state.panel_grace
+    expired_ids: list[str] = []
+    for tid, info in state.completed_panel_tools.items():
+        first_shown = info.get("first_shown_at", now)
+        if now - first_shown >= grace:
+            expired_ids.append(tid)
+            continue
+        if rendered_count >= _LIVE_TASKS_CAP:
+            overflow += 1
+            continue
+        rendered_count += 1
+        seq = info.get("seq", "?")
+        name = info.get("name", "?")
+        inp = info.get("input") or {}
+        # One-liner with ✓ marker — no need for the full sub-tool detail
+        # since the tool is already done.
+        if name == "Task":
+            subtype = _tb_escape(str(inp.get("subagent_type", "?")))
+            desc = _tb_escape(str(inp.get("description") or "").strip()[:60])
+            lines.append(
+                f'[<b>#{seq}</b>] <done-marker>✓</done-marker> '
+                f'<tool-label>task</tool-label> '
+                f'<b>{subtype}</b>: "{desc}"'
+            )
+        elif name == "Grep":
+            pat = _tb_escape(str(inp.get("pattern", "")))
+            lines.append(
+                f"[<b>#{seq}</b>] <done-marker>✓</done-marker> "
+                f"<tool-label>search</tool-label> /<b>{pat}</b>/"
+            )
+        elif name == "Read":
+            path = _tb_escape(str(inp.get("file_path", "?")))
+            lines.append(
+                f"[<b>#{seq}</b>] <done-marker>✓</done-marker> "
+                f"<tool-label>read</tool-label> {path}"
+            )
+        else:
+            lines.append(
+                f"[<b>#{seq}</b>] <done-marker>✓</done-marker> "
+                f"<tool-label>{_tb_escape(name.lower())}</tool-label>"
+            )
+    for tid in expired_ids:
+        state.completed_panel_tools.pop(tid, None)
+
     if overflow > 0:
         lines.append(
-            f"<ansibrightblack>… +{overflow} more task"
-            f"{'s' if overflow != 1 else ''} (/tasks for all)</ansibrightblack>"
+            f"<panel-dim>… +{overflow} more task"
+            f"{'s' if overflow != 1 else ''} (/tasks for all)</panel-dim>"
         )
     # Prepend the two-line header only when we have rows to show — otherwise
     # the header alone would add a noisy empty section.
@@ -2797,27 +3002,34 @@ def _panel_live_bg(state: "State") -> list[str]:
     """One row per currently-running background task (bash run_in_background
     shells + Task-tool subagents). Empty when nothing's running. Suppressed
     when --inline-all-tools is set since everything is scrolling already.
+
+    When ``state.panel_delay`` > 0, tasks running shorter than the delay
+    are hidden to avoid toolbar-height flicker for fast-completing tasks.
     Capped at _LIVE_BG_CAP rows; overflow shows a trailing counter."""
     if state.inline_all_tools or not state.show_bg_panel:
         return []
     bg = state.background_tasks
-    if not bg:
+    if not bg and not state.completed_panel_bg:
         return []
     now = time.monotonic()
-    out: list[str] = [
-        _panel_header("background tasks"),
-        "<panel-hint>"
-        "(`/bg`: list, `/bg N`: detail, `/bg N -K`: tail K lines of output)"
-        "</panel-hint>",
-    ]
+    delay = state.panel_delay
+    # Build rows first, then prepend the header only when at least one
+    # task survives the delay filter (avoids an empty header block).
+    out: list[str] = []
     overflow = 0
     rendered = 0
     for tid, info in bg.items():
+        elapsed = now - info.get("started_at", now)
+        # Panel-delay: skip tasks that haven't been running long enough.
+        if delay > 0 and elapsed < delay:
+            continue
+        # Stamp first-shown time for the grace-period logic.
+        if "first_shown_at" not in info:
+            info["first_shown_at"] = now
         if rendered >= _LIVE_BG_CAP:
             overflow += 1
             continue
         rendered += 1
-        elapsed = now - info.get("started_at", now)
         raw_type = str(info.get("task_type", "?"))
         task_type = _tb_escape(raw_type)
         raw_name = str(info.get("name") or "(unnamed)").replace("\n", " ")
@@ -2839,15 +3051,64 @@ def _panel_live_bg(state: "State") -> list[str]:
         out.append(
             f"{seq_tag}<b>{task_type}</b>: {name}{elapsed_str}"
         )
+    # Grace-period: render recently-completed bg tasks.
+    grace = state.panel_grace
+    expired_ids: list[str] = []
+    for tid, info in state.completed_panel_bg.items():
+        first_shown = info.get("first_shown_at", now)
+        if now - first_shown >= grace:
+            expired_ids.append(tid)
+            continue
+        if rendered >= _LIVE_BG_CAP:
+            overflow += 1
+            continue
+        rendered += 1
+        raw_type = str(info.get("task_type", "?"))
+        task_type = _tb_escape(raw_type)
+        raw_name = str(info.get("name") or "(unnamed)").replace("\n", " ")[:40]
+        seq = info.get("seq")
+        seq_tag = f"[<b>#{seq}</b>] " if isinstance(seq, int) else ""
+        out.append(
+            f"{seq_tag}<done-marker>✓</done-marker> <b>{task_type}</b>: "
+            f"{_tb_escape(raw_name)}"
+        )
+    for tid in expired_ids:
+        state.completed_panel_bg.pop(tid, None)
+
     if overflow > 0:
         out.append(
             f"… +{overflow} more bg task"
             f"{'s' if overflow != 1 else ''} (/bg for all)"
         )
+    # Prepend header only when there are visible rows.
+    if out:
+        out[0:0] = [
+            _panel_header("background tasks"),
+            "<panel-hint>"
+            "(`/bg`: list, `/bg N`: detail, `/bg N -K`: tail K lines of output)"
+            "</panel-hint>",
+        ]
     return out
 
 
+# Last toolbar line-count — used to detect when the toolbar shrinks so we
+# can force a full re-render (prompt_toolkit's renderer never lets the
+# layout height decrease and doesn't erase vacated rows, leaving ghost
+# text between the prompt and the toolbar).  Fix: when the toolbar
+# produces fewer lines than last time, we set renderer._last_screen =
+# None from inside the callback.  This makes the very same render cycle
+# treat the screen as "first render" → erase_down + full redraw on a
+# clean canvas, exactly like the first render or a terminal-width change.
+_toolbar_last_lines: int = 0
+# Filled in by the Orchestrator after creating the PromptSession so
+# _render_toolbar can poke at the renderer when it detects a height
+# decrease.  Stays None until then (safe — no-op).
+_toolbar_renderer: Any = None
+
+
 def _render_toolbar(state: "State") -> str:
+    global _toolbar_last_lines  # noqa: PLW0603
+
     # Fixed status rows at the top, dynamic panels below. Fixed-row
     # sections flow section-at-a-time across however many lines are
     # needed to fit the terminal width — `_TOOLBAR_LAYOUT`'s two rows
@@ -2885,16 +3146,34 @@ def _render_toolbar(state: "State") -> str:
             cur_len = nxt
     if cur:
         lines.append(" " + sep.join(cur) + " ")
-    for row in _panel_live_tasks(state):
-        lines.append(" " + row + " ")
+    if state.show_tasks_panel:
+        for row in _panel_live_tasks(state):
+            lines.append("<panel-row> " + row + " </panel-row>")
     for row in _panel_live_bg(state):
-        lines.append(" " + row + " ")
+        lines.append("<panel-row> " + row + " </panel-row>")
     # Every user-provided cell (Task desc, Grep pattern, Bash command
     # preview, API-status description, session title, etc.) can carry an
     # embedded newline that would silently render as an extra toolbar row
     # for the duration of that event. Collapse internal \n/\r per row so
     # the toolbar height only ever grows by intentional rows.
     lines = [ln.replace("\r", " ").replace("\n", " ") for ln in lines]
+
+    # --- Anti-ghost-row fix ---
+    # prompt_toolkit's renderer keeps `height = max(last_height, preferred)`
+    # so the layout height never decreases.  When the toolbar shrinks the
+    # diff algorithm writes the new content into the old (taller) canvas
+    # but never erases the vacated rows.  Fix: when the toolbar produces
+    # fewer lines than last time, null out the renderer's cached screen.
+    # This makes the *current* render cycle treat the frame as a first
+    # render → `erase_down` + full redraw on a clean canvas — exactly the
+    # same path prompt_toolkit takes for the initial render or a terminal-
+    # width change.  The cost is one full repaint per shrink event (not
+    # every frame), which is invisible at 0.5 s refresh.
+    n = len(lines)
+    if n < _toolbar_last_lines and _toolbar_renderer is not None:
+        _toolbar_renderer._last_screen = None
+    _toolbar_last_lines = n
+
     return "\n".join(lines)
 
 
@@ -2930,15 +3209,19 @@ class Orchestrator:
         initial_effort = None if args.effort in (None, "auto") else args.effort
         sub = _detect_subscription()
         self.state = State(
+            continue_prompt=getattr(args, "continue_prompt", None) or CONTINUE_PROMPT,
             effort=initial_effort,
             model=args.model,
             is_subscription=sub,
             subscription_plan=_detect_subscription_plan() if sub else None,
             inline_all_tools=bool(getattr(args, "inline_all_tools", False)),
-            show_edits=getattr(args, "show_edits", "off") or "off",
+            show_edits=getattr(args, "show_edits", "compact") or "compact",
             show_thinking=bool(getattr(args, "show_thinking", False)),
-            show_tasks_panel=bool(getattr(args, "tasks_panel", True)),
+            show_tasks_panel=bool(getattr(args, "tasks_panel", False)),
             show_bg_panel=bool(getattr(args, "bg_panel", True)),
+            show_tasks=getattr(args, "show_tasks", "compact") or "compact",
+            panel_delay=float(getattr(args, "panel_delay", 0.0)),
+            panel_grace=float(getattr(args, "panel_grace", 10.0)),
         )
         self.event_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self.turn_msg_queue: asyncio.Queue[Any] = asyncio.Queue()
@@ -3103,14 +3386,30 @@ class Orchestrator:
             self.stop_event.set()
             event.app.exit(exception=EOFError)
 
-        # Multi-line input: Enter submits, Alt-Enter inserts a newline.
+        # Multi-line input: Enter submits, Ctrl-J inserts a newline.
+        # (Alt-Enter is reserved by Windows Terminal for fullscreen toggle,
+        # so Ctrl-J is the primary newline key.)
         @kb.add("enter")
         def _(event):  # type: ignore[no-untyped-def]
             event.current_buffer.validate_and_handle()
 
-        @kb.add("escape", "enter")
+        @kb.add("c-j")  # Ctrl-J (linefeed) – always works
         def _(event):  # type: ignore[no-untyped-def]
             event.current_buffer.insert_text("\n")
+
+        @kb.add("escape", "enter")  # Alt-Enter – works on non-Windows terminals
+        def _(event):  # type: ignore[no-untyped-def]
+            event.current_buffer.insert_text("\n")
+
+        # Shift-Enter / Ctrl-Enter: most terminals can't distinguish these
+        # from plain Enter, and older prompt_toolkit versions reject the
+        # key names outright. Register them only if the installed version
+        # accepts them so startup doesn't fail.
+        for _extra_key in ("s-enter", "c-enter"):
+            try:
+                kb.add(_extra_key)(lambda event: event.current_buffer.insert_text("\n"))
+            except ValueError:
+                pass
 
         # Escape alone clears the whole input buffer. Non-eager so the
         # longer `escape enter` (Alt-Enter) binding above still wins when
@@ -3119,24 +3418,26 @@ class Orchestrator:
         def _(event):  # type: ignore[no-untyped-def]
             event.current_buffer.reset()
 
-        # Up / Down: move the cursor between lines of a multi-line input
-        # when such lines exist; fall through to history search when the
-        # cursor is already on the first / last line.
+        # Up / Down: cursor movement only — no history navigation.
+        # The system defaults (auto_up/auto_down) navigate history on
+        # the first/last line, which we don't want. These overrides
+        # only move the cursor within multi-line text and do nothing
+        # on single-line input.
         @kb.add("up")
         def _(event):  # type: ignore[no-untyped-def]
             buf = event.current_buffer
-            if buf.document.cursor_position_row > 0:
-                buf.cursor_up()
-            else:
-                buf.history_backward()
+            if buf.complete_state:
+                buf.complete_previous(count=event.arg)
+            elif buf.document.cursor_position_row > 0:
+                buf.cursor_up(count=event.arg)
 
         @kb.add("down")
         def _(event):  # type: ignore[no-untyped-def]
             buf = event.current_buffer
-            if buf.document.cursor_position_row < buf.document.line_count - 1:
-                buf.cursor_down()
-            else:
-                buf.history_forward()
+            if buf.complete_state:
+                buf.complete_next(count=event.arg)
+            elif buf.document.cursor_position_row < buf.document.line_count - 1:
+                buf.cursor_down(count=event.arg)
 
         return kb
 
@@ -3169,10 +3470,11 @@ class Orchestrator:
         print("  /btw <question>                 ask a side question (doesn't enter main session history)")
         print("  /autocompact [on|off|N]         enable/disable/set auto-compact threshold")
         print("  /max-context [off|N]            cap context at N tokens (rolling-window trim)")
+        print("  /continue-prompt [text|default] view/set/reset the auto-continue prompt")
         print("  /todos  /plan                   show Claude's current TodoWrite plan")
         print("  /quit  /exit                    graceful exit (waits up to ~10s for CLI flush)")
         print("  /quit! /exit!                   force exit immediately (may lose last message)")
-        print("Input: Enter submits.  Alt-Enter inserts a newline (multi-line input).")
+        print("Input: Enter submits.  Ctrl-J inserts a newline (multi-line input).")
         print("Anything else is sent to Claude as a message.")
         print()
 
@@ -3492,6 +3794,20 @@ class Orchestrator:
             self.args.no_continue = prev_no_continue
         old = f"(was {old_sid[:8]})" if old_sid else ""
         print(f"\033[35m[sys] context cleared -- fresh session {old}\033[0m")
+
+    def set_continue_prompt(self, payload: str) -> None:
+        if not payload:
+            # Show current
+            print(
+                f"\033[35m[continue-prompt] "
+                f"{self.state.continue_prompt}\033[0m"
+            )
+        elif payload.lower() == "default":
+            self.state.continue_prompt = CONTINUE_PROMPT
+            print("\033[35m[continue-prompt reset to default]\033[0m")
+        else:
+            self.state.continue_prompt = payload
+            print(f"\033[35m[continue-prompt set]\033[0m")
 
     def toggle_auto_continue(self, payload: str) -> None:
         if payload == "on":
@@ -4646,6 +4962,7 @@ class Orchestrator:
                         show_full_commands=self.args.show_full_commands,
                         inline_all=self.args.inline_all_tools,
                         edits_mode=self.args.show_edits,
+                        show_tasks=getattr(self.args, "show_tasks", "compact"),
                     )
         elif isinstance(msg, UserMessage):
             content = msg.content
@@ -4660,11 +4977,19 @@ class Orchestrator:
                             if h["tool_use_id"] == block.tool_use_id:
                                 tool_name = h.get("name")
                                 break
-                        if tool_name == "Bash" or self.args.inline_all_tools:
+                        _show_tasks = getattr(self.args, "show_tasks", "compact")
+                        if (
+                            tool_name == "Bash"
+                            or self.args.inline_all_tools
+                            or _show_tasks != "off"
+                        ):
                             _render_tool_result(
                                 summarize_tool_result(block),
                                 is_error=bool(block.is_error),
-                                show_full=self.args.show_tool_output,
+                                show_full=(
+                                    self.args.show_tool_output
+                                    or _show_tasks == "full+output"
+                                ),
                             )
         elif isinstance(msg, ResultMessage):
             # Stray ResultMessage outside a turn (rare). Capture session id.
@@ -4750,19 +5075,17 @@ class Orchestrator:
         turn_started = time.monotonic()
         self.turn_active.set()
 
-        print()
         # Echo the full prompt — no length cap; wrap continuation lines
-        # to line up under the first-line text after "> you: " (7 cols).
+        # to line up under the first-line text after "you: " (5 cols).
         # Reset the streaming state explicitly so nothing from a prior
         # claude-text block bleeds into the echo (stale word buffer or
         # pending indent would drop/mangle the leading characters).
-        self._claude_col = 7
+        self._claude_col = 5
         self._claude_word_buf = ""
         self._claude_pending_indent = False
-        sys.stdout.write("\033[36m> you:\033[0m ")
-        self._write_indented(prompt_text, 7, flush=True)
+        sys.stdout.write("\033[36myou:\033[0m ")
+        self._write_indented(prompt_text, 5, flush=True)
         self._flush_claude_text()
-        print()
 
         watcher = asyncio.create_task(self._interrupt_watcher())
         assistant_parts: list[str] = []
@@ -4775,7 +5098,7 @@ class Orchestrator:
                 msg = await self.turn_msg_queue.get()
                 if isinstance(msg, SystemMessage):
                     if in_text and msg.subtype not in ("init",):
-                        print()
+                        self._flush_claude_text()
                         in_text = False
                     render_system_message(msg, self.state)
                     if msg.subtype == "api_retry":
@@ -4807,6 +5130,16 @@ class Orchestrator:
                             seq = self.state.next_tool_seq
                             self.state.next_tool_seq += 1
                             started = time.monotonic()
+                            # Compute first_shown_at eagerly: if the tool
+                            # would be immediately visible in the panel
+                            # (delay already elapsed or zero), stamp it now
+                            # so that even sub-frame tools get the grace
+                            # period treatment when they complete before the
+                            # next toolbar render cycle.
+                            _delay = self.state.panel_delay
+                            _first_shown: float | None = None
+                            if _delay <= 0:
+                                _first_shown = started
                             self.state.active_tools[block.id] = {
                                 "name": block.name,
                                 "input": block.input,
@@ -4815,6 +5148,7 @@ class Orchestrator:
                                 "parent_id": parent_id,
                                 "sub_trail": [] if block.name == "Task" else None,
                                 "current_sub_id": None,
+                                "first_shown_at": _first_shown,
                             }
                             # Track this seq in the current-turn list unless
                             # it's (a) Bash (scrolls inline) or (b) a sub-tool
@@ -4862,6 +5196,7 @@ class Orchestrator:
                                 seq=seq,
                                 inline_all=self.args.inline_all_tools,
                                 edits_mode=self.args.show_edits,
+                                show_tasks=getattr(self.args, "show_tasks", "compact"),
                             )
                         elif ThinkingBlock is not None and isinstance(block, ThinkingBlock):
                             if in_text:
@@ -4940,6 +5275,20 @@ class Orchestrator:
                                 active = self.state.active_tools.pop(
                                     block.tool_use_id, None
                                 )
+                                # Panel grace: if this tool was visible in the
+                                # panel and hasn't been visible long enough,
+                                # keep it in the completed list with a ✓.
+                                if (
+                                    active
+                                    and active.get("first_shown_at") is not None
+                                    and not active.get("parent_id")
+                                    and self.state.panel_grace > 0
+                                    and self.state.show_tasks_panel
+                                ):
+                                    shown_for = time.monotonic() - active["first_shown_at"]
+                                    if shown_for < self.state.panel_grace:
+                                        active["completed_at"] = time.monotonic()
+                                        self.state.completed_panel_tools[block.tool_use_id] = active
                                 # If this was a sub-tool of a Task, clear the
                                 # parent's "currently running" marker so the
                                 # live-tasks panel stops showing it.
@@ -4979,27 +5328,33 @@ class Orchestrator:
                                         h["ended_at"] = time.monotonic()
                                         break
                                 # Match the tool-use side: Bash always prints
-                                # inline; others only with --inline-all-tools.
+                                # inline; others only with --inline-all-tools
+                                # or --show-tasks.
+                                _show_tasks = getattr(self.args, "show_tasks", "compact")
                                 if (
                                     tool_name == "Bash"
                                     or self.args.inline_all_tools
+                                    or _show_tasks != "off"
                                 ):
                                     _render_tool_result(
                                         text,
                                         is_error=is_err,
-                                        show_full=self.args.show_tool_output,
+                                        show_full=(
+                                            self.args.show_tool_output
+                                            or _show_tasks == "full+output"
+                                        ),
                                         seq=seq,
                                     )
                     elif isinstance(content, str) and content.strip():
                         # System-injected user messages — e.g. background-shell
                         # completion notifications the CLI inserts into context.
                         if in_text:
-                            print()
+                            self._flush_claude_text()
                             in_text = False
                         print(f"\033[35m[notice] {content.strip()}\033[0m")
                 elif isinstance(msg, ResultMessage):
                     if in_text:
-                        print()
+                        self._flush_claude_text()
                         in_text = False
                     self.state.last_result_subtype = msg.subtype
                     if msg.session_id:
@@ -5031,8 +5386,19 @@ class Orchestrator:
                         cost = msg.total_cost_usd or 0.0
                         cost_part = f"${cost:.4f} -- "
                     elapsed = time.monotonic() - turn_started
+                    # Show a clean label when the user interrupted vs a
+                    # real error. The SDK reports both as subtypes like
+                    # "error_during_execution"; the interrupt_event flag
+                    # tells us which it was.
+                    subtype = msg.subtype
+                    if (
+                        self.interrupt_event.is_set()
+                        and subtype
+                        and "error" in subtype
+                    ):
+                        subtype = "interrupted"
                     print(
-                        f"\033[90m[turn done -- {msg.subtype} -- "
+                        f"\033[90m[turn done -- {subtype} -- "
                         f"{cost_part}ctx~{self.state.context_tokens} tok -- "
                         f"{_fmt_duration(elapsed)}]\033[0m"
                     )
@@ -5042,7 +5408,7 @@ class Orchestrator:
                     # (tool_progress, auth_status, partial streaming chunks,
                     # future message types) gets shape-detected and rendered.
                     if in_text:
-                        print()
+                        self._flush_claude_text()
                         in_text = False
                     render_unknown_message(msg, self.state)
         finally:
@@ -5063,6 +5429,49 @@ class Orchestrator:
 
     # ---- input loop ----------------------------------------------------
 
+    # Commands that are safe to run immediately from input_loop even
+    # while a turn is in progress. These are all synchronous, don't
+    # interact with the SDK, and don't affect turn flow.
+    _IMMEDIATE_COMMANDS: dict[str, str] = {
+        "status":           "print_status",
+        "help":             "print_help",
+        "clear-screen":     "clear_screen",
+        "rename":           "rename_session",
+        "auto":             "toggle_auto_continue",
+        "burst":            "set_burst",
+        "export":           "export_session",
+        "tools":            "show_tools",
+        "tasks":            "show_tasks",
+        "bg":               "show_bg_tasks",
+        "show":             "show_tool_detail",
+        "think":            "show_thinking_detail",
+        "autocompact":      "set_autocompact",
+        "max-context":      "set_max_context",
+        "continue-prompt":  "set_continue_prompt",
+        "todos":            "show_todos",
+        "effort-show":      "show_effort_info",
+        "model-show":       "show_model_info",
+    }
+
+    # Methods that take no payload argument (only self).
+    _IMMEDIATE_NO_ARG = frozenset({
+        "print_status", "print_help", "clear_screen", "show_tools",
+        "show_tasks", "show_todos", "show_effort_info", "show_model_info",
+    })
+
+    def _try_immediate_command(self, kind: str, payload: str) -> bool:
+        """Run a command immediately if it's in the safe set. Returns True
+        if handled, False if it should be queued."""
+        method_name = self._IMMEDIATE_COMMANDS.get(kind)
+        if method_name is None:
+            return False
+        method = getattr(self, method_name)
+        if method_name in self._IMMEDIATE_NO_ARG:
+            method()
+        else:
+            method(payload)
+        return True
+
     async def input_loop(self) -> None:
         assert self.session is not None
         try:
@@ -5077,6 +5486,35 @@ class Orchestrator:
                     break
                 if line is None:
                     continue
+                # Multi-line paste: if any line is a standalone slash
+                # command (like /i), split the input — send the text
+                # before it as a message, execute the command, and queue
+                # the text after for later.
+                if "\n" in line:
+                    parts = line.split("\n")
+                    rewritten: list[str] = []
+                    msg_buf: list[str] = []
+                    for p in parts:
+                        pk, _ = classify(p)
+                        if pk not in ("empty", "message", "passthrough-slash", "error"):
+                            # This line is a slash command.
+                            if msg_buf:
+                                rewritten.append("\n".join(msg_buf))
+                                msg_buf = []
+                            rewritten.append(p)
+                        else:
+                            msg_buf.append(p)
+                    if msg_buf:
+                        rewritten.append("\n".join(msg_buf))
+                    if len(rewritten) > 1:
+                        # Process the first part now, queue the rest.
+                        line = rewritten[0]
+                        for extra in rewritten[1:]:
+                            await self.event_queue.put(
+                                classify(extra)
+                                if extra.startswith("/")
+                                else ("message", extra)
+                            )
                 kind, payload = classify(line)
                 if kind == "passthrough-slash":
                     # Unknown slash — forward to the CLI as a message
@@ -5121,14 +5559,15 @@ class Orchestrator:
                     sys.stdout.flush()
                     import os
                     os._exit(0)
-                # Acknowledge slash-commands at queue time so the user
-                # sees that the orchestrator received them, even when
-                # the worker can't process them until the current turn
-                # ends. `message` is excluded because unknown-slash
-                # forwarding already printed a `[forwarding ...]` line
-                # above and a second receipt would be noise; non-slash
-                # plain-text inputs are filtered by the line.startswith
-                # check.
+                # Many slash commands are purely local (display info or
+                # tweak a setting) and can run immediately even mid-turn.
+                # Only commands that interact with the SDK, trigger turns,
+                # or need async go through the event queue.
+                immediate = self._try_immediate_command(kind, payload)
+                if immediate:
+                    continue
+                # Acknowledge queued slash-commands so the user sees that
+                # the orchestrator received them.
                 if (
                     line.startswith("/")
                     and kind not in ("message", "compact")
@@ -5200,6 +5639,8 @@ class Orchestrator:
                 self.set_autocompact(payload)
             elif kind == "max-context":
                 self.set_max_context(payload)
+            elif kind == "continue-prompt":
+                self.set_continue_prompt(payload)
             elif kind == "todos":
                 self.show_todos()
             elif kind == "effort":
@@ -5239,7 +5680,10 @@ class Orchestrator:
                 sys.stdout.write("\a")
                 sys.stdout.flush()
                 print(f"\033[36m[wakeup -- {payload}]\033[0m")
-                return CONTINUE_PROMPT
+                # Don't send the full CONTINUE_PROMPT — the bg task
+                # completion is already injected into context by the SDK.
+                # A minimal nudge is enough to start the next turn.
+                return "(background task completed — check results and continue)"
             if kind == "status":
                 self.print_status()
             elif kind == "help":
@@ -5272,6 +5716,8 @@ class Orchestrator:
                 self.set_autocompact(payload)
             elif kind == "max-context":
                 self.set_max_context(payload)
+            elif kind == "continue-prompt":
+                self.set_continue_prompt(payload)
             elif kind == "todos":
                 self.show_todos()
             elif kind == "effort":
@@ -5313,7 +5759,7 @@ class Orchestrator:
                             print(f"\033[31m[reconnect failed: {e2}]\033[0m")
                             next_prompt = await self._await_user_or_quit()
                             continue
-                        next_prompt = CONTINUE_PROMPT
+                        next_prompt = self.state.continue_prompt
                         continue
                     next_prompt = await self._await_user_or_quit()
                     continue
@@ -5326,7 +5772,13 @@ class Orchestrator:
                     await self._reconnect()
 
                 if injected:
-                    next_prompt = "\n".join(injected)
+                    # Send only the first message as this turn's prompt.
+                    # Re-queue any extras so they become separate turns
+                    # (and separate records in the JSONL) instead of being
+                    # \n-joined into one blob.
+                    next_prompt = injected[0]
+                    for extra in injected[1:]:
+                        await self.event_queue.put(("message", extra))
                     continue
 
                 if interrupted:
@@ -5370,7 +5822,7 @@ class Orchestrator:
                         print(
                             "\033[90m[post-compact: auto-continuing]\033[0m"
                         )
-                        next_prompt = CONTINUE_PROMPT
+                        next_prompt = self.state.continue_prompt
                     else:
                         print(
                             "\033[90m[post-compact: waiting for your input]\033[0m"
@@ -5447,8 +5899,8 @@ class Orchestrator:
                     elif done_emitted:
                         self.state.needs_user_attention = "done"
                         msg_line = (
-                            "\033[32m[Claude marked the project DONE -- "
-                            "your turn to send a new project or /quit]\033[0m"
+                            "\033[32m[Claude finished all tasks -- "
+                            "your turn]\033[0m"
                         )
                     else:
                         self.state.needs_user_attention = "waiting"
@@ -5493,7 +5945,7 @@ class Orchestrator:
                     )
                     next_prompt = await self._await_user_or_quit()
                     continue
-                next_prompt = grace_prompt if grace_prompt is not None else CONTINUE_PROMPT
+                next_prompt = grace_prompt if grace_prompt is not None else self.state.continue_prompt
         finally:
             await self._disconnect()
 
@@ -5545,40 +5997,15 @@ class Orchestrator:
             complete_while_typing=False,
             bottom_toolbar=self._bottom_toolbar,
             style=STYLE,
-            enable_history_search=True,
-            multiline=True,  # Alt-Enter newline, Enter submit (see keybindings)
+            multiline=True,  # Ctrl-J newline, Enter submit (see keybindings)
             refresh_interval=0.5,  # keep toolbar's busy/ctx/cost fields fresh
         )
 
-        # When the buffer's line count *shrinks*, prompt_toolkit's
-        # renderer doesn't drop the previously-claimed height by itself —
-        # `app.invalidate()` alone marks the layout dirty but the
-        # renderer keeps its old footprint, so the toolbar stays pushed
-        # down. `renderer.reset()` resets the renderer's internal state
-        # (last-screen height etc.) so the next render computes a fresh
-        # layout — typically lighter-weight than `renderer.erase()`.
-        # Per-keystroke work isn't needed: typing/expanding lines is
-        # handled fine by prompt_toolkit's own redraw path.
-        try:
-            buf = self.session.default_buffer
-            self._last_input_line_count = buf.document.line_count
-            def _shrink_redraw(_buf):  # type: ignore[no-untyped-def]
-                lc = _buf.document.line_count
-                prev = getattr(self, "_last_input_line_count", lc)
-                self._last_input_line_count = lc
-                if lc >= prev:
-                    return
-                app = self.session.app if self.session else None
-                if app is None:
-                    return
-                try:
-                    app.renderer.reset()
-                except Exception:  # noqa: BLE001
-                    pass
-                app.invalidate()
-            buf.on_text_changed += _shrink_redraw
-        except Exception:  # noqa: BLE001
-            pass  # buffer not available yet on this prompt_toolkit version
+        # Ghost-row fix: when the toolbar shrinks, `_render_toolbar`
+        # nulls `renderer._last_screen` so the diff algorithm treats
+        # the frame as a first-render (erase_down + full repaint).
+        global _toolbar_renderer  # noqa: PLW0603
+        _toolbar_renderer = self.session.app.renderer
 
         # Set the terminal title so long sessions are easy to find.
         try:
@@ -5626,17 +6053,40 @@ class Orchestrator:
             f"  |  perm={self.args.permission_mode}"
         )
         print(f"  - {ac_summary}")
-        resume_summary = "fresh session"
-        if not self.args.no_continue:
+        # Build a resume summary that reflects what *actually* happened —
+        # whether a session was found, which one, and how big it is — so
+        # the user can immediately tell if --continue picked up the right
+        # context or silently started fresh.
+        if self.args.no_continue:
+            resume_summary = "fresh session (--no-continue)"
+        elif self._initial_resume_id:
+            resume_summary = f"resuming {self._initial_resume_id[:12]} (--resume)"
+        elif history_jsonl is not None:
+            # We found a session to continue. Show its id + age + size so
+            # the user can verify it's the right one.
+            _sid = history_jsonl.stem[:12]
+            try:
+                _age = time.time() - history_jsonl.stat().st_mtime
+                _age_str = _fmt_duration(_age)
+                _size_kb = history_jsonl.stat().st_size / 1024
+                resume_summary = (
+                    f"continuing {_sid} "
+                    f"(age {_age_str}, {_size_kb:.0f} kB"
+                    f"{', replaying' if not self.args.no_replay else ', no replay'})"
+                )
+            except OSError:
+                resume_summary = f"continuing {_sid}"
+        else:
+            # --continue is active but no session was found for this cwd.
             resume_summary = (
-                "resuming last session (replaying history)"
-                if not self.args.no_replay
-                else "resuming last session (no replay)"
+                "no prior session found for this cwd — will start fresh"
             )
         print(
             f"  - cwd={self.args.cwd}"
             f"  |  {resume_summary}"
-            f"  |  effort={self.state.effort or 'default'}"
+        )
+        print(
+            f"  - effort={self.state.effort or 'default'}"
             f"  |  model={self.state.model or 'default'}"
         )
         print(f"  - tools: {tool_summary}")
@@ -5815,6 +6265,14 @@ def parse_args() -> argparse.Namespace:
         "flags only have effect when this is enabled.",
     )
     ap.add_argument(
+        "--continue-prompt",
+        default=None,
+        metavar="TEXT",
+        help="Override the text sent to Claude on each auto-continue turn. "
+        "Default includes instructions about [WAITING]/[DONE] tokens. "
+        "Use /continue-prompt at runtime to view or change it.",
+    )
+    ap.add_argument(
         "--continue-response-delay",
         type=float,
         default=CONTINUE_RESPONSE_DELAY_SECONDS,
@@ -5921,10 +6379,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--tasks-panel",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Show the live tasks panel in the toolbar while non-Bash tools "
-        "are running. Pass --no-tasks-panel to hide the panel entirely "
-        "(still accessible via /tasks / /show). Default on.",
+        default=False,
+        help="Show a live tasks panel in the toolbar for in-flight and "
+        "recently-completed tools. Completed tools stay visible for "
+        "--panel-grace seconds with a ✓ marker. Off by default (tools "
+        "print to the scroll via --show-tasks instead). Use --tasks-panel "
+        "with a high --panel-grace (e.g. 15) to move tool activity from "
+        "scroll to toolbar.",
     )
     ap.add_argument(
         "--bg-panel",
@@ -5935,13 +6396,46 @@ def parse_args() -> argparse.Namespace:
         "(still accessible via /bg). Default on.",
     )
     ap.add_argument(
+        "--show-tasks",
+        choices=("off", "compact", "full", "full+output"),
+        default="compact",
+        help="Print non-Bash tool activity to the scrolling log. "
+        "compact (default): one-liner per tool start and result. "
+        "full: tool start details + result summary. "
+        "full+output: details + full tool output (like --show-tool-output "
+        "but for every tool, not just Bash). off: toolbar panel only.",
+    )
+    ap.add_argument(
+        "--panel-delay",
+        type=float,
+        default=0.0,
+        metavar="SECS",
+        help="Seconds a tool must be running before it appears in the "
+        "toolbar tasks/bg panels. Useful to reduce noise from sub-second "
+        "ops (Read, Grep, Glob). 0 (default) shows immediately — the "
+        "grace period (--panel-grace) prevents flicker by keeping tasks "
+        "visible for a minimum duration.",
+    )
+    ap.add_argument(
+        "--panel-grace",
+        type=float,
+        default=10.0,
+        metavar="SECS",
+        help="Minimum seconds a task stays visible in the toolbar panel "
+        "after first appearing. If a task completes before this grace "
+        "period it shows a done marker (✓) until the period elapses, "
+        "so the user can see what ran. Higher values (10-15s) give a "
+        "useful activity summary when --tasks-panel is on. 0 disables. "
+        "Default 10.0.",
+    )
+    ap.add_argument(
         "--show-edits",
         choices=("off", "compact", "full"),
-        default="off",
-        help="How Edit tool calls render. off (default): live panel only, "
-        "use /show N for detail. compact: scroll inline as a one-liner "
-        "`edit path (+A -R lines) [#N]`. full: scroll inline with the full "
-        "unified diff. --inline-all-tools overrides this to 'full'.",
+        default="compact",
+        help="How Edit tool calls render. compact (default): scroll inline "
+        "as a one-liner `edit path (+A -R lines) [#N]`. full: scroll "
+        "inline with the full unified diff. off: live panel only, use "
+        "/show N for detail. --inline-all-tools overrides this to 'full'.",
     )
     ap.add_argument(
         "--cmd-hint-style",
