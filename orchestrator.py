@@ -653,6 +653,7 @@ SLASH_COMMANDS = [
     "/continue-prompt",
     "/bell",
     "/queue",
+    "/panel",
     "/todos",
     "/plan",
     "/quit",
@@ -802,9 +803,11 @@ class State:
     # Mirror of --show-thinking so the toolbar can surface it without
     # reaching into argparse state.
     show_thinking: bool = False
-    # Toolbar panel visibility (mirrors --tasks-panel / --bg-panel flags).
+    # Toolbar panel visibility (mirrors --tasks-panel / --bg-panel /
+    # --todos-panel flags).
     show_tasks_panel: bool = False
     show_bg_panel: bool = True
+    show_todos_panel: bool = False
     # Mirror of --show-tasks ("off"|"compact"|"full"|"full+output"). When not
     # "off", non-Bash tool calls and their results print to the scrolling log.
     show_tasks: str = "compact"
@@ -1031,6 +1034,23 @@ def classify(line: str) -> tuple[str, str]:
         if val in ("", "toggle"):
             return "thinking", ""  # toggle
         return "error", "usage: /thinking [on|off|toggle]"
+    if cmd == "panel":
+        # `/panel` — show all panel states.
+        # `/panel tasks|bg|todos [on|off|toggle]` — change/show one panel.
+        parts = arg.split()
+        if not parts:
+            return "panel", ""  # list all
+        name = parts[0].lower()
+        if name not in ("tasks", "bg", "todos"):
+            return "error", "usage: /panel [tasks|bg|todos] [on|off|toggle]"
+        action = parts[1].lower() if len(parts) > 1 else "toggle"
+        if action in ("on", "true", "1", "yes", "enable"):
+            return "panel", f"{name} on"
+        if action in ("off", "false", "0", "no", "disable"):
+            return "panel", f"{name} off"
+        if action in ("", "toggle"):
+            return "panel", f"{name} toggle"
+        return "error", "usage: /panel [tasks|bg|todos] [on|off|toggle]"
     if cmd == "burst":
         return "burst", arg  # "" = show; "N" = set count; "N T" = set both
     if cmd == "export":
@@ -3467,6 +3487,7 @@ def _panel_bg(state: "State") -> str:
 
 
 def _panel_todos(state: "State") -> str:
+    """Compact status-line badge: `todos: <done>/<total>[ {arrow} current-in-progress]`."""
     todos = state.current_todos
     if not todos:
         return "todos: -"
@@ -3480,7 +3501,7 @@ def _panel_todos(state: "State") -> str:
                 label = label[:49] + "…"
             in_prog_label = f" {_mark('arrow_cur')} {label}"
             break
-    return f"todos: <b>{done}/{len(todos)}</b>{in_prog_label}"
+    return f"todos: {done}/{len(todos)}{in_prog_label}"
 
 
 def _tb_escape(s: str) -> str:
@@ -3893,6 +3914,60 @@ def _panel_queued_prompts(state: "State") -> list[str]:
     return out
 
 
+_LIVE_TODOS_CAP = 50  # max todo rows before overflow
+
+
+def _panel_live_todos(state: "State") -> list[str]:
+    """One row per TodoWrite item when `--todos-panel` is on. Each row
+    shows a status marker (✓ / → / ·) and the todo's content/activeForm.
+    Header + hint row prepended when any todos exist. Empty when
+    `show_todos_panel` is off or Claude hasn't populated any todos."""
+    if not state.show_todos_panel:
+        return []
+    todos = state.current_todos
+    if not todos:
+        return []
+    out: list[str] = []
+    overflow = 0
+    # Budget: terminal width minus toolbar padding (2) minus the status
+    # marker + space (~2 chars).
+    width = _term_width(default=100)
+    budget = max(20, width - 4)
+    for i, t in enumerate(todos):
+        if i >= _LIVE_TODOS_CAP:
+            overflow += 1
+            continue
+        status = t.get("status", "pending")
+        if status == "completed":
+            marker = f"<done-marker>{_mark('check')}</done-marker>"
+            label_source = t.get("content") or t.get("activeForm") or ""
+        elif status == "in_progress":
+            marker = f"<tool-label>{_mark('arrow_cur')}</tool-label>"
+            label_source = t.get("activeForm") or t.get("content") or ""
+        else:  # pending or unknown
+            marker = f"<panel-dim>{_mark('bullet')}</panel-dim>"
+            label_source = t.get("content") or t.get("activeForm") or ""
+        label = label_source.strip().replace("\n", " ")
+        if len(label) > budget:
+            label = label[: budget - 1] + "…"
+        # Completed items render dimmer so the eye tracks the active
+        # ones first.
+        if status == "completed":
+            out.append(f"{marker} <panel-dim>{_tb_escape(label)}</panel-dim>")
+        else:
+            out.append(f"{marker} {_tb_escape(label)}")
+    if overflow > 0:
+        out.append(
+            f"… +{overflow} more todo{'s' if overflow != 1 else ''} "
+            f"(/todos for all)"
+        )
+    out[0:0] = [
+        _panel_header("todos"),
+        "<panel-hint>(<b>/todos</b>: full plan in scrollback)</panel-hint>",
+    ]
+    return out
+
+
 # Last toolbar line-count — used to detect when the toolbar shrinks so we
 # can force a full re-render (prompt_toolkit's renderer never lets the
 # layout height decrease and doesn't erase vacated rows, leaving ghost
@@ -3960,6 +4035,8 @@ def _render_toolbar(state: "State") -> str:
         for row in _panel_live_tasks(state):
             lines.append(_wrap_panel_row(row))
     for row in _panel_live_bg(state):
+        lines.append(_wrap_panel_row(row))
+    for row in _panel_live_todos(state):
         lines.append(_wrap_panel_row(row))
     for row in _panel_queued_prompts(state):
         lines.append(_wrap_panel_row(row))
@@ -4064,6 +4141,7 @@ class Orchestrator:
             thinking_enabled=not bool(getattr(args, "no_thinking", False)),
             show_tasks_panel=bool(getattr(args, "tasks_panel", False)),
             show_bg_panel=bool(getattr(args, "bg_panel", True)),
+            show_todos_panel=bool(getattr(args, "todos_panel", False)),
             show_tasks=getattr(args, "show_tasks", "compact") or "compact",
             panel_delay=float(getattr(args, "panel_delay", 0.0)),
             panel_grace=float(getattr(args, "panel_grace", 10.0)),
@@ -4375,6 +4453,7 @@ class Orchestrator:
         print("  /continue-prompt [text|default] view/set/reset the auto-continue prompt")
         print("  /bell [all|none|EVENTS]       view/change bell events (e.g. /bell turn-done on)")
         print("  /queue [N|drop N|clear]       view/manage prompts queued while Claude is busy")
+        print("  /panel [tasks|bg|todos [on|off|toggle]]  show/toggle toolbar panel visibility")
         print("  /todos  /plan                   show Claude's current TodoWrite plan")
         print("  /quit  /exit                    graceful exit (waits up to ~10s for CLI flush)")
         print("  /quit! /exit!                   force exit immediately (may lose last message)")
@@ -4809,6 +4888,51 @@ class Orchestrator:
         print(f"{_C_BOLD}queued prompt #{idx + 1}{_C_RESET}:")
         for line in q[idx].splitlines() or [q[idx]]:
             print(f"  {line}")
+
+    def manage_panel(self, payload: str) -> None:
+        """`/panel` — show state of all toolbar panels.
+        `/panel <name> [on|off|toggle]` — change one panel's visibility
+        (names: tasks, bg, todos). With no action, toggles."""
+        panels = {
+            "tasks": "show_tasks_panel",
+            "bg": "show_bg_panel",
+            "todos": "show_todos_panel",
+        }
+        payload = payload.strip()
+        if not payload:
+            # Show all states
+            print(f"{_C_BOLD}Toolbar panels{_C_RESET}:")
+            for name, attr in panels.items():
+                val = getattr(self.state, attr)
+                marker = "on " if val else "off"
+                print(
+                    f"  {name:8} {_C_MAGENTA}{marker}{_C_RESET}   "
+                    f"{_C_DIM}(runtime: /panel {name} "
+                    f"[on|off|toggle]){_C_RESET}"
+                )
+            return
+        parts = payload.split()
+        name = parts[0]
+        action = parts[1] if len(parts) > 1 else "toggle"
+        attr = panels.get(name)
+        if attr is None:
+            print(
+                f"{_C_RED}[error: unknown panel {name!r} "
+                f"(valid: tasks, bg, todos)]{_C_RESET}"
+            )
+            return
+        cur = getattr(self.state, attr)
+        if action == "on":
+            new = True
+        elif action == "off":
+            new = False
+        else:
+            new = not cur
+        setattr(self.state, attr, new)
+        print(
+            f"{_C_MAGENTA}[panel {name} -> "
+            f"{'on' if new else 'off'}]{_C_RESET}"
+        )
 
     def toggle_auto_continue(self, payload: str) -> None:
         if payload == "on":
@@ -6646,6 +6770,7 @@ class Orchestrator:
         "continue-prompt":  "set_continue_prompt",
         "bell":             "set_bell",
         "queue":            "manage_queue",
+        "panel":            "manage_panel",
         "todos":            "show_todos",
         "effort-show":      "show_effort_info",
         "model-show":       "show_model_info",
@@ -7778,6 +7903,16 @@ def parse_args() -> argparse.Namespace:
         help="Show the live background-tasks panel in the toolbar while bg "
         "shells / Task subagents are running. Pass --no-bg-panel to hide "
         "(still accessible via /bg). Default on.",
+    )
+    ap.add_argument(
+        "--todos-panel",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Show a live todos panel in the toolbar with one row per "
+        "TodoWrite item (✓ completed dimmed, → in-progress, · pending). "
+        "Off by default — the compact `todos: N/N` status-line badge "
+        "plus `/todos` for the full list in scrollback usually suffice. "
+        "Use --todos-panel when you want the full plan always visible.",
     )
     ap.add_argument(
         "--show-tasks",
