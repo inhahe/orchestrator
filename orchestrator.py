@@ -2847,6 +2847,16 @@ def _panel_session(state: "State") -> str:
         busy = "<status-error>RATE-LIMIT</status-error>"
     elif state.busy:
         busy = "<status-working>WORKING</status-working>"
+    elif state.background_tasks:
+        # bg-wait takes precedence over WAITING/done/burst — the
+        # orchestrator's actual behavior while bg tasks are running is
+        # to wait for them first, regardless of what sentinel Claude
+        # emitted. The needs_user_attention flag is still set, so once
+        # bg tasks drain the toolbar switches to WAITING/done/burst.
+        busy = (
+            f"<bg-wait-label>bg-wait "
+            f"({len(state.background_tasks)})</bg-wait-label>"
+        )
     elif state.needs_user_attention == "waiting":
         busy = "<status-waiting>WAITING</status-waiting>"
     elif state.needs_user_attention == "done":
@@ -2859,15 +2869,6 @@ def _panel_session(state: "State") -> str:
             desc = _tb_escape(state.api_status_description)[:40]
             label = f"API-STALL ({desc})"
         busy = f"<status-error>{label}</status-error>"
-    elif state.background_tasks:
-        # No foreground turn in flight, but bg shells / Task subagents
-        # are still running. The orchestrator is waiting on them before
-        # it would auto-continue; surface that as its own state so it
-        # isn't mistaken for plain idle.
-        busy = (
-            f"<bg-wait-label>bg-wait "
-            f"({len(state.background_tasks)})</bg-wait-label>"
-        )
     else:
         busy = "idle"
     # Only surface the session name if one's been set (via /rename or
@@ -6124,14 +6125,23 @@ class Orchestrator:
                 # rate-limit reset, bg-all-done (last bg task finished).
                 # For the "capacity restored" subset — rate-limit,
                 # api-status, bg-all-done — resume the auto-continue
-                # driver loop if it's on. Otherwise just notify.
+                # driver loop if it's on AND Claude hasn't asked for
+                # user input ([WAITING]/[DONE]/burst). Otherwise just
+                # notify — user still needs to type to engage.
                 print(f"\033[36m[wakeup -- {payload}]\033[0m")
                 resumable = (
                     payload.startswith("rate-limit")
                     or payload.startswith("api-status")
                     or payload == "bg-all-done"
                 )
-                if resumable and self.args.auto_continue:
+                claude_wants_user = self.state.needs_user_attention in (
+                    "waiting", "done", "burst",
+                )
+                if (
+                    resumable
+                    and self.args.auto_continue
+                    and not claude_wants_user
+                ):
                     return self.state.continue_prompt
                 continue
             if kind == "status":
