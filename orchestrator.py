@@ -1209,14 +1209,11 @@ def render_tool_use(
     # disambiguated by the command you use (/show, /think, /bg) — no
     # letter prefix needed.
     if seq is not None:
-        if name == "Bash":
-            seq_prefix = (
-                f"\033[90m[#{seq} -- "
-                f"{_cmd_hint(f'/show {seq} [-K]')}"
-                f"]\033[0m "
-            )
-        else:
-            seq_prefix = f"\033[90m[#{seq}]\033[0m "
+        seq_prefix = (
+            f"\033[90m[#{seq} -- "
+            f"{_cmd_hint(f'/show {seq} [-K]')}"
+            f"]\033[0m "
+        )
     else:
         seq_prefix = ""
     seq_tag = ""  # kept for legacy placeholders below; always empty now
