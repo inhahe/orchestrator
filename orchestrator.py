@@ -729,6 +729,10 @@ class State:
     # Cleared at run_turn start.
     needs_user_attention: str | None = None
     recent_turn_ends: deque[float] = field(default_factory=deque)
+    # `time.monotonic()` when the current turn started (live updated
+    # from run_turn / the async-turn path). None while idle. Consumed
+    # by the toolbar's "turn: Xs" live-elapsed section.
+    turn_started_at: float | None = None
     # Foreground tools currently in flight: tool_use_id -> {name, input, started_at, seq}
     active_tools: dict[str, dict[str, Any]] = field(default_factory=dict)
     # User messages typed while Claude is busy — queued up to be sent in
@@ -3416,8 +3420,15 @@ def _panel_session(state: "State") -> str:
         busy,
         ctx,
         f"turns: {state.turns}",
-        plan_field,
     ])
+    # Live "turn: Xs" elapsed timer — only while a turn is in flight.
+    # Updates each toolbar refresh (default 2 Hz). Hidden between
+    # turns so the status line doesn't keep a stale number around.
+    if state.turn_started_at is not None:
+        sections.append(
+            f"turn: {_fmt_duration(time.monotonic() - state.turn_started_at)}"
+        )
+    sections.append(plan_field)
     if rate_field:
         sections.append(rate_field)
     sections.extend([
@@ -3992,20 +4003,12 @@ def _render_toolbar(state: "State") -> str:
                 # `_min_available_height=0`, the next render's height
                 # calc `max(0, 0, preferred)` = preferred — which is
                 # correct content size, forcing prompt_toolkit to
-                # draw only the new (shorter) region. Immediately
-                # after, the render re-measures `_min_available_height`
-                # via `request_absolute_cursor_position` and the
-                # region re-expands on the FOLLOWING render (also in
-                # this same synchronous block if invalidate fires
-                # again). All output gets flushed together.
+                # draw only the new (shorter) region.
                 r._last_screen = None
                 r._min_available_height = 0
-                # Synchronous redraw — paints immediately, no gap.
                 try:
                     _app._redraw()
                 except Exception:  # noqa: BLE001
-                    # Fallback to async invalidate if _redraw fails
-                    # (e.g., called in an unexpected state).
                     _app.invalidate()
 
             asyncio.get_running_loop().call_soon(_force_full_redraw_next_tick)
@@ -4268,26 +4271,74 @@ class Orchestrator:
         def _(event):  # type: ignore[no-untyped-def]
             event.current_buffer.reset()
 
-        # Up / Down: cursor movement only — no history navigation.
-        # The system defaults (auto_up/auto_down) navigate history on
-        # the first/last line, which we don't want. These overrides
-        # only move the cursor within multi-line text and do nothing
-        # on single-line input.
-        @kb.add("up")
+        # Up / Down: visual-wrap navigation for wrapped input.
+        #
+        # prompt_toolkit's default `auto_up` / `auto_down` only know
+        # about LOGICAL rows (separated by `\n`). For our prompt,
+        # users typically have one long logical line that wraps onto
+        # multiple terminal rows — those visual wraps are NOT rows in
+        # the document, so the default binding falls through to
+        # history-backward, which isn't what we want.
+        #
+        # We emulate "visual row" navigation by jumping the cursor
+        # by one VISUAL-row's worth of characters. prompt_toolkit
+        # indents continuation (wrapped) lines by `prompt_w` cols so
+        # they visually align under the first row — which means every
+        # visual row has effective width `term_w - prompt_w`. Jumping
+        # by that delta preserves the visual column on the new row.
+        # When we can't step within the current logical line, fall
+        # through to `cursor_up` / `cursor_down` for real multi-line
+        # navigation.
+        _PROMPT_WIDTH = 2  # `"> "` at the left edge of every visual row
+
+        @kb.add("up", eager=True)
         def _(event):  # type: ignore[no-untyped-def]
-            buf = event.current_buffer
+            buf = event.app.current_buffer
             if buf.complete_state:
                 buf.complete_previous(count=event.arg)
-            elif buf.document.cursor_position_row > 0:
+                return
+            doc = buf.document
+            # Empirical calibration: `term_w - 2` = 2 left of target,
+            # `term_w - 4` = 2 right of target. The linear midpoint is
+            # `term_w - 3`. Likely reason the offset is odd: the
+            # prompt wraps at an effective text width that's `term_w -
+            # (_PROMPT_WIDTH + 1)` — perhaps prompt_toolkit reserves
+            # an extra 1-col right margin to avoid the classic
+            # "last-column auto-wrap" terminal glitch.
+            effective_w = max(1, _term_width() - _PROMPT_WIDTH - 1)
+            col_in_line = doc.cursor_position_col
+            if col_in_line >= effective_w:
+                # Step up one visual row within current logical line.
+                buf.cursor_position -= effective_w
+            elif doc.cursor_position_row > 0:
+                # Already at visual row 0 of this logical line —
+                # step to previous logical line.
                 buf.cursor_up(count=event.arg)
+            # Else: first visual row of first logical line — swallow
+            # (deliberately skip history-backward).
 
-        @kb.add("down")
+        @kb.add("down", eager=True)
         def _(event):  # type: ignore[no-untyped-def]
-            buf = event.current_buffer
+            buf = event.app.current_buffer
             if buf.complete_state:
                 buf.complete_next(count=event.arg)
-            elif buf.document.cursor_position_row < buf.document.line_count - 1:
+                return
+            doc = buf.document
+            # Empirical calibration: `term_w - 2` = 2 left of target,
+            # `term_w - 4` = 2 right of target. The linear midpoint is
+            # `term_w - 3`. Likely reason the offset is odd: the
+            # prompt wraps at an effective text width that's `term_w -
+            # (_PROMPT_WIDTH + 1)` — perhaps prompt_toolkit reserves
+            # an extra 1-col right margin to avoid the classic
+            # "last-column auto-wrap" terminal glitch.
+            effective_w = max(1, _term_width() - _PROMPT_WIDTH - 1)
+            col_in_line = doc.cursor_position_col
+            line_len = len(doc.current_line)
+            if col_in_line + effective_w <= line_len:
+                buf.cursor_position += effective_w
+            elif doc.cursor_position_row < doc.line_count - 1:
                 buf.cursor_down(count=event.arg)
+            # Else: last visual row of last logical line — swallow.
 
         return kb
 
@@ -5979,7 +6030,14 @@ class Orchestrator:
     def _handle_async_message(self, msg: Any) -> None:
         """Render a between-turns message and, for wakeup-worthy events
         (background-task completion, requires_action), push a 'wakeup' onto
-        event_queue so any pending wait returns CONTINUE_PROMPT."""
+        event_queue so any pending wait returns CONTINUE_PROMPT.
+
+        Assistant content arriving here (Claude's auto-response to bg-task
+        notifications, etc.) is rendered identically to in-turn content
+        — same `claude:` prefix, same 8-col indent, same busy-state
+        tracking — so the toolbar correctly reports "WORKING" while
+        Claude is actively streaming and it doesn't look visually
+        different from a user-driven turn."""
         if isinstance(msg, SystemMessage):
             # Snapshot bg-count BEFORE rendering so we can tell if this
             # particular message is the one that emptied the list (used
@@ -6006,11 +6064,29 @@ class Orchestrator:
                 self.state.active_model = m
             for block in msg.content:
                 if isinstance(block, TextBlock):
-                    sys.stdout.write(f"{_C_GREEN}claude (async):{_C_RESET} ")
-                    self._claude_col = 16  # "claude (async): " width
-                    self._write_indented(block.text, 16)
-                    self._flush_claude_text()
+                    # First TextBlock of a fresh async stream: print the
+                    # "claude:" prefix, flip busy=True, record start time
+                    # (used for the matching [turn done] line). Subsequent
+                    # TextBlocks in the same stream just append text.
+                    if not getattr(self, "_async_in_text", False):
+                        sys.stdout.write(f"{_C_GREEN}claude:{_C_RESET} ")
+                        self._async_in_text = True
+                        self._claude_col = 8  # "claude: " width
+                        self.state.busy = True
+                        self._async_turn_started = time.monotonic()
+                        self.state.turn_started_at = self._async_turn_started
+                    self._write_indented(block.text, 8)
+                    sys.stdout.flush()
                 elif isinstance(block, ToolUseBlock):
+                    if getattr(self, "_async_in_text", False):
+                        self._flush_claude_text()
+                        self._async_in_text = False
+                    # Tool use also counts as "working" — mark busy and
+                    # remember start time in case no TextBlock preceded.
+                    if not self.state.busy:
+                        self.state.busy = True
+                        self._async_turn_started = time.monotonic()
+                        self.state.turn_started_at = self._async_turn_started
                     render_tool_use(
                         block,
                         show_full_commands=self.args.show_full_commands,
@@ -6062,9 +6138,42 @@ class Orchestrator:
                                 tool_name=tool_name,
                             )
         elif isinstance(msg, ResultMessage):
-            # Stray ResultMessage outside a turn (rare). Capture session id.
+            # Flush any trailing async text.
+            if getattr(self, "_async_in_text", False):
+                self._flush_claude_text()
+                self._async_in_text = False
             if msg.session_id:
                 self.state.session_id = msg.session_id
+            # If we actually rendered async content (busy was flipped on
+            # by a TextBlock or ToolUseBlock above), treat this as the
+            # end of an async "turn" — book-keep cost/usage/context/turn-
+            # counter the same way run_turn does, print the matching
+            # [turn done -- ...] line, and flip busy back off.
+            if self.state.busy:
+                self.state.last_result_subtype = msg.subtype
+                self.state.turns += 1
+                if msg.total_cost_usd is not None:
+                    self.state.total_cost_usd += msg.total_cost_usd
+                usage = msg.usage or {}
+                self.state.last_usage = usage
+                model_usage = getattr(msg, "model_usage", None)
+                if not self.state.compact_during_last_turn:
+                    self.state.context_tokens = _extract_context_tokens(
+                        usage, model_usage
+                    )
+                cost_part = ""
+                if not self.state.is_subscription:
+                    cost = msg.total_cost_usd or 0.0
+                    cost_part = f"${cost:.4f} -- "
+                started = getattr(self, "_async_turn_started", None) or time.monotonic()
+                elapsed = time.monotonic() - started
+                print(
+                    f"{_C_DIM}[turn done -- {msg.subtype} -- "
+                    f"{cost_part}ctx~{self.state.context_tokens} tok -- "
+                    f"{_fmt_duration(elapsed)}]{_C_RESET}"
+                )
+                self.state.busy = False
+                self.state.turn_started_at = None
         else:
             render_unknown_message(msg, self.state)
 
@@ -6099,10 +6208,12 @@ class Orchestrator:
             # Bg task completions (task_notification / task_updated) are
             # NOT queued as wakeups here — the SDK/CLI handles them by
             # injecting the <task-notification> into Claude's context,
-            # and Claude's auto-response arrives as `claude (async):` via
-            # _handle_async_message. A manual wakeup would just produce
-            # a redundant `[wakeup -- ...]` line. The bell for bg-done
-            # rings from `_emit_bg_completion` instead.
+            # and Claude's auto-response is rendered by
+            # _handle_async_message the same way as an in-turn
+            # response (claude: prefix, busy=True while streaming).
+            # A manual wakeup would just produce a redundant
+            # [wakeup -- ...] line. The bell for bg-done rings from
+            # `_emit_bg_completion` instead.
             if sub == "session_state_changed" and d.get("state") == "requires_action":
                 return "session requires action"
         return None
@@ -6138,6 +6249,7 @@ class Orchestrator:
         self.state.current_turn_tool_seqs = []
         self.state.current_turn_bg = {}
         turn_started = time.monotonic()
+        self.state.turn_started_at = turn_started
         self.turn_active.set()
 
         # Echo the full prompt — no length cap; wrap continuation lines
@@ -6148,6 +6260,15 @@ class Orchestrator:
         self._claude_col = 5
         self._claude_word_buf = ""
         self._claude_pending_indent = False
+        # prompt_toolkit's `render_as_done` path can leave the cursor
+        # one row below the last rendered input row, producing a
+        # visible blank line between the input echo (`> ...`) and our
+        # `you:` echo. Move cursor up one row and erase it to reclaim
+        # that row for the `you:` line. Safe when the blank exists;
+        # cosmetic-only if it doesn't (would overwrite an already-
+        # blank row, net zero). \033[F = cursor-up-to-BOL; \033[2K =
+        # erase entire line.
+        sys.stdout.write("\033[F\033[2K")
         sys.stdout.write(f"{_C_CYAN}you:{_C_RESET} ")
         self._write_indented(prompt_text, 5, flush=True)
         self._flush_claude_text()
@@ -6489,6 +6610,7 @@ class Orchestrator:
         finally:
             self.turn_active.clear()
             self.state.busy = False
+            self.state.turn_started_at = None
             # Drop any foreground tool tracker entries left over from an
             # interrupted turn (background tasks survive — they keep running).
             self.state.active_tools.clear()
@@ -7131,9 +7253,16 @@ class Orchestrator:
                         _bell_event = "stalled"
                     elif done_emitted:
                         self.state.needs_user_attention = "done"
+                        # Same caveat as WAITING: Claude can still be
+                        # woken by a bg-task completion or a
+                        # requires-action event and continue producing
+                        # content through `_handle_async_message`,
+                        # even after emitting [DONE]. Don't imply the
+                        # session is over.
                         msg_line = (
                             f"{_C_GREEN}[Claude finished all tasks -- "
-                            f"your turn]{_C_RESET}"
+                            f"your turn (or async wakeup on bg-task "
+                            f"/ requires-action)]{_C_RESET}"
                         )
                         _bell_event = "done"
                     else:
