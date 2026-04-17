@@ -2256,10 +2256,28 @@ def _render_tool_result(
         return
     size = _humanize_size(text)
     if is_error:
-        print(
-            f"{seq_prefix}{_C_RED}{_mark('failed')} tool error{_C_RESET}  "
-            f"{_C_DIM}({size}){_C_RESET}"
-        )
+        # Show the first non-empty line of the error text (e.g. "must
+        # read file before editing it") — but only if it fits on one
+        # terminal line. Otherwise fall back to the compact size hint.
+        preview = ""
+        for _err_line in text.strip().splitlines():
+            _err_line = _err_line.strip()
+            if _err_line:
+                preview = _err_line
+                break
+        # "✗ " (or "x ") + preview must fit within terminal width
+        # after the seq prefix.
+        prefix_len = _visible_len(seq_prefix) + 2  # mark + space
+        avail = _term_width(default=100) - prefix_len
+        if preview and len(preview) <= avail:
+            print(
+                f"{seq_prefix}{_C_RED}{_mark('failed')} {preview}{_C_RESET}"
+            )
+        else:
+            print(
+                f"{seq_prefix}{_C_RED}{_mark('failed')} tool error{_C_RESET}  "
+                f"{_C_DIM}({size}){_C_RESET}"
+            )
     else:
         print(f"{seq_prefix}{_C_DIM}{_mark('arrow_result')} {size}{_C_RESET}")
 
@@ -3113,13 +3131,27 @@ def render_session_history_text(
                             is_err = bool(block.get("is_error"))
                             if not show_tool_output:
                                 # Match live default: dim "→ N lines, K chars"
-                                # on success, red error stub on failure.
+                                # on success, red error preview on failure.
                                 size = _humanize_size(text)
                                 if is_err:
-                                    write(
-                                        f"{_C_RED}{_mark('failed')} tool error{_C_RESET}  "
-                                        f"{_C_DIM}({size}){_C_RESET}\n"
-                                    )
+                                    _err_preview = ""
+                                    for _el in text.strip().splitlines():
+                                        _el = _el.strip()
+                                        if _el:
+                                            _err_preview = _el
+                                            break
+                                    # mark + space = 2 visible chars
+                                    _avail = _term_width(default=100) - 2
+                                    if _err_preview and len(_err_preview) <= _avail:
+                                        write(
+                                            f"{_C_RED}{_mark('failed')} "
+                                            f"{_err_preview}{_C_RESET}\n"
+                                        )
+                                    else:
+                                        write(
+                                            f"{_C_RED}{_mark('failed')} tool error{_C_RESET}  "
+                                            f"{_C_DIM}({size}){_C_RESET}\n"
+                                        )
                                 else:
                                     write(f"{_C_DIM}{_mark('arrow_result')} {size}{_C_RESET}\n")
                                 continue
@@ -3398,7 +3430,7 @@ def _panel_session(state: "State") -> str:
         # being made or it's truly wedged.
         if state.connect_started_at is not None:
             elapsed_s = time.monotonic() - state.connect_started_at
-            label = f"CONNECTING {int(elapsed_s)}s"
+            label = f"CONNECTING ({int(elapsed_s)}s)"
         else:
             label = "CONNECTING"
         busy = f"<status-waiting>{label}</status-waiting>"
@@ -3414,10 +3446,22 @@ def _panel_session(state: "State") -> str:
         # to wait for them first, regardless of what sentinel Claude
         # emitted. The needs_user_attention flag is still set, so once
         # bg tasks drain the toolbar switches to WAITING/done/burst.
-        busy = (
-            f"<bg-wait-label>bg-wait "
-            f"({len(state.background_tasks)})</bg-wait-label>"
+        # Show elapsed time of the oldest (longest-running) bg task.
+        oldest = min(
+            (t.get("started_at", now) for t in state.background_tasks.values()),
+            default=None,
         )
+        if oldest is not None:
+            elapsed = _fmt_duration(time.monotonic() - oldest)
+            busy = (
+                f"<bg-wait-label>bg-wait "
+                f"({len(state.background_tasks)}, {elapsed})</bg-wait-label>"
+            )
+        else:
+            busy = (
+                f"<bg-wait-label>bg-wait "
+                f"({len(state.background_tasks)})</bg-wait-label>"
+            )
     elif state.needs_user_attention == "waiting":
         busy = "<status-waiting>WAITING</status-waiting>"
     elif state.needs_user_attention == "done":
@@ -4495,6 +4539,25 @@ class Orchestrator:
             elif doc.cursor_position_row < doc.line_count - 1:
                 buf.cursor_down(count=event.arg)
             # Else: last visual row of last logical line — swallow.
+
+        # Left / Right: cross line boundaries so the cursor wraps from
+        # column 0 to end-of-previous-line and from end-of-line to
+        # start-of-next-line, rather than stopping at the edge.
+        # prompt_toolkit's default emacs-mode `backward-char` /
+        # `forward-char` should already do this, but some builds or
+        # terminal configurations restrict movement to the current
+        # logical line. Explicit bindings guarantee the behavior.
+        @kb.add("left")
+        def _(event):  # type: ignore[no-untyped-def]
+            buf = event.app.current_buffer
+            if buf.cursor_position > 0:
+                buf.cursor_position -= 1
+
+        @kb.add("right")
+        def _(event):  # type: ignore[no-untyped-def]
+            buf = event.app.current_buffer
+            if buf.cursor_position < len(buf.text):
+                buf.cursor_position += 1
 
         return kb
 
@@ -5877,7 +5940,22 @@ class Orchestrator:
             print(f"{_C_RED}[rename failed: {e}]{_C_RESET}")
             return
         self.state.session_title = new_title
+        self._update_terminal_title()
         print(f"{_C_MAGENTA}[renamed session {sid[:8]} -> '{new_title}']{_C_RESET}")
+
+    def _update_terminal_title(self) -> None:
+        """Set the terminal window title. Uses the session name if one
+        exists, otherwise falls back to the cwd directory name."""
+        try:
+            name = self.state.session_title
+            if name:
+                title = name
+            else:
+                title = f"Claude -- {Path(self.args.cwd).resolve().name}"
+            sys.stdout.write(f"\033]0;{title}\a")
+            sys.stdout.flush()
+        except Exception:  # noqa: BLE001
+            pass
 
     def print_status(self) -> None:
         print()
@@ -6939,8 +7017,9 @@ class Orchestrator:
                     # waiting for a reconnect.
                     if self.state.session_id:
                         disk_title = _read_session_title(self.state.session_id)
-                        if disk_title:
+                        if disk_title and disk_title != self.state.session_title:
                             self.state.session_title = disk_title
+                            self._update_terminal_title()
                     cost_part = ""
                     if not self.state.is_subscription:
                         cost = msg.total_cost_usd or 0.0
@@ -7170,24 +7249,32 @@ class Orchestrator:
                     )
                 # state.queued_prompts is the source of truth for
                 # pending user prompts — the worker pops from it at
-                # turn boundaries. The event_queue message is both a
-                # wakeup signal (so the worker unblocks from
-                # `_await_user_or_quit`) AND a payload carrier for
-                # the race case below.
+                # turn boundaries.
                 #
-                # Only queue WHILE BUSY so idle-typed messages don't
-                # briefly flash in the queue panel (they're about to
-                # be consumed directly by `_await_user_or_quit`).
+                # When busy: append to queued_prompts and do NOT put
+                # on event_queue. The worker isn't in
+                # `_await_user_or_quit` during a turn, so no wakeup
+                # is needed. Putting on event_queue while also
+                # appending to queued_prompts caused a race: if the
+                # put was scheduled by asyncio AFTER the worker's
+                # `_drain_between_turns`, the orphaned event would be
+                # re-added to queued_prompts on the next drain
+                # (because the original had already been popped),
+                # causing a double-send.
                 #
-                # The turn-end race (user's Enter arrives just after
-                # busy flipped to False — message lands in
-                # event_queue only) is caught by `_drain_between_turns`,
-                # which moves any stray "message" events into
-                # `queued_prompts` before dropping them. That keeps
-                # this gate safe: no lost messages, no panel flash.
+                # When not busy: put on event_queue only — the worker
+                # IS in `_await_user_or_quit` and will consume it
+                # directly. Don't append to queued_prompts so it
+                # doesn't briefly flash in the queue panel.
+                #
+                # The turn-end race (Enter arrives just after busy
+                # flips off) is still caught by `_drain_between_turns`
+                # which moves stray "message" events into
+                # `queued_prompts`.
                 if kind == "message" and self.state.busy:
                     self.state.queued_prompts.append(payload)
-                await self.event_queue.put((kind, payload))
+                else:
+                    await self.event_queue.put((kind, payload))
         finally:
             self.stop_event.set()
             try:
@@ -7763,12 +7850,7 @@ class Orchestrator:
         self.session.app._handle_exception = _async_exception_handler
 
         # Set the terminal title so long sessions are easy to find.
-        try:
-            title = f"Claude Orchestrator -- {Path(self.args.cwd).resolve().name}"
-            sys.stdout.write(f"\033]0;{title}\a")
-            sys.stdout.flush()
-        except Exception:  # noqa: BLE001
-            pass
+        self._update_terminal_title()
 
         tool_summary = (
             "all Claude Code tools (Read, Write, Edit, Glob, Grep, Bash "
