@@ -164,7 +164,7 @@ _DEFAULT_COLORS: dict[str, _ColorSpec] = {
     #   Secondary info, defaults to DIM.
     "PATH":        {"fg": "38;5;250", "bg": None, "bold": False},
     "URL":         {"fg": "38;5;250", "bg": None, "bold": False},
-    "PATTERN":     {"fg": "96",       "bg": None, "bold": False},
+    "PATTERN":     {"fg": "36",       "bg": None, "bold": False},
     "COMMAND":     {"fg": "96",       "bg": None, "bold": False},
     "DESC":        {"fg": "38;5;244", "bg": None, "bold": False},
 }
@@ -628,6 +628,7 @@ CONTINUE_BURST_WINDOW_SECONDS = 180.0
 SLASH_COMMANDS = [
     "/help",
     "/status",
+    "/debug",
     "/cost",
     "/cwd",
     "/clear",
@@ -704,6 +705,12 @@ class State:
     session_id: str | None = None
     session_title: str | None = None  # cached title from JSONL custom-title/ai-title
     init_seen: bool = False  # True after the first SDK init message
+    # Session id we expected the SDK's first init to report -- set in run()
+    # when we're about to pass --continue or --resume so the init handler
+    # can detect silent failure (Claude Code's print mode silently starts a
+    # fresh session if loadConversationForResume returns null). Cleared on
+    # the first init message, mismatch or not.
+    expected_resume_sid: str | None = None
     continue_prompt: str = CONTINUE_PROMPT
     context_tokens: int = 0
     total_cost_usd: float = 0.0
@@ -712,6 +719,20 @@ class State:
     effort: str | None = None
     model: str | None = None
     busy: bool = False
+    # True while `_connect()` is waiting for the SDK to finish bringing up
+    # the CLI subprocess (subprocess spawn + transport handshake +
+    # `initialize` control-protocol round-trip). The SDK can take tens of
+    # seconds on large sessions because Claude Code has to parse the same
+    # JSONL we're resuming. `busy` alone doesn't cover this (it's a
+    # turn-scoped flag), so the toolbar would otherwise lie with "idle"
+    # while nothing the user types can be consumed yet. Cleared once
+    # `_connect()` returns.
+    connecting: bool = False
+    # `time.monotonic()` when the in-flight `_connect()` started; used by
+    # the toolbar to render a live elapsed counter next to CONNECTING so
+    # you can tell whether the handshake is making progress or truly
+    # wedged. None while not connecting.
+    connect_started_at: float | None = None
     last_result_subtype: str | None = None
     last_compact_trigger: str | None = None
     # Set by the compact_boundary handler; consumed (and cleared) by
@@ -1001,6 +1022,8 @@ def classify(line: str) -> tuple[str, str]:
         return "compact", ""
     if cmd == "status":
         return "status", ""
+    if cmd == "debug":
+        return "debug", ""
     if cmd == "help":
         return "help", ""
     if cmd == "effort":
@@ -1466,7 +1489,28 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
         # turn — suppress the repeat noise for the common same-session case.
         first = not state.init_seen
         state.init_seen = True
-        if first or old_sid != new_sid:
+        # Silent-fresh-session detector. We pre-populated state.expected_resume_sid
+        # in run() if we asked the SDK to --continue or --resume. If the SDK's
+        # first init reports a different session id, Claude Code's print-mode
+        # path silently fell through to a fresh session (loadConversationForResume
+        # returned null with no error -- see claude-code-mod print.ts:4908-4986).
+        # Prior conversation context was NOT loaded; warn loudly so the user can
+        # /quit and re-resume by id instead of polluting the project dir with
+        # another empty session.
+        expected = state.expected_resume_sid
+        state.expected_resume_sid = None  # consumed on first init regardless
+        if first and expected and expected != new_sid:
+            short_exp = expected[:12]
+            short_new = new_sid[:12]
+            print(
+                f"{_C_BOLD_RED}[!! warning] expected to resume session "
+                f"{short_exp}, but Claude Code silently started a fresh "
+                f"session {short_new} -- prior conversation context was NOT "
+                f"loaded.{_C_RESET}\n"
+                f"{_C_YELLOW}    To recover: /quit, then re-run with "
+                f"--resume {expected}{_C_RESET}"
+            )
+        elif first or old_sid != new_sid:
             short_new = new_sid[:12]
             if old_sid is None or (first and old_sid == new_sid):
                 print(f"{_C_DIM}[init] session {short_new}{_C_RESET}")
@@ -1867,25 +1911,32 @@ def render_tool_use(
 
     `edits_mode` ("off"|"compact"|"full") lets Edit render inline even when
     `inline_all` is False — useful when you want file-change activity in
-    your scrollback but don't need every Read/Grep there too. `inline_all`
-    forces Edit to "full".
+    your scrollback but don't need every Read/Grep there too.
 
     `show_tasks` ("off"|"compact"|"full"|"full+output") enables inline
     rendering for *all* tool types when not "off". "compact" prints
-    one-liners, "full"/"full+output" add detail (Edit diffs, Write
-    previews). The "+output" part only affects tool *results*, not this
-    function."""
+    one-liners; "full"/"full+output" add detail (Edit diffs, Write/
+    NotebookEdit previews, full TodoWrite plan, MCP arg dumps). The
+    --inline-all-tools corner case (show_tasks="off" forced inline) stays
+    at the compact one-liner -- detail is always opt-in via "full" (or
+    --show-edits=full for Edit specifically). The "+output" part only
+    affects tool *results*, not this function."""
     name = block.name
-    # Determine effective Edit rendering mode: inline_all > explicit
-    # --show-edits > show_tasks level > default.
-    if inline_all:
-        effective_edits = "full"
-    elif edits_mode != "off":
+    # Determine effective Edit rendering mode: explicit --show-edits wins;
+    # otherwise fall back to the show_tasks level. inline_all only forces
+    # *visibility* (renders Edit even when show_tasks="off"), never the
+    # detail level -- detail is always opt-in via --show-edits=full or
+    # --show-tasks=full.
+    if edits_mode != "off":
         effective_edits = edits_mode
-    elif show_tasks == "compact":
-        effective_edits = "compact"
     elif show_tasks in ("full", "full+output"):
         effective_edits = "full"
+    elif show_tasks == "compact":
+        effective_edits = "compact"
+    elif inline_all:
+        # show_tasks="off" with --inline-all-tools: render compact rather
+        # than hide. Matches Write/NotebookEdit/MCP-fallback behavior.
+        effective_edits = "compact"
     else:
         effective_edits = "off"
     # Gate: which tool types render inline?
@@ -1931,8 +1982,11 @@ def render_tool_use(
             path,
             suffix,
         )
-        # Skip the file-content preview in compact mode — keep it to one line.
-        if show_tasks != "compact":
+        # Detail (file-content preview) only when the user opted in via
+        # --show-tasks full / full+output. Compact mode and the
+        # --inline-all-tools corner case (show_tasks="off" forced inline)
+        # both stay header-only.
+        if show_tasks in ("full", "full+output"):
             preview = content.splitlines()[:10]
             for ln in preview:
                 print(f"    {_C_GREEN}+{ln}{_C_RESET}")
@@ -1948,7 +2002,8 @@ def render_tool_use(
             path,
             suffix,
         )
-        if show_tasks != "compact":
+        # See Write above: detail only on opt-in (full / full+output).
+        if show_tasks in ("full", "full+output"):
             src = inp.get("new_source", "") or ""
             for ln in src.splitlines()[:12]:
                 print(f"    {_C_GREEN}+{ln}{_C_RESET}")
@@ -2007,15 +2062,20 @@ def render_tool_use(
     elif name == "TodoWrite":
         todos = inp.get("todos", []) or []
         print(f"{seq_prefix}{_C_BOLD_BLUE}TodoWrite{_C_RESET} {_C_DIM}({len(todos)} items){_C_RESET}")
-        markers = {
-            "completed": f"{_C_GREEN}{_mark('check')}{_C_RESET}",
-            "in_progress": f"{_C_YELLOW}{_mark('arrow_cur')}{_C_RESET}",
-            "pending": f"{_C_DIM}{_mark('bullet')}{_C_RESET}",
-        }
-        for t in todos:
-            m = markers.get(t.get("status", "pending"), "?")
-            content = t.get("content", "") or t.get("activeForm", "")
-            print(f"    {m} {content}")
+        # Match Write/NotebookEdit/MCP-fallback: per-item lines only when the
+        # user opted into detail via --show-tasks full / full+output.
+        # Compact mode shows just the (N items) count; /todos prints the
+        # full plan on demand.
+        if show_tasks in ("full", "full+output"):
+            markers = {
+                "completed": f"{_C_GREEN}{_mark('check')}{_C_RESET}",
+                "in_progress": f"{_C_YELLOW}{_mark('arrow_cur')}{_C_RESET}",
+                "pending": f"{_C_DIM}{_mark('bullet')}{_C_RESET}",
+            }
+            for t in todos:
+                m = markers.get(t.get("status", "pending"), "?")
+                content = t.get("content", "") or t.get("activeForm", "")
+                print(f"    {m} {content}")
     elif name == "Task":
         desc = inp.get("description", "")
         subtype = inp.get("subagent_type", "general-purpose")
@@ -2079,7 +2139,7 @@ def render_tool_use(
         # repr() so nested dicts/lists print structurally; long values
         # wrap at terminal width to the same indent.
         print(f"{seq_prefix}{_C_BOLD_BLUE}{name}{_C_RESET}")
-        if inp and show_tasks != "compact":
+        if inp and show_tasks in ("full", "full+output"):
             keys = list(inp.keys())
             keylen = max(len(str(k)) for k in keys)
             for k in keys:
@@ -3330,6 +3390,18 @@ def _panel_session(state: "State") -> str:
     )
     if _rate_limited:
         busy = "<status-error>RATE-LIMIT</status-error>"
+    elif state.connecting:
+        # Shown during the SDK's `client.connect()` call. Distinct from
+        # "idle" so the user doesn't type expecting it to send -- input
+        # typed here stacks in event_queue with no consumer until the
+        # handshake finishes. Elapsed counter shows whether progress is
+        # being made or it's truly wedged.
+        if state.connect_started_at is not None:
+            elapsed_s = time.monotonic() - state.connect_started_at
+            label = f"CONNECTING {int(elapsed_s)}s"
+        else:
+            label = "CONNECTING"
+        busy = f"<status-waiting>{label}</status-waiting>"
     elif state.busy:
         busy = "<status-working>WORKING</status-working>"
     elif state.background_tasks:
@@ -4307,9 +4379,12 @@ class Orchestrator:
             elif buf.text:
                 buf.reset()
             else:
+                # Ctrl+C never exits the orchestrator — only /exit does.
+                # Still set the interrupt flag in case something is
+                # running outside a foreground turn (e.g. the
+                # `_interrupt_watcher` if one is armed, or a
+                # reconnect-in-progress that eventually checks it).
                 self.interrupt_event.set()
-                self.stop_event.set()
-                event.app.exit(exception=EOFError)
 
         @kb.add("c-d")
         def _(event):  # type: ignore[no-untyped-def]
@@ -5829,6 +5904,60 @@ class Orchestrator:
         print(f"  last usage   : {self.state.last_usage}")
         print()
 
+    def print_debug(self) -> None:
+        """Dump internal state so we can tell WHERE a wedge is happening.
+        Useful when input typed at idle doesn't produce a `you:` echo, or
+        when /exit hangs — shows whether the worker is parked on the event
+        queue, stuck mid-turn, or blocked in a disconnect."""
+        print()
+        print("  === debug snapshot ===")
+        print(f"  state.busy              : {self.state.busy}")
+        print(f"  needs_user_attention    : {self.state.needs_user_attention}")
+        print(f"  turn_active event set   : {self.turn_active.is_set()}")
+        print(f"  stop_event set          : {self.stop_event.is_set()}")
+        print(f"  interrupt_event set     : {self.interrupt_event.is_set()}")
+        print(f"  event_queue size        : {self.event_queue.qsize()}")
+        print(f"  turn_msg_queue size     : {self.turn_msg_queue.qsize()}")
+        print(f"  queued_prompts          : {len(self.state.queued_prompts)}")
+        if self.state.queued_prompts:
+            for i, p in enumerate(self.state.queued_prompts):
+                preview = p.replace("\n", " ")[:80]
+                print(f"    [{i}] {preview}")
+        print(f"  active_tools (in-flight): {len(self.state.active_tools)}")
+        print(f"  background_tasks        : {len(self.state.background_tasks)}")
+        pend = self._pending_permission
+        if pend is None:
+            print(f"  pending_permission      : None")
+        else:
+            print(f"  pending_permission      : set (done={pend.done()})")
+        # Task states — when a task is wedged, `_state` usually shows
+        # PENDING and .get_stack() shows where it's parked.
+        for attr, label in (
+            ("_input_task", "input_task   "),
+            ("_worker_task", "worker_task  "),
+            ("dispatcher_task", "dispatcher   "),
+            ("_status_task", "status_poller"),
+            ("_rate_watcher_task", "rate_watcher "),
+        ):
+            t = getattr(self, attr, None)
+            if t is None:
+                print(f"  {label}           : (not started)")
+                continue
+            state = "done" if t.done() else "running"
+            print(f"  {label}           : {state}")
+            if not t.done():
+                try:
+                    stack = t.get_stack(limit=3)
+                    if stack:
+                        top = stack[-1]
+                        print(
+                            f"    parked at: {top.f_code.co_name} "
+                            f"({Path(top.f_code.co_filename).name}:{top.f_lineno})"
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
+        print()
+
     # ---- SDK plumbing --------------------------------------------------
 
     def _make_options(self, resume_id: str | None = None) -> ClaudeAgentOptions:
@@ -5875,12 +6004,28 @@ class Orchestrator:
             and PermissionResultAllow is not None
         ):
             kwargs["can_use_tool"] = self._handle_tool_permission
+        # Capture CLI stderr so we can surface diagnostic output
+        # (especially during slow CONNECTING phases). The SDK normally
+        # discards it.
+        kwargs["stderr"] = self._on_cli_stderr
         # Note on history replay: the CLI's --replay-user-messages flag is
         # NOT for historical playback (it just echoes inputs we send back at
         # us). Claude Code's TUI loads the session JSONL from disk and
         # renders it itself; we do the same in run() before connecting,
         # gated by --no-replay.
         return ClaudeAgentOptions(**kwargs)
+
+    def _on_cli_stderr(self, line: str) -> None:
+        """Callback invoked by the SDK for each stderr line from the
+        Claude Code CLI subprocess. Surfaces it in our scrollback with a
+        dim `[cli-err]` prefix so the user can see what the CLI is doing
+        during slow startups or wedges. SDK calls this from the stderr-
+        reader task (async context), so `print` here is fine under
+        `patch_stdout(raw=True)`."""
+        line = line.rstrip()
+        if not line:
+            return
+        print(f"{_C_DIM}[cli-err] {line}{_C_RESET}")
 
     async def _handle_tool_permission(
         self,
@@ -5917,7 +6062,29 @@ class Orchestrator:
         # reconnects (from /effort, /model) use state.session_id instead.
         self._initial_resume_id = None
         self.client = ClaudeSDKClient(options=options)
-        await self.client.connect()
+        # Surface the connecting phase so the toolbar shows CONNECTING
+        # instead of "idle" while the SDK is bringing up the subprocess
+        # and doing the control-protocol initialize round-trip (can take
+        # tens of seconds on large sessions because Claude Code has to
+        # parse the same JSONL we're resuming). A scroll-line print
+        # explains the cause so the user doesn't think the orchestrator
+        # is hung or ignoring their input.
+        print(
+            f"{_C_DIM}[connecting to Claude Code CLI -- can take a while "
+            f"on large sessions while the CLI parses the JSONL ...]"
+            f"{_C_RESET}"
+        )
+        self.state.connecting = True
+        self.state.connect_started_at = time.monotonic()
+        try:
+            await self.client.connect()
+        finally:
+            elapsed = time.monotonic() - (self.state.connect_started_at or time.monotonic())
+            self.state.connecting = False
+            self.state.connect_started_at = None
+            print(
+                f"{_C_DIM}[connected in {_fmt_duration(elapsed)}]{_C_RESET}"
+            )
         # Start the persistent SDK message dispatcher.
         self.dispatcher_task = asyncio.create_task(
             self._message_dispatcher(), name="msg-dispatcher"
@@ -5959,14 +6126,26 @@ class Orchestrator:
     async def _disconnect(self) -> None:
         if self.dispatcher_task is not None:
             self.dispatcher_task.cancel()
+            # Cap the cancel wait too — if the SDK's receive_messages()
+            # ignores cancellation (has happened with wedged subprocess
+            # state), this would hang indefinitely with no timeout.
             try:
-                await self.dispatcher_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                await asyncio.wait_for(self.dispatcher_task, timeout=3.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):  # noqa: BLE001
                 pass
             self.dispatcher_task = None
         if self.client is not None:
+            # The SDK transport runs its own ~10s graceful shutdown (EOF on
+            # stdin, SIGTERM, SIGKILL). Cap it with a hard ceiling so a
+            # wedged CLI subprocess can't hang /exit (or /effort, /model,
+            # /clear, max-context reconnects) forever.
             try:
-                await self.client.disconnect()
+                await asyncio.wait_for(self.client.disconnect(), timeout=12.0)
+            except asyncio.TimeoutError:
+                print(
+                    f"{_C_YELLOW}[warn] client.disconnect() exceeded 12s "
+                    f"— CLI subprocess appears wedged]{_C_RESET}"
+                )
             except Exception as e:  # noqa: BLE001
                 print(f"[warn] disconnect error: {e!r}")
             self.client = None
@@ -6130,6 +6309,57 @@ class Orchestrator:
         except (ValueError, IndexError):
             print(f"{_C_RED}[invalid selection; cancelled]{_C_RESET}")
             return None
+
+    # ---- name-based --resume resolution ---------------------------------
+
+    def _resolve_resume_by_name(self, name: str) -> str | None:
+        """If `--resume <arg>` doesn't look like a UUID, treat it as a
+        session title and resolve to a session id. Returns the id on
+        exactly-one match, prompts for disambiguation on multiple, or
+        prints an error and returns None on zero matches."""
+        import uuid as _uuid
+
+        try:
+            _uuid.UUID(name)
+            return name  # already a valid UUID — use as-is
+        except ValueError:
+            pass
+
+        # Name-based lookup (case-insensitive).
+        matches = _find_sessions_with_title(name)
+        if len(matches) == 1:
+            title = _read_session_title(matches[0]) or name
+            print(
+                f"{_C_DIM}[resolved '{name}' → "
+                f"{matches[0][:12]} ({title})]{_C_RESET}"
+            )
+            return matches[0]
+        if len(matches) == 0:
+            print(
+                f"{_C_RED}[no session named '{name}' found — "
+                f"use --resume (no arg) for the interactive picker]"
+                f"{_C_RESET}"
+            )
+            return None
+        # Multiple matches — build session info for each and let user pick.
+        print(
+            f"{_C_YELLOW}[multiple sessions named '{name}' — "
+            f"pick one:]{_C_RESET}"
+        )
+        sessions: list[dict[str, Any]] = []
+        for sid in matches:
+            project = _find_session_dir(sid)
+            if project is None:
+                continue
+            jsonl = project / f"{sid}.jsonl"
+            info = _parse_session_info(jsonl, project.name)
+            if info is not None:
+                sessions.append(info)
+        if not sessions:
+            print(f"{_C_RED}[matched ids but couldn't parse their JSONLs]{_C_RESET}")
+            return None
+        sessions.sort(key=lambda s: s.get("mtime", 0.0), reverse=True)
+        return self._pick_sessions_in_project_textfallback(sessions)
 
     # ---- SDK message dispatcher (persistent reader) --------------------
 
@@ -6384,15 +6614,15 @@ class Orchestrator:
         self._claude_col = 5
         self._claude_word_buf = ""
         self._claude_pending_indent = False
-        # prompt_toolkit's `render_as_done` path can leave the cursor
-        # one row below the last rendered input row, producing a
-        # visible blank line between the input echo (`> ...`) and our
-        # `you:` echo. Move cursor up one row and erase it to reclaim
-        # that row for the `you:` line. Safe when the blank exists;
-        # cosmetic-only if it doesn't (would overwrite an already-
-        # blank row, net zero). \033[F = cursor-up-to-BOL; \033[2K =
-        # erase entire line.
-        sys.stdout.write("\033[F\033[2K")
+        # NOTE: an earlier version used `\033[F\033[2K` here (cursor-up
+        # + erase-line) to reclaim a blank row that prompt_toolkit's
+        # `render_as_done` sometimes leaves between the `> ...` input
+        # and our `you:` echo. Removed because it over-erased: when
+        # prompt_toolkit *didn't* leave a blank row (varies by version
+        # and terminal), it nuked the `> ...` prompt text itself,
+        # making the user's original typed line disappear. A possible
+        # blank line is purely cosmetic; deleting the user's input
+        # echo is not.
         sys.stdout.write(f"{_C_CYAN}you:{_C_RESET} ")
         self._write_indented(prompt_text, 5, flush=True)
         self._flush_claude_text()
@@ -6774,12 +7004,14 @@ class Orchestrator:
         "todos":            "show_todos",
         "effort-show":      "show_effort_info",
         "model-show":       "show_model_info",
+        "debug":            "print_debug",
     }
 
     # Methods that take no payload argument (only self).
     _IMMEDIATE_NO_ARG = frozenset({
         "print_status", "print_help", "clear_screen", "show_tools",
         "show_tasks", "show_todos", "show_effort_info", "show_model_info",
+        "print_debug",
     })
 
     def _try_immediate_command(self, kind: str, payload: str) -> bool:
@@ -6897,6 +7129,13 @@ class Orchestrator:
                             f"{_C_YELLOW}[shutting down (up to ~5s for the CLI "
                             f"to flush the session file)...]{_C_RESET}"
                         )
+                    # Hard deadline: if the graceful path (worker drains
+                    # quit event, _disconnect cleans up the SDK transport)
+                    # doesn't complete in 25s, a daemon-thread timer calls
+                    # os._exit() unconditionally. Survives any asyncio-level
+                    # wedge — the thread runs independently of the event
+                    # loop. Daemon means it doesn't block a clean exit.
+                    _arm_shutdown_watchdog(25.0)
                     await self.event_queue.put((kind, payload))
                     break
                 if kind == "force-quit":
@@ -6952,6 +7191,12 @@ class Orchestrator:
                 self.event_queue.put_nowait(("quit", ""))
             except asyncio.QueueFull:
                 pass
+            # Arm the hard deadline for ANY input-loop exit path (Ctrl+C
+            # at empty prompt, Ctrl+D, /exit, etc.) — not just /exit.
+            # Each call creates its own Timer thread; if the /exit path
+            # also armed one, we end up with two running, whichever
+            # fires first kills the process.
+            _arm_shutdown_watchdog(25.0)
 
     # ---- main worker loop ---------------------------------------------
 
@@ -7453,6 +7698,15 @@ class Orchestrator:
                 print(f"{_C_YELLOW}[no session chosen — exiting]{_C_RESET}")
                 return
             self._initial_resume_id = chosen
+        # Name-based resolution: if --resume <arg> isn't a UUID, treat it
+        # as a session title and resolve to the matching session id. Exactly
+        # one match → use it; multiple → disambiguation picker; zero →
+        # exit with an error.
+        if self._initial_resume_id:
+            resolved = self._resolve_resume_by_name(self._initial_resume_id)
+            if resolved is None:
+                return
+            self._initial_resume_id = resolved
         if self._initial_resume_id:
             self._maybe_switch_cwd_for_resume()
 
@@ -7499,6 +7753,12 @@ class Orchestrator:
         global _toolbar_renderer  # noqa: PLW0603
         _toolbar_renderer = self.session.app.renderer
 
+        # prompt_toolkit's prompt_async() reinstalls Application._handle_exception
+        # as the loop's exception handler each turn, which would override the
+        # one we set in _amain. Override the instance attribute so its lookup
+        # picks up our handler (logs to orchestrator.log + brief notice).
+        self.session.app._handle_exception = _async_exception_handler
+
         # Set the terminal title so long sessions are easy to find.
         try:
             title = f"Claude Orchestrator -- {Path(self.args.cwd).resolve().name}"
@@ -7520,7 +7780,7 @@ class Orchestrator:
         print("=" * 78)
         print(" Claude Orchestrator")
         print("  - type + Enter to send; Tab completes /commands")
-        print("  - Ctrl-C: interrupt turn / clear input / exit at empty prompt")
+        print("  - Ctrl-C: interrupt turn / clear input (never exits — use /exit)")
         print("  - Ctrl-D: exit")
         if self.args.auto_continue:
             ac_summary = (
@@ -7598,12 +7858,24 @@ class Orchestrator:
         # syscall so the terminal doesn't appear to scroll line-by-line
         # while we're populating it.
         if history_jsonl is not None:
+            try:
+                size_kb = history_jsonl.stat().st_size / 1024
+                size_hint = f", {size_kb:.0f} kB"
+            except OSError:
+                size_hint = ""
+            # Print the "loading" line BEFORE the read so the user sees
+            # immediate feedback instead of a blank screen while a big
+            # JSONL is being parsed (can take several seconds).
+            sys.stdout.write(
+                f"{_C_DIM}[loading history from {history_jsonl.name}"
+                f"{size_hint} ...]{_C_RESET}\n"
+            )
+            sys.stdout.flush()
             n, history_text, _orphan_bg = render_session_history_text(
                 history_jsonl,
                 show_tool_output=self.args.show_tool_output,
             )
             buffered = (
-                f"{_C_DIM}[loading history from {history_jsonl.name} ...]{_C_RESET}\n"
                 f"{history_text}"
                 f"{_C_DIM}[end of history -- {n} message(s)]{_C_RESET}\n"
             )
@@ -7627,6 +7899,13 @@ class Orchestrator:
         if seed_sid:
             self.state.session_id = seed_sid
             self.state.session_title = _read_session_title(seed_sid)
+        # Track the resume target so the init handler can warn if Claude
+        # Code's --continue silently fails (creates a fresh session instead
+        # of resuming what we asked for). Only set when _make_options will
+        # actually pass --continue or --resume; --no-continue with no
+        # explicit --resume means a fresh session is the goal.
+        if seed_sid and (self._initial_resume_id or not self.args.no_continue):
+            self.state.expected_resume_sid = seed_sid
 
         # Loud red warning about the unattended-mode footgun.
         if self.args.permission_mode == "bypassPermissions":
@@ -7649,6 +7928,9 @@ class Orchestrator:
 
         input_task = asyncio.create_task(self.input_loop(), name="input")
         worker_task = asyncio.create_task(self.worker_loop(), name="worker")
+        # Store on self so /debug can inspect task state when something wedges.
+        self._input_task = input_task
+        self._worker_task = worker_task
 
         done, pending = await asyncio.wait(
             {input_task, worker_task}, return_when=asyncio.FIRST_COMPLETED
@@ -7954,7 +8236,7 @@ def parse_args() -> argparse.Namespace:
         help="How Edit tool calls render. compact (default): scroll inline "
         "as a one-liner `edit path (+A -R lines) [#N]`. full: scroll "
         "inline with the full unified diff. off: live panel only, use "
-        "/show N for detail. --inline-all-tools overrides this to 'full'.",
+        "/show N for detail (or fall back to --show-tasks's level).",
     )
     ap.add_argument(
         "--ascii-only",
@@ -8036,12 +8318,87 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+_EXCEPTION_LOG_PATH = Path(__file__).resolve().parent / "orchestrator.log"
+
+
+def _arm_shutdown_watchdog(seconds: float) -> None:
+    """Start a daemon-thread timer that force-exits the process after
+    `seconds` if it hasn't terminated by then. Independent of the asyncio
+    loop, so it fires even when the loop or SDK transport is wedged.
+    Daemon=True means a clean exit isn't blocked by this thread."""
+    import threading
+
+    def _force_exit() -> None:
+        try:
+            sys.stdout.write(
+                f"\n{_C_RED}[force-exit: shutdown deadline exceeded "
+                f"({seconds:.0f}s) -- killing process; last in-flight "
+                f"message may be lost from the JSONL]{_C_RESET}\n"
+            )
+            sys.stdout.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        os._exit(1)
+
+    t = threading.Timer(seconds, _force_exit)
+    t.daemon = True
+    t.start()
+
+
+def _async_exception_handler(
+    loop: asyncio.AbstractEventLoop, context: dict[str, Any]
+) -> None:
+    """Log full traceback to orchestrator.log; print a one-line notice.
+
+    Replaces both the default asyncio handler and prompt_toolkit's
+    `Application._handle_exception` (which would otherwise dump the full
+    traceback into the scrollback and block on "Press ENTER to continue...").
+    """
+    import traceback as _tb
+    exc = context.get("exception")
+    msg = context.get("message", "")
+    if exc is not None:
+        tb_text = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
+        short = f"{type(exc).__name__}: {exc}"
+    else:
+        tb_text = (msg or "(no traceback)") + "\n"
+        short = msg or "(unknown asyncio error)"
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    header = f"\n=== {timestamp}  [asyncio]"
+    if msg and exc is not None:
+        header += f"  {msg}"
+    header += " ===\n"
+    try:
+        with _EXCEPTION_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(header + tb_text)
+    except OSError:
+        pass
+    notice = (
+        f"{_C_YELLOW}[exception: {short} -- logged to "
+        f"{_EXCEPTION_LOG_PATH.name}]{_C_RESET}"
+    )
+    try:
+        # patch_stdout(raw=True) is active during run(), so plain print
+        # is buffered safely between renderer frames.
+        print(notice)
+    except Exception:  # noqa: BLE001
+        try:
+            sys.stderr.write(notice + "\n")
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def _amain() -> None:
     args = parse_args()
     # Flip the module-level marker-style flag before anything renders.
     # Default is Unicode; --ascii-only switches to ASCII equivalents.
     global _USE_UNICODE_MARKERS
     _USE_UNICODE_MARKERS = not args.ascii_only
+    # Route uncaught asyncio exceptions to orchestrator.log with a brief
+    # on-screen notice instead of the default multi-line traceback dump.
+    # (Application-level override happens in Orchestrator.run() after the
+    # PromptSession is created -- see _install_pt_exception_override.)
+    asyncio.get_running_loop().set_exception_handler(_async_exception_handler)
     orch = Orchestrator(args)
     with patch_stdout(raw=True):
         await orch.run()
