@@ -3403,7 +3403,11 @@ def _panel_session(state: "State") -> str:
             label = "CONNECTING"
         busy = f"<status-waiting>{label}</status-waiting>"
     elif state.busy:
-        busy = "<status-working>WORKING</status-working>"
+        if state.turn_started_at is not None:
+            elapsed = _fmt_duration(time.monotonic() - state.turn_started_at)
+            busy = f"<status-working>WORKING ({elapsed})</status-working>"
+        else:
+            busy = "<status-working>WORKING</status-working>"
     elif state.background_tasks:
         # bg-wait takes precedence over WAITING/done/burst — the
         # orchestrator's actual behavior while bg tasks are running is
@@ -3513,13 +3517,6 @@ def _panel_session(state: "State") -> str:
         ctx,
         f"turns: {state.turns}",
     ])
-    # Live "turn: Xs" elapsed timer — only while a turn is in flight.
-    # Updates each toolbar refresh (default 2 Hz). Hidden between
-    # turns so the status line doesn't keep a stale number around.
-    if state.turn_started_at is not None:
-        sections.append(
-            f"turn: {_fmt_duration(time.monotonic() - state.turn_started_at)}"
-        )
     sections.append(plan_field)
     if rate_field:
         sections.append(rate_field)
