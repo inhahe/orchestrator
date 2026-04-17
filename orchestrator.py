@@ -4175,6 +4175,12 @@ def format_session_label(s: dict[str, Any], width: int = 100) -> str:
     renders that as a group header)."""
     sid = s["session_id"][:8]
     age = _format_session_age(s.get("mtime") or 0.0)
+    msgs = s.get("msg_count", 0)
+    size_bytes = s.get("size", 0)
+    if size_bytes >= 1_048_576:
+        size_str = f"{size_bytes / 1_048_576:.1f} MB"
+    else:
+        size_str = f"{size_bytes / 1024:.0f} kB"
     title = s.get("title")
     if title:
         msg = title
@@ -4185,7 +4191,7 @@ def format_session_label(s: dict[str, Any], width: int = 100) -> str:
             or "(no user message)"
         ).strip()
     msg = msg.replace("\n", " ").replace("\r", " ")
-    head = f"{sid} {age:>9}  "
+    head = f"{sid} {age:>9}  {msgs:>4} msgs  {size_str:>8}  "
     remaining = max(20, width - len(head))
     if len(msg) > remaining:
         msg = msg[: remaining - 1] + "…"
