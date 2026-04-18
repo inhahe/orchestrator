@@ -1605,13 +1605,10 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
         # symmetrically with the completion message below. "bg-task"
         # carries the "this is a background task" signal; "▶ started"
         # is the status pair that matches "✓ completed" etc. on exit.
-        # For local_bash the Bash tool call already printed the
-        # command one line above, so the name is omitted; the seq
-        # and the "bg-task started" signal are the whole point here.
+        # The name/description is always shown (including local_bash)
+        # — it's Claude's human-readable label, not the raw command.
         seq_prefix = _call_seq_prefix(seq, letter="b") if isinstance(seq, int) else ""
-        label_suffix = (
-            f" -- {name}" if (name and task_type != "local_bash") else ""
-        )
+        label_suffix = f" -- {name}" if name else ""
         # MAGENTA carries the "bg-task started" signal; everything
         # past that (task_type + optional name) is supporting context,
         # dimmed to DESC so only the status pair stands out.
