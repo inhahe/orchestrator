@@ -1408,47 +1408,14 @@ def _emit_bg_completion(
     # the unified /show scheme.
     seq_prefix = _result_seq_prefix(seq, None, letter="b") if isinstance(seq, int) else ""
     label = (name or summary or "(unnamed)").replace("\n", " ")
-    # If this bg task originated from a Bash tool call, append the
-    # command (inline if it fits, size hint otherwise).
-    cmd_suffix = ""
-    tu_id = turn_entry.get("tool_use_id") if turn_entry else (
-        bg_entry.get("tool_use_id") if bg_entry else None
-    )
-    if tu_id:
-        for h in state.tool_history:
-            if h.get("tool_use_id") == tu_id and h.get("name") == "Bash":
-                orig_cmd = (h.get("input") or {}).get("command", "") or ""
-                if orig_cmd.strip():
-                    lines = orig_cmd.splitlines() or [orig_cmd]
-                    # Mirror the actual print-line layout exactly so the
-                    # width check reflects what will be emitted.
-                    base = (
-                        f"{seq_prefix}{_C_MAGENTA}bg-task{_C_RESET} "
-                        f"{color}{marker}{_C_RESET} {_C_MAGENTA}{status}{_C_RESET} "
-                        f"{_C_DESC}-- {label}{_C_RESET}"
-                    )
-                    if len(lines) <= 1:
-                        trial = f"{base}  {_C_COMMAND}`{orig_cmd}`{_C_RESET}"
-                        if _visible_len(trial) <= _term_width():
-                            cmd_suffix = f"  {_C_COMMAND}`{orig_cmd}`{_C_RESET}"
-                    if not cmd_suffix:
-                        cmd_suffix = (
-                            f"  {_C_DIM}({_cmd_size_hint(orig_cmd)}){_C_RESET}"
-                        )
-                break
-    # End format mirrors the start: hint tag, "bg-task" (MAGENTA), then
-    # the status marker coloured by status (GREEN ✓ / RED ✗ / MAGENTA 🛑),
-    # then the status WORD always in MAGENTA so the lifecycle thread
-    # (bg-task ... <word> -- label) reads as one colour, with only the
-    # marker doing the "what happened" signal. Parallel structure with
-    # "▶ started" on the start line (where marker+word are both magenta
-    # since "started" has no outcome distinction to convey yet). Label
-    # + cmd_suffix go in DESC; cmd_suffix carries its own COMMAND / DIM
-    # colour for the embedded backtick cmd or the (size) hint.
+    # Completion line is kept clean — no command appended. The command
+    # was already shown on the "bg-task ▶ started" line (or on the
+    # preceding Bash tool-call line), so repeating it here is redundant
+    # clutter, especially for long multi-part commands.
     print(
         f"{seq_prefix}{_C_MAGENTA}bg-task{_C_RESET} "
         f"{color}{marker}{_C_RESET} {_C_MAGENTA}{status}{_C_RESET} "
-        f"{_C_DESC}-- {label}{_C_RESET}{cmd_suffix}"
+        f"{_C_DESC}-- {label}{_C_RESET}"
     )
     # Per-task ring (opt-in via bell-on bg-done).
     _ring_bell(state, "bg-done")
@@ -1648,9 +1615,45 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
         # MAGENTA carries the "bg-task started" signal; everything
         # past that (task_type + optional name) is supporting context,
         # dimmed to DESC so only the status pair stands out.
+        # For local_bash, append the command:
+        #   compact → only if single-line and fits terminal width
+        #   full/full+output → always (even if it overflows)
+        cmd_suffix = ""
+        is_full = state.show_tasks in ("full", "full+output")
+        if task_type == "local_bash":
+            tu_id = d.get("tool_use_id")
+            if tu_id:
+                for h in state.tool_history:
+                    if h.get("tool_use_id") == tu_id and h.get("name") == "Bash":
+                        orig_cmd = (h.get("input") or {}).get("command", "") or ""
+                        orig_cmd = orig_cmd.strip()
+                        if orig_cmd:
+                            if is_full:
+                                # Full mode: always show, collapse
+                                # newlines to fit on one line.
+                                flat = orig_cmd.replace("\n", " ; ")
+                                cmd_suffix = f"  {_C_COMMAND}`{flat}`{_C_RESET}"
+                            else:
+                                # Compact: inline if single-line and
+                                # fits, otherwise show size hint.
+                                shown = False
+                                if "\n" not in orig_cmd:
+                                    base = (
+                                        f"{seq_prefix}{_C_MAGENTA}bg-task {_mark('start')} started{_C_RESET} "
+                                        f"{_C_DESC}-- {task_type}{label_suffix}{_C_RESET}"
+                                    )
+                                    trial = f"{base}  {_C_COMMAND}`{orig_cmd}`{_C_RESET}"
+                                    if _visible_len(trial) <= _term_width():
+                                        cmd_suffix = f"  {_C_COMMAND}`{orig_cmd}`{_C_RESET}"
+                                        shown = True
+                                if not shown:
+                                    cmd_suffix = (
+                                        f"  {_C_DIM}({_cmd_size_hint(orig_cmd)}){_C_RESET}"
+                                    )
+                        break
         print(
             f"{seq_prefix}{_C_MAGENTA}bg-task {_mark('start')} started{_C_RESET} "
-            f"{_C_DESC}-- {task_type}{label_suffix}{_C_RESET}"
+            f"{_C_DESC}-- {task_type}{label_suffix}{_C_RESET}{cmd_suffix}"
         )
         return
 
@@ -4464,10 +4467,19 @@ class Orchestrator:
             except ValueError:
                 pass
 
-        # Escape alone clears the whole input buffer. Non-eager so the
-        # longer `escape enter` (Alt-Enter) binding above still wins when
-        # Enter follows within the key-sequence timeout.
-        @kb.add("escape")
+        # Escape clears the whole input buffer. On Windows, use eager
+        # so it fires instantly — the non-eager version required 2-3
+        # presses because each one restarted prompt_toolkit's key-
+        # sequence timeout. Alt-Enter is intercepted by Windows
+        # Terminal for fullscreen anyway, so losing it is fine.
+        # On Linux/macOS, Alt+key combos are sent as Escape + key, so
+        # eager Escape would break Alt+Enter (newline). Use non-eager
+        # there to preserve it — the extra press is less annoying when
+        # the timeout is shorter (most Unix terminals use ~50-100ms vs
+        # prompt_toolkit's default ~500ms).
+        _esc_eager = sys.platform == "win32"
+
+        @kb.add("escape", eager=_esc_eager)
         def _(event):  # type: ignore[no-untyped-def]
             event.current_buffer.reset()
 
@@ -7849,9 +7861,6 @@ class Orchestrator:
         # picks up our handler (logs to orchestrator.log + brief notice).
         self.session.app._handle_exception = _async_exception_handler
 
-        # Set the terminal title so long sessions are easy to find.
-        self._update_terminal_title()
-
         tool_summary = (
             "all Claude Code tools (Read, Write, Edit, Glob, Grep, Bash "
             "incl. background, BashOutput, KillShell, NotebookEdit, "
@@ -7984,6 +7993,8 @@ class Orchestrator:
         if seed_sid:
             self.state.session_id = seed_sid
             self.state.session_title = _read_session_title(seed_sid)
+        # Set the terminal title now that session_title is seeded.
+        self._update_terminal_title()
         # Track the resume target so the init handler can warn if Claude
         # Code's --continue silently fails (creates a fresh session instead
         # of resuming what we asked for). Only set when _make_options will
