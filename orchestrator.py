@@ -6199,6 +6199,10 @@ class Orchestrator:
             print(
                 f"{_C_DIM}[connected in {_fmt_duration(elapsed)}]{_C_RESET}"
             )
+        # Re-assert our terminal title AFTER the CLI subprocess has
+        # started — the CLI sets its own title ("claude") during init,
+        # overwriting whatever we set earlier.
+        self._update_terminal_title()
         # Start the persistent SDK message dispatcher.
         self.dispatcher_task = asyncio.create_task(
             self._message_dispatcher(), name="msg-dispatcher"
@@ -8023,8 +8027,9 @@ class Orchestrator:
         if seed_sid:
             self.state.session_id = seed_sid
             self.state.session_title = _read_session_title(seed_sid)
-        # Set the terminal title now that session_title is seeded.
-        self._update_terminal_title()
+        # Don't set the terminal title here — the CLI subprocess will
+        # overwrite it during init anyway. _connect() re-asserts our
+        # title after the subprocess finishes its handshake.
         # Track the resume target so the init handler can warn if Claude
         # Code's --continue silently fails (creates a fresh session instead
         # of resuming what we asked for). Only set when _make_options will
