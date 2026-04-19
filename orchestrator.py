@@ -7208,7 +7208,7 @@ class Orchestrator:
                         for extra in rewritten[1:]:
                             await self.event_queue.put(
                                 classify(extra)
-                                if extra.startswith("/")
+                                if extra.strip().startswith("/")
                                 else ("message", extra)
                             )
                 kind, payload = classify(line)
@@ -7262,6 +7262,15 @@ class Orchestrator:
                     sys.stdout.flush()
                     import os
                     os._exit(0)
+                # /btw runs mid-turn: it spawns an independent one-shot
+                # SDK query (separate subprocess), so it doesn't conflict
+                # with the main turn's message stream. Fire it as a
+                # background task immediately rather than queuing.
+                if kind == "btw":
+                    asyncio.create_task(
+                        self.ask_btw(payload), name="btw"
+                    )
+                    continue
                 # Many slash commands are purely local (display info or
                 # tweak a setting) and can run immediately even mid-turn.
                 # Only commands that interact with the SDK, trigger turns,
@@ -7272,7 +7281,7 @@ class Orchestrator:
                 # Acknowledge queued slash-commands so the user sees that
                 # the orchestrator received them.
                 if (
-                    line.startswith("/")
+                    line.strip().startswith("/")
                     and kind not in ("message", "compact")
                     and self.state.busy
                 ):
