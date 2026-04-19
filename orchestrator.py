@@ -2179,6 +2179,11 @@ def render_tool_use(
                 )
 
 
+_TOOL_USE_ERROR_RE = re.compile(
+    r"<tool_use_error>\s*(.*?)\s*</tool_use_error>", re.DOTALL
+)
+
+
 def summarize_tool_result(block: ToolResultBlock) -> str:
     content = block.content
     if isinstance(content, list):
@@ -2189,10 +2194,17 @@ def summarize_tool_result(block: ToolResultBlock) -> str:
     text = text.strip()
     if not text:
         return "(empty)"
+    # Strip <tool_use_error>...</tool_use_error> wrapping — the CLI
+    # wraps error messages in this tag, but we already render error
+    # status via the ✗ marker / "tool-err:" prefix. Show the inner
+    # message cleanly.
+    m = _TOOL_USE_ERROR_RE.match(text)
+    if m:
+        text = m.group(1).strip() or text
     if len(text) > 1500:
         head = text[:1000]
         tail = text[-300:]
-        return f"{head}\n... [+{len(text) - 1300} chars]\n{tail}"
+        return f"{head}\n… [+{len(text) - 1300} chars]\n{tail}"
     return text
 
 
