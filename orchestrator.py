@@ -1131,7 +1131,7 @@ def classify(line: str) -> tuple[str, str]:
 
 def brief_args(d: dict[str, Any], limit: int = 110) -> str:
     s = ", ".join(f"{k}={v!r}" for k, v in d.items())
-    return s if len(s) <= limit else s[: limit - 3] + "..."
+    return s if len(s) <= limit else s[: limit - 1] + "…"
 
 
 def _print_one_line_tool(
@@ -1157,22 +1157,22 @@ def _print_one_line_tool(
         print(header + params_colored)
         return
     # Need to trim from the left of params. Keep `keep` visible chars
-    # plus a leading "..." — all in dim gray to match parameter style.
-    keep = max(4, term_w - header_w - 3)  # 3 for "..."
+    # plus a leading "…" — all in dim gray to match parameter style.
+    keep = max(4, term_w - header_w - 1)  # 1 for "…"
     plain_stripped = _ANSI_RE.sub("", params_plain).lstrip()
     if len(plain_stripped) <= keep:
         print(header + params_colored)
         return
     tail = plain_stripped[-keep:]
-    print(f"{header} {_C_DIM}...{tail}{_C_RESET}")
+    print(f"{header} {_C_DIM}…{tail}{_C_RESET}")
 
 
 def _truncate_left(s: str, budget: int) -> str:
     """Keep the LAST `budget` visible chars of `s`, prefixing with
-    `...` when truncation happened. `budget` must be >= 4."""
+    `…` when truncation happened. `budget` must be >= 2."""
     if len(s) <= budget:
         return s
-    return "..." + s[-(budget - 3):]
+    return "…" + s[-(budget - 1):]
 
 
 def _print_path_tool(
@@ -1181,19 +1181,25 @@ def _print_path_tool(
     suffix: str = "",
     *,
     path_color: str = _C_PATH,
+    truncate: bool = True,
 ) -> None:
     """Print a one-line tool call as `prefix <path> [suffix]`. If the
-    line is too wide for the terminal, truncate the BEGINNING of `path`
-    with `...` — never touches `prefix` or `suffix`. `prefix` and
-    `suffix` carry their own ANSI; `path` is wrapped in `path_color`
-    (default `_C_PATH`; callers rendering a URL pass `_C_URL`)."""
-    term_w = _term_width(default=100) - 2
-    prefix_w = _visible_len(prefix)
-    suffix_w = _visible_len(suffix)
-    # Spaces: one before the path, one before suffix if present.
-    gap_w = 1 + (1 if suffix else 0)
-    path_budget = max(4, term_w - prefix_w - suffix_w - gap_w)
-    path_display = _truncate_left(path, path_budget)
+    line is too wide for the terminal AND `truncate` is True, truncate
+    the BEGINNING of `path` with `...` — never touches `prefix` or
+    `suffix`. When `truncate=False` (full mode), the path is printed
+    verbatim regardless of width. `prefix` and `suffix` carry their own
+    ANSI; `path` is wrapped in `path_color` (default `_C_PATH`; callers
+    rendering a URL pass `_C_URL`)."""
+    if truncate:
+        term_w = _term_width(default=100) - 2
+        prefix_w = _visible_len(prefix)
+        suffix_w = _visible_len(suffix)
+        # Spaces: one before the path, one before suffix if present.
+        gap_w = 1 + (1 if suffix else 0)
+        path_budget = max(4, term_w - prefix_w - suffix_w - gap_w)
+        path_display = _truncate_left(path, path_budget)
+    else:
+        path_display = path
     line = f"{prefix} {path_color}{path_display}{_C_RESET}"
     if suffix:
         line += f" {suffix}"
@@ -1779,7 +1785,7 @@ def _task_summary_line(name: str, inp: dict[str, Any]) -> str:
         cmd = (inp.get("command") or "").splitlines()
         head = cmd[0] if cmd else ""
         if len(head) > 100:
-            head = head[:97] + "..."
+            head = head[:99] + "…"
         return head
     if name == "Grep":
         pat = inp.get("pattern", "")
@@ -2101,21 +2107,39 @@ def render_tool_use(
     elif name == "Grep":
         pattern = inp.get("pattern", "")
         path = inp.get("path", ".")
-        # Pattern goes in the prefix (never truncated) — only the search
-        # path is truncatable.
+        # In compact mode, truncate the pattern if the whole line
+        # wouldn't fit on one terminal row. Full mode shows everything.
+        if show_tasks not in ("full", "full+output"):
+            # Budget: terminal width - seq prefix - "Grep //" - path
+            # (min ~6 chars) - spacing. If pattern blows the budget,
+            # right-truncate with "…".
+            term_w = _term_width(default=100) - 2
+            fixed_w = _visible_len(seq_prefix) + len("Grep //") + 1  # + space
+            # Reserve at least 6 chars for the path portion.
+            pat_budget = max(8, term_w - fixed_w - 6)
+            if len(pattern) > pat_budget:
+                pattern = pattern[: pat_budget - 1] + "…"
+        is_full = show_tasks in ("full", "full+output")
         prefix = (
             f"{seq_prefix}{_C_BOLD_BLUE}Grep{_C_RESET} "
             f"{_C_PATTERN}/{pattern}/{_C_RESET}"
         )
-        _print_path_tool(prefix, path)
+        _print_path_tool(prefix, path, truncate=not is_full)
     elif name == "Glob":
         pattern = inp.get("pattern", "")
         path = inp.get("path", ".")
+        is_full = show_tasks in ("full", "full+output")
+        if not is_full:
+            term_w = _term_width(default=100) - 2
+            fixed_w = _visible_len(seq_prefix) + len("Glob ") + 1
+            pat_budget = max(8, term_w - fixed_w - 6)
+            if len(pattern) > pat_budget:
+                pattern = pattern[: pat_budget - 1] + "…"
         prefix = (
             f"{seq_prefix}{_C_BOLD_BLUE}Glob{_C_RESET} "
             f"{_C_PATTERN}{pattern}{_C_RESET}"
         )
-        _print_path_tool(prefix, path)
+        _print_path_tool(prefix, path, truncate=not is_full)
     elif name == "WebFetch":
         url = inp.get("url", "?")
         _print_path_tool(
@@ -3942,7 +3966,7 @@ def _panel_live_bg(state: "State") -> list[str]:
         )  # "<type>: " contributes type + ": "
         name_budget = max(10, _term_width(default=100) - 4 - fixed_visible_len)
         if len(raw_name) > name_budget:
-            raw_name = raw_name[: max(1, name_budget - 3)] + "..."
+            raw_name = raw_name[: max(1, name_budget - 1)] + "…"
         name = _tb_escape(raw_name)
         out.append(
             f"{seq_tag}<b>{task_type}</b>: {name}{elapsed_str}"
@@ -5023,7 +5047,7 @@ class Orchestrator:
             del q[idx]
             first = removed.splitlines()[0] if removed else ""
             if len(first) > 60:
-                first = first[:57] + "..."
+                first = first[:59] + "…"
             print(f"{_C_MAGENTA}[dropped #{idx + 1}: {first}]{_C_RESET}")
             return
         # Assume numeric: show full prompt N
@@ -5690,7 +5714,7 @@ class Orchestrator:
             carry = f" {_C_DIM}(carryover){_C_RESET}" if info.get("carryover") else ""
             short_name = name.replace("\n", " ")
             if len(short_name) > 60:
-                short_name = short_name[:57] + "..."
+                short_name = short_name[:59] + "…"
             print(
                 f"  [{_C_DIM}#{seq}{_C_RESET}] {status}  "
                 f"{_C_BLUE}{task_type}{_C_RESET}: {short_name}  "
