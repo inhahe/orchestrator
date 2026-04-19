@@ -6910,15 +6910,24 @@ class Orchestrator:
                                 if status_code
                                 else ""
                             )
-                            print(
-                                f"{_C_RED}[orchestrator] detected API error "
-                                f"in assistant text{status_part} -- "
-                                f"treating as api_retry for stall "
-                                f"detection{_C_RESET}"
-                            )
-                            self._check_api_stall(
-                                error_status=status_code, error_info=None
-                            )
+                            if self.args.auto_continue:
+                                # Stall detection matters for unattended
+                                # runs — feed into the retry tracker so
+                                # dense failures trigger API-STALL state.
+                                print(
+                                    f"{_C_RED}[API error in response"
+                                    f"{status_part} -- tracking for "
+                                    f"stall detection]{_C_RESET}"
+                                )
+                                self._check_api_stall(
+                                    error_status=status_code,
+                                    error_info=None,
+                                )
+                            else:
+                                print(
+                                    f"{_C_RED}[API error in response"
+                                    f"{status_part}]{_C_RESET}"
+                                )
                 elif isinstance(msg, UserMessage):
                     content = msg.content
                     if isinstance(content, list):
