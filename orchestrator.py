@@ -3472,7 +3472,7 @@ def _panel_session(state: "State") -> str:
         # bg tasks drain the toolbar switches to WAITING/done/burst.
         # Show elapsed time of the oldest (longest-running) bg task.
         oldest = min(
-            (t.get("started_at", now) for t in state.background_tasks.values()),
+            (t.get("started_at", time.monotonic()) for t in state.background_tasks.values()),
             default=None,
         )
         if oldest is not None:
