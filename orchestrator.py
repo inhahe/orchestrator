@@ -4604,6 +4604,37 @@ class Orchestrator:
             if buf.cursor_position < len(buf.text):
                 buf.cursor_position += 1
 
+        # Home / End: go to start / end of the current LOGICAL line
+        # (delimited by \n), not the entire buffer. In a multi-line
+        # input, the default prompt_toolkit behavior jumps to the
+        # very first / very last character of the whole buffer.
+        # Home / End: visual-row-aware, consistent with our Up/Down.
+        # In a long single-line input that wraps visually, Home goes to
+        # the start of the current *visual* row and End to the end of
+        # it — not the very first / very last character of the whole
+        # logical line. Uses the same effective_w calculation as Up/Down.
+        @kb.add("home", eager=True)
+        def _(event):  # type: ignore[no-untyped-def]
+            buf = event.app.current_buffer
+            doc = buf.document
+            col = doc.cursor_position_col
+            effective_w = max(1, _term_width() - _PROMPT_WIDTH - 1)
+            visual_row_start = (col // effective_w) * effective_w
+            buf.cursor_position -= (col - visual_row_start)
+
+        @kb.add("end", eager=True)
+        def _(event):  # type: ignore[no-untyped-def]
+            buf = event.app.current_buffer
+            doc = buf.document
+            col = doc.cursor_position_col
+            line_len = len(doc.current_line)
+            effective_w = max(1, _term_width() - _PROMPT_WIDTH - 1)
+            visual_row_end = min(
+                (col // effective_w + 1) * effective_w,
+                line_len,
+            )
+            buf.cursor_position += (visual_row_end - col)
+
         return kb
 
     def _bottom_toolbar(self):  # returns HTML; multi-line per the layout
