@@ -6134,6 +6134,10 @@ class Orchestrator:
             # Load skills / CLAUDE.md-linked config from user + project + local scopes
             # so the SDK behaves like the CLI.
             "setting_sources": ["user", "project", "local"],
+            # SDK default is 1MB which is too small for large Edit diffs
+            # or Read results on big files. 10MB is generous enough for
+            # any realistic tool result.
+            "max_buffer_size": 10 * 1024 * 1024,
         }
         resuming = False
         effective_resume = resume_id or self._initial_resume_id
