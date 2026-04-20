@@ -6051,6 +6051,21 @@ class Orchestrator:
                 print(f"    [{i}] {preview}")
         print(f"  active_tools (in-flight): {len(self.state.active_tools)}")
         print(f"  background_tasks        : {len(self.state.background_tasks)}")
+        if self.state.background_tasks:
+            now = time.monotonic()
+            for tid, info in self.state.background_tasks.items():
+                elapsed = now - info.get("started_at", now)
+                shown = info.get("first_shown_at")
+                print(
+                    f"    {tid[:8]}  seq=#{info.get('seq')}  "
+                    f"{info.get('task_type', '?')}: "
+                    f"{(info.get('name') or '?')[:50]}  "
+                    f"elapsed={_fmt_duration(elapsed)}  "
+                    f"first_shown={'%.1fs ago' % (now - shown) if shown else 'None'}"
+                )
+        print(f"  show_bg_panel           : {self.state.show_bg_panel}")
+        print(f"  inline_all_tools        : {self.state.inline_all_tools}")
+        print(f"  panel_delay             : {self.state.panel_delay}")
         pend = self._pending_permission
         if pend is None:
             print(f"  pending_permission      : None")
