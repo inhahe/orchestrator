@@ -6829,17 +6829,16 @@ class Orchestrator:
                 msg = await self.turn_msg_queue.get()
                 if msg is _DISPATCHER_DEAD:
                     # The dispatcher task crashed (e.g. JSON too large).
-                    # No more messages will arrive. Break out so the turn
-                    # ends instead of hanging in WORKING forever.
+                    # No more messages will arrive. Raise so the
+                    # worker's error handler triggers a reconnect
+                    # (with --auto-reconnect) or prompts the user.
                     if in_text:
                         self._flush_claude_text()
                         in_text = False
-                    print(
-                        f"{_C_RED}[turn aborted: dispatcher died — "
-                        f"reconnect recommended (/exit and restart, "
-                        f"or wait for auto-reconnect)]{_C_RESET}"
+                    raise RuntimeError(
+                        "dispatcher died mid-turn (JSON message exceeded "
+                        "buffer size) — reconnect needed"
                     )
-                    break
                 if isinstance(msg, SystemMessage):
                     if in_text and msg.subtype not in ("init",):
                         self._flush_claude_text()
@@ -7683,15 +7682,30 @@ class Orchestrator:
                     raise
                 except Exception as e:  # noqa: BLE001
                     print(f"{_C_RED}[error: {type(e).__name__}: {e}]{_C_RESET}")
-                    if self.args.auto_reconnect:
-                        print(f"{_C_YELLOW}[sys] auto-reconnecting...{_C_RESET}")
+                    # Always reconnect on dispatcher-death errors (the
+                    # client is in a broken state — subsequent turns
+                    # would hang). For other errors, respect
+                    # --auto-reconnect.
+                    should_reconnect = (
+                        self.args.auto_reconnect
+                        or "dispatcher died" in str(e)
+                    )
+                    if should_reconnect:
+                        print(f"{_C_YELLOW}[sys] reconnecting...{_C_RESET}")
                         try:
                             await self._reconnect()
                         except Exception as e2:  # noqa: BLE001
                             print(f"{_C_RED}[reconnect failed: {e2}]{_C_RESET}")
                             next_prompt = await self._await_user_or_quit()
                             continue
-                        next_prompt = self.state.continue_prompt
+                        if self.args.auto_reconnect:
+                            next_prompt = self.state.continue_prompt
+                        else:
+                            print(
+                                f"{_C_YELLOW}[reconnected — type to "
+                                f"continue]{_C_RESET}"
+                            )
+                            next_prompt = await self._await_user_or_quit()
                         continue
                     next_prompt = await self._await_user_or_quit()
                     continue
