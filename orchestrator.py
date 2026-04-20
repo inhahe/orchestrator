@@ -3491,7 +3491,7 @@ def _panel_session(state: "State") -> str:
             elapsed = _fmt_duration(time.monotonic() - oldest)
             busy = (
                 f"<bg-wait-label>bg-wait "
-                f"({len(state.background_tasks)}, {elapsed})</bg-wait-label>"
+                f"({len(state.background_tasks)}) ({elapsed})</bg-wait-label>"
             )
         else:
             busy = (
@@ -7731,19 +7731,30 @@ class Orchestrator:
                 # the "stop nudging" brake. Then auto-continue (or wait,
                 # if --auto-continue is off).
                 if self.state.compact_during_last_turn:
+                    if self.args.debug:
+                        trigger = self.state.last_compact_trigger or "?"
+                        print(
+                            f"{_C_DIM}[debug] post-compact: trigger={trigger}, "
+                            f"ctx~{self.state.context_tokens} tok, "
+                            f"bg={len(self.state.background_tasks)}{_C_RESET}"
+                        )
                     self.state.compact_during_last_turn = False
                     self.state.recent_turn_ends.clear()
-                    if self.args.auto_continue:
-                        print(
-                            f"{_C_DIM}[post-compact: auto-continuing]{_C_RESET}"
-                        )
-                        next_prompt = self.state.continue_prompt
-                    else:
-                        print(
-                            f"{_C_DIM}[post-compact: waiting for your input]{_C_RESET}"
-                        )
-                        next_prompt = await self._await_user_or_quit()
-                    continue
+                    # Don't short-circuit past the bg-tasks check below —
+                    # if bg tasks are running we need the bg-wait path
+                    # regardless of whether a compact just fired.
+                    if not self.state.background_tasks:
+                        if self.args.auto_continue:
+                            print(
+                                f"{_C_DIM}[post-compact: auto-continuing]{_C_RESET}"
+                            )
+                            next_prompt = self.state.continue_prompt
+                        else:
+                            print(
+                                f"{_C_DIM}[post-compact: waiting for your input]{_C_RESET}"
+                            )
+                            next_prompt = await self._await_user_or_quit()
+                        continue
 
                 # Rolling-window trim takes priority when configured: if it
                 # fires we've already reconnected onto a shorter session, so
@@ -8504,6 +8515,12 @@ def parse_args() -> argparse.Namespace:
         help="If a turn fails (e.g. the CLI subprocess crashes), reconnect "
         "with resume=<session id> and auto-continue instead of waiting for you. "
         "Recommended for unattended multi-hour runs.",
+    )
+    ap.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print extra diagnostic messages (post-compact details, "
+        "internal state transitions). Noisy — use when chasing bugs.",
     )
     args = ap.parse_args()
     # --show-tool-everything is a convenience that flips both detail flags.
