@@ -398,6 +398,7 @@ CONTINUE_PROMPT = (
 )
 WAITING_SENTINEL = "[WAITING]"
 DONE_SENTINEL = "[DONE]"
+_DISPATCHER_DEAD = object()  # sentinel pushed on turn_msg_queue when dispatcher crashes
 
 
 def _bg_waiting_msg(n: int) -> str:
@@ -5231,34 +5232,28 @@ class Orchestrator:
         print()
         print(f"{_C_CYAN}> btw:{_C_RESET} {prompt_text}")
         print()
-        in_text = False
+        # Buffer the entire response and print at once — btw runs
+        # concurrently with the main turn, and _write_indented uses
+        # shared instance state that can't be safely interleaved.
+        response_parts: list[str] = []
         try:
             async for msg in _sdk_query(prompt=prompt_text, options=options):
                 if isinstance(msg, AssistantMessage):
                     for block in msg.content:
                         if isinstance(block, TextBlock):
-                            if not in_text:
-                                sys.stdout.write(
-                                    f"{_C_GREEN}claude (btw):{_C_RESET} "
-                                )
-                                in_text = True
-                                self._claude_col = 14  # "claude (btw): " width
-                            # Continuation lines line up under the text;
-                            # also handles visual wraps on long lines.
-                            self._write_indented(block.text, 14)
-                            sys.stdout.flush()
+                            response_parts.append(block.text)
                 elif isinstance(msg, ResultMessage):
-                    if in_text:
-                        self._flush_claude_text()
-                        in_text = False
                     break
         except Exception as e:  # noqa: BLE001
-            if in_text:
-                self._flush_claude_text()
             print(f"{_C_RED}[btw failed: {e}]{_C_RESET}")
             return
-        if in_text:
-            self._flush_claude_text()
+        if response_parts:
+            text = "".join(response_parts).strip()
+            # Wrap with indent matching "claude (btw): " (14 cols).
+            wrapped = _wrap_text(text, indent=14, start_col=14)
+            print(f"{_C_GREEN}claude (btw):{_C_RESET} {wrapped}")
+        else:
+            print(f"{_C_DIM}[btw: no response]{_C_RESET}")
 
     # Known model IDs for `/model` listing. Not exhaustive — MCP/custom
     # setups may have more — but covers the stock set the CLI ships with.
@@ -6556,6 +6551,16 @@ class Orchestrator:
             print(
                 f"{_C_RED}[dispatcher error: {type(e).__name__}: {e}]{_C_RESET}"
             )
+            # If a turn is in progress, run_turn is parked on
+            # turn_msg_queue.get() with no one to feed it. Push a
+            # synthetic _DISPATCHER_DEAD sentinel so run_turn can
+            # break out cleanly — otherwise WORKING hangs forever.
+            if self.turn_active.is_set():
+                print(
+                    f"{_C_RED}[dispatcher died mid-turn — unblocking "
+                    f"run_turn]{_C_RESET}"
+                )
+                self.turn_msg_queue.put_nowait(_DISPATCHER_DEAD)
 
     def _handle_async_message(self, msg: Any) -> None:
         """Render a between-turns message and, for wakeup-worthy events
@@ -6568,6 +6573,16 @@ class Orchestrator:
         tracking — so the toolbar correctly reports "WORKING" while
         Claude is actively streaming and it doesn't look visually
         different from a user-driven turn."""
+        if self.args.debug:
+            kind = type(msg).__name__
+            sub = getattr(msg, "subtype", None)
+            attn = self.state.needs_user_attention
+            extra = f" subtype={sub}" if sub else ""
+            print(
+                f"{_C_DIM}[debug] async msg: {kind}{extra}  "
+                f"attention={attn}  bg={len(self.state.background_tasks)}"
+                f"{_C_RESET}"
+            )
         if isinstance(msg, SystemMessage):
             # Snapshot bg-count BEFORE rendering so we can tell if this
             # particular message is the one that emptied the list (used
@@ -6812,6 +6827,19 @@ class Orchestrator:
             await self.client.query(prompt_text)
             while True:
                 msg = await self.turn_msg_queue.get()
+                if msg is _DISPATCHER_DEAD:
+                    # The dispatcher task crashed (e.g. JSON too large).
+                    # No more messages will arrive. Break out so the turn
+                    # ends instead of hanging in WORKING forever.
+                    if in_text:
+                        self._flush_claude_text()
+                        in_text = False
+                    print(
+                        f"{_C_RED}[turn aborted: dispatcher died — "
+                        f"reconnect recommended (/exit and restart, "
+                        f"or wait for auto-reconnect)]{_C_RESET}"
+                    )
+                    break
                 if isinstance(msg, SystemMessage):
                     if in_text and msg.subtype not in ("init",):
                         self._flush_claude_text()
@@ -7257,7 +7285,21 @@ class Orchestrator:
                 # command (like /i), split the input — send the text
                 # before it as a message, execute the command, and queue
                 # the text after for later.
-                if "\n" in line:
+                # Exception: /btw takes the ENTIRE remaining text as its
+                # payload (including newlines) — don't split it.
+                if "\n" in line and classify(line.split("\n", 1)[0])[0] == "btw":
+                    # Collapse the whole multi-line input into a single
+                    # /btw with the full text as the question.
+                    first_line = line.split("\n", 1)[0]
+                    _, first_payload = classify(first_line)
+                    rest = line.split("\n", 1)[1] if "\n" in line else ""
+                    full_payload = (
+                        f"{first_payload}\n{rest}".strip()
+                        if rest
+                        else first_payload
+                    )
+                    kind, payload = "btw", full_payload
+                elif "\n" in line:
                     parts = line.split("\n")
                     rewritten: list[str] = []
                     msg_buf: list[str] = []
