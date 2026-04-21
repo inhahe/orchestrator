@@ -6618,6 +6618,10 @@ class Orchestrator:
                     # (used for the matching [turn done] line). Subsequent
                     # TextBlocks in the same stream just append text.
                     if not getattr(self, "_async_in_text", False):
+                        # Reset streaming state so stale word buffer
+                        # from a prior turn doesn't leak into this one.
+                        self._claude_word_buf = ""
+                        self._claude_pending_indent = False
                         sys.stdout.write(f"{_C_GREEN}claude:{_C_RESET} ")
                         self._async_in_text = True
                         self._claude_col = 8  # "claude: " width
@@ -7179,6 +7183,9 @@ class Orchestrator:
                         in_text = False
                     render_unknown_message(msg, self.state)
         finally:
+            # Flush any leftover word buffer so stale text doesn't leak
+            # into the next async response or turn.
+            self._flush_claude_text()
             self.turn_active.clear()
             self.state.busy = False
             self.state.turn_started_at = None
