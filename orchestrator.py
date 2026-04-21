@@ -165,7 +165,7 @@ _DEFAULT_COLORS: dict[str, _ColorSpec] = {
     "PATH":        {"fg": "38;5;250", "bg": None, "bold": False},
     "URL":         {"fg": "38;5;250", "bg": None, "bold": False},
     "PATTERN":     {"fg": "36",       "bg": None, "bold": False},
-    "COMMAND":     {"fg": "96",       "bg": None, "bold": False},
+    "COMMAND":     {"fg": "36",       "bg": None, "bold": False},
     "DESC":        {"fg": "38;5;244", "bg": None, "bold": False},
 }
 
