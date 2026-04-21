@@ -2293,22 +2293,16 @@ def _render_tool_result(
         return
     size = _humanize_size(text)
     if is_error:
-        # Show the first non-empty line of the error text (e.g. "must
-        # read file before editing it") — but only if it fits on one
-        # terminal line. Otherwise fall back to the compact size hint.
-        preview = ""
-        for _err_line in text.strip().splitlines():
-            _err_line = _err_line.strip()
-            if _err_line:
-                preview = _err_line
-                break
-        # "✗ " (or "x ") + preview must fit within terminal width
-        # after the seq prefix.
+        # Show the error text inline only if it's a single line AND
+        # fits on the terminal. Multi-line errors always get the
+        # compact size hint — showing just the first line would be
+        # misleading / incomplete.
+        err_lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
         prefix_len = _visible_len(seq_prefix) + 2  # mark + space
         avail = _term_width(default=100) - prefix_len
-        if preview and len(preview) <= avail:
+        if len(err_lines) == 1 and len(err_lines[0]) <= avail:
             print(
-                f"{seq_prefix}{_C_RED}{_mark('failed')} {preview}{_C_RESET}"
+                f"{seq_prefix}{_C_RED}{_mark('failed')} {err_lines[0]}{_C_RESET}"
             )
         else:
             print(
@@ -3171,18 +3165,16 @@ def render_session_history_text(
                                 # on success, red error preview on failure.
                                 size = _humanize_size(text)
                                 if is_err:
-                                    _err_preview = ""
-                                    for _el in text.strip().splitlines():
-                                        _el = _el.strip()
-                                        if _el:
-                                            _err_preview = _el
-                                            break
-                                    # mark + space = 2 visible chars
+                                    _err_lines = [
+                                        ln.strip()
+                                        for ln in text.strip().splitlines()
+                                        if ln.strip()
+                                    ]
                                     _avail = _term_width(default=100) - 2
-                                    if _err_preview and len(_err_preview) <= _avail:
+                                    if len(_err_lines) == 1 and len(_err_lines[0]) <= _avail:
                                         write(
                                             f"{_C_RED}{_mark('failed')} "
-                                            f"{_err_preview}{_C_RESET}\n"
+                                            f"{_err_lines[0]}{_C_RESET}\n"
                                         )
                                     else:
                                         write(
