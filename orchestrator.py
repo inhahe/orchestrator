@@ -6577,16 +6577,23 @@ class Orchestrator:
         tracking — so the toolbar correctly reports "WORKING" while
         Claude is actively streaming and it doesn't look visually
         different from a user-driven turn."""
+        # Debug print — deferred for ResultMessage so it appears AFTER
+        # the text flush (otherwise it visually splits the last word from
+        # the body, making it look like a stray fragment).
+        _debug_deferred = False
         if self.args.debug:
-            kind = type(msg).__name__
-            sub = getattr(msg, "subtype", None)
-            attn = self.state.needs_user_attention
-            extra = f" subtype={sub}" if sub else ""
-            print(
-                f"{_C_DIM}[debug] async msg: {kind}{extra}  "
-                f"attention={attn}  bg={len(self.state.background_tasks)}"
-                f"{_C_RESET}"
-            )
+            if isinstance(msg, ResultMessage) and getattr(self, "_async_in_text", False):
+                _debug_deferred = True  # print after flush below
+            else:
+                kind = type(msg).__name__
+                sub = getattr(msg, "subtype", None)
+                attn = self.state.needs_user_attention
+                extra = f" subtype={sub}" if sub else ""
+                print(
+                    f"{_C_DIM}[debug] async msg: {kind}{extra}  "
+                    f"attention={attn}  bg={len(self.state.background_tasks)}"
+                    f"{_C_RESET}"
+                )
         if isinstance(msg, SystemMessage):
             # Snapshot bg-count BEFORE rendering so we can tell if this
             # particular message is the one that emptied the list (used
@@ -6695,6 +6702,17 @@ class Orchestrator:
             if getattr(self, "_async_in_text", False):
                 self._flush_claude_text()
                 self._async_in_text = False
+            # Deferred debug print — after flush so the last word of
+            # Claude's text isn't visually split by the debug line.
+            if _debug_deferred:
+                sub = getattr(msg, "subtype", None)
+                attn = self.state.needs_user_attention
+                extra = f" subtype={sub}" if sub else ""
+                print(
+                    f"{_C_DIM}[debug] async msg: ResultMessage{extra}  "
+                    f"attention={attn}  bg={len(self.state.background_tasks)}"
+                    f"{_C_RESET}"
+                )
             if msg.session_id:
                 self.state.session_id = msg.session_id
             # If we actually rendered async content (busy was flipped on
