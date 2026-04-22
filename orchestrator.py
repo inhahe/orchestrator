@@ -114,10 +114,7 @@ from prompt_toolkit.layout.containers import (
     HSplit as _PtkHSplit,
     Window as _PtkWindow,
 )
-from prompt_toolkit.layout.controls import (
-    BufferControl as _PtkBufferControl,
-    FormattedTextControl as _PtkFormattedTextControl,
-)
+from prompt_toolkit.layout.controls import BufferControl as _PtkBufferControl
 from prompt_toolkit.layout.menus import CompletionsMenu as _PtkCompletionsMenu
 from prompt_toolkit.styles import Style
 
@@ -510,6 +507,434 @@ class _ScrollProxy:
         return False
 
 
+# ── DECSTBM toolbar renderer ────────────────────────────────────
+class _ToolbarRenderer:
+    """Paints the toolbar into fixed bottom rows via ANSI escapes + DECSTBM.
+
+    Uses DECSTBM (Set Top and Bottom Margins) to confine scrolling to the
+    area above the toolbar.  The toolbar itself is painted using direct
+    cursor positioning and ANSI SGR colour sequences.
+
+    This eliminates ghost rows entirely: the toolbar is never part of
+    prompt_toolkit's rendered area, so there is no "reserved space" that
+    the terminal can fail to un-reserve when the toolbar shrinks.
+    """
+
+    _ANSI_COLORS: dict[str, int] = {
+        "ansiblack": 30, "ansired": 31, "ansigreen": 32,
+        "ansiyellow": 33, "ansiblue": 34, "ansimagenta": 35,
+        "ansicyan": 36, "ansiwhite": 37,
+        "ansibrightblack": 90, "ansibrightred": 91,
+        "ansibrightgreen": 92, "ansibrightyellow": 93,
+        "ansibrightblue": 94, "ansibrightmagenta": 95,
+        "ansibrightcyan": 96, "ansibrightwhite": 97,
+    }
+
+    def __init__(self, state: "State") -> None:
+        self._state = state
+        self._height = 0          # current toolbar height in rows
+        self._active = False      # whether DECSTBM is currently set
+        self._sgr_map: dict[str, str] = {}
+        self._build_sgr_map()
+
+    # ── style conversion ────────────────────────────────────────────
+
+    @classmethod
+    def _color_to_sgr_params(cls, color: str, is_bg: bool = False) -> str:
+        """Convert a single colour value to SGR parameter string.
+
+        ``'ansigreen'`` → ``'32'``,  ``'#006600'`` → ``'38;2;0;102;0'``
+        """
+        c = color.lower().strip()
+        if c in cls._ANSI_COLORS:
+            code = cls._ANSI_COLORS[c]
+            if is_bg:
+                code += 10  # fg → bg offset
+            return str(code)
+        if c.startswith("#") and len(c) == 7:
+            try:
+                r, g, b = int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)
+            except ValueError:
+                return ""
+            return f"{'48' if is_bg else '38'};2;{r};{g};{b}"
+        return ""
+
+    @classmethod
+    def _ptk_style_to_sgr(cls, style_str: str) -> str:
+        """``'fg:#006600 bold'`` → ``'\\x1b[1;38;2;0;102;0m'``"""
+        parts: list[str] = []
+        for tok in style_str.split():
+            lo = tok.lower()
+            if lo == "bold":
+                parts.append("1")
+            elif lo == "italic":
+                parts.append("3")
+            elif lo == "underline":
+                parts.append("4")
+            elif lo in ("noreverse", "noitalic", "nobold", "nounderline"):
+                continue
+            elif lo.startswith("fg:"):
+                p = cls._color_to_sgr_params(tok[3:], is_bg=False)
+                if p:
+                    parts.append(p)
+            elif lo.startswith("bg:"):
+                p = cls._color_to_sgr_params(tok[3:], is_bg=True)
+                if p:
+                    parts.append(p)
+            elif lo in cls._ANSI_COLORS:
+                # bare colour name without fg:/bg: prefix — treat as fg
+                p = cls._color_to_sgr_params(lo, is_bg=False)
+                if p:
+                    parts.append(p)
+        if not parts:
+            return ""
+        return f"\x1b[{';'.join(parts)}m"
+
+    def _build_sgr_map(self) -> None:
+        """Populate ``_sgr_map`` from ``_STYLE_RULES``."""
+        for name, rule in _STYLE_RULES.items():
+            sgr = self._ptk_style_to_sgr(rule)
+            if sgr:
+                self._sgr_map[name] = sgr
+        # Standard HTML tags that aren't in _STYLE_RULES.
+        self._sgr_map.setdefault("b", "\x1b[1m")
+        self._sgr_map.setdefault("i", "\x1b[3m")
+        self._sgr_map.setdefault("u", "\x1b[4m")
+
+    # ── HTML → ANSI ─────────────────────────────────────────────────
+
+    def _html_to_ansi(self, html: str, base_sgr: str) -> str:
+        """Convert a single toolbar HTML line into an ANSI-coloured string.
+
+        ``base_sgr`` is re-applied after every ``\\x1b[0m`` reset so that
+        the toolbar's background colour survives tag transitions.
+        """
+        out: list[str] = []
+        stack: list[str] = []  # SGR string for each open tag
+        i, n = 0, len(html)
+        while i < n:
+            ch = html[i]
+            if ch == "<":
+                gt = html.find(">", i)
+                if gt < 0:
+                    out.append(ch)
+                    i += 1
+                    continue
+                tag = html[i + 1 : gt]
+                i = gt + 1
+                if tag.startswith("/"):
+                    # closing tag — pop style
+                    if stack:
+                        stack.pop()
+                    out.append("\x1b[0m")
+                    if base_sgr:
+                        out.append(base_sgr)
+                    for s in stack:
+                        if s:
+                            out.append(s)
+                else:
+                    # opening tag
+                    name = tag.split()[0].lower() if tag else ""
+                    sgr = self._sgr_map.get(name, "")
+                    stack.append(sgr)
+                    if sgr:
+                        out.append(sgr)
+            elif ch == "&":
+                semi = html.find(";", i)
+                if semi < 0:
+                    out.append(ch)
+                    i += 1
+                    continue
+                entity = html[i + 1 : semi]
+                i = semi + 1
+                if entity == "amp":
+                    out.append("&")
+                elif entity == "lt":
+                    out.append("<")
+                elif entity == "gt":
+                    out.append(">")
+                else:
+                    out.append(f"&{entity};")
+            else:
+                out.append(ch)
+                i += 1
+        return "".join(out)
+
+    # ── scroll region management ────────────────────────────────────
+
+    def _set_scroll_region(self, n_rows: int, writer: Any) -> None:
+        """Set DECSTBM to reserve ``n_rows`` at the bottom for the toolbar.
+
+        ``writer`` must expose either ``write_raw`` (prompt_toolkit output)
+        or ``write`` (plain file).
+        """
+        rows = shutil.get_terminal_size().lines
+        top_bound = max(1, rows - n_rows)
+        # Save cursor, set margins, restore cursor — DECSTBM homes the
+        # cursor to (1,1) as a side effect; save/restore neutralises that.
+        seq = f"\x1b7\x1b[1;{top_bound}r\x1b8"
+        _wr = getattr(writer, "write_raw", None) or writer.write
+        _wr(seq)
+
+    def _clear_freed_rows(self, old_h: int, new_h: int, writer: Any) -> None:
+        """After the toolbar shrinks, clear the rows that moved from the
+        toolbar area into the scroll region so stale content doesn't show.
+
+        Old toolbar: rows ``[H-old_h+1 .. H]``.  New toolbar:
+        ``[H-new_h+1 .. H]``.  Freed rows are at the *top* of the old
+        area: ``[H-old_h+1 .. H-new_h]``."""
+        if new_h >= old_h:
+            return
+        rows = shutil.get_terminal_size().lines
+        _wr = getattr(writer, "write_raw", None) or writer.write
+        first_freed = rows - old_h + 1
+        last_freed = rows - new_h
+        _wr("\x1b7")  # save cursor
+        for row in range(first_freed, last_freed + 1):
+            _wr(f"\x1b[{row};1H\x1b[0m\x1b[K")
+        _wr("\x1b8")  # restore cursor
+
+    def setup(self) -> None:
+        """Initial setup: determine toolbar height and set DECSTBM."""
+        html = _render_toolbar(self._state)
+        lines = html.split("\n")
+        n = len(lines) if lines != [""] else 0
+        if n <= 0:
+            return
+        self._height = n
+        self._active = True
+        w = sys.__stdout__
+        self._set_scroll_region(n, w)
+        w.flush()
+
+    def reset(self) -> None:
+        """Reset scroll region to full terminal.  Called on shutdown."""
+        if not self._active:
+            return
+        self._active = False
+        self._height = 0
+        sys.__stdout__.write("\x1b[r")
+        sys.__stdout__.flush()
+
+    # ── pre-render region adjustment ────────────────────────────────
+
+    def pre_render_adjust(self, output: Any, renderer: Any) -> str:
+        """Compute toolbar HTML, adjust scroll region if the height
+        changed, and return the HTML for ``paint_html`` to use.
+
+        **Must be called BEFORE ``_orig_redraw()``** so that
+        prompt_toolkit renders within the correct scroll region.
+
+        When the toolbar *grows*, the content in the scroll region is
+        scrolled up (via ``\\n`` at the bottom margin) so the input
+        prompt stays above the new, larger toolbar.  The renderer's
+        cursor state is reset to force a fresh render from the correct
+        position.
+        """
+        html = _render_toolbar(self._state)
+        lines = html.split("\n")
+        new_h = len(lines) if lines != [""] else 0
+        old_h = self._height
+
+        if new_h == old_h and self._active:
+            return html  # nothing to adjust
+
+        rows = shutil.get_terminal_size().lines
+
+        if self._active and new_h > old_h:
+            # ── toolbar growing ─────────────────────────────────
+            delta = new_h - old_h
+            old_bottom = rows - old_h
+            # Scroll content UP by delta within the *current* region so
+            # the prompt doesn't end up under the new toolbar.
+            output.write_raw(f"\x1b[{old_bottom};1H")
+            output.write_raw("\n" * delta)
+            # Now update the region to the new (smaller) size.
+            self._height = new_h
+            self._set_scroll_region(new_h, output)
+            # Move cursor to the bottom of the *new* scroll region and
+            # force a fresh render.  The content has shifted, so the
+            # incremental diff would be wrong.
+            new_bottom = rows - new_h
+            output.write_raw(f"\x1b[{new_bottom};1H")
+            from prompt_toolkit.data_structures import Point
+            renderer._cursor_pos = Point(x=0, y=0)
+            renderer._last_screen = None
+        elif self._active and new_h < old_h:
+            # ── toolbar shrinking ───────────────────────────────
+            delta = old_h - new_h
+            self._height = new_h
+            self._set_scroll_region(new_h, output)
+            # SD (Scroll Down): shift content in the *new* (larger) region
+            # down by delta rows.  This fills the freed rows with content
+            # from above, so there is no visible gap between the last
+            # output line and the toolbar.
+            output.write_raw(f"\x1b[{delta}T")
+            # Reposition cursor at the bottom of the new region and
+            # force a fresh render — the content shifted.
+            new_bottom = rows - new_h
+            output.write_raw(f"\x1b[{new_bottom};1H")
+            from prompt_toolkit.data_structures import Point
+            renderer._cursor_pos = Point(x=0, y=0)
+            renderer._last_screen = None
+        elif not self._active and new_h > 0:
+            # ── first activation ────────────────────────────────
+            self._height = new_h
+            self._active = True
+            self._set_scroll_region(new_h, output)
+
+        return html
+
+    # ── painting ────────────────────────────────────────────────────
+
+    def _line_base_sgr(self, line: str) -> str:
+        """Determine the base SGR for a toolbar line.
+
+        ``<panel-hint>``-wrapped lines get their own dark background;
+        everything else gets the standard toolbar background.
+        """
+        stripped = line.lstrip()
+        if stripped.startswith("<panel-hint"):
+            return self._sgr_map.get("panel-hint", "")
+        return self._sgr_map.get("bottom-toolbar", "")
+
+    def paint_html(self, output: Any, html: str) -> None:
+        """Paint pre-computed toolbar *html* to *output*.
+
+        The scroll region must already be correct (see
+        ``pre_render_adjust``).  Call **before** ``output.flush()``
+        so paint is batched with the render.
+        """
+        lines = html.split("\n")
+        n = len(lines) if lines != [""] else 0
+        if n <= 0:
+            return
+
+        rows = shutil.get_terminal_size().lines
+        base_tb_sgr = self._sgr_map.get("bottom-toolbar", "")
+        _wr = output.write_raw
+
+        _wr("\x1b7")  # save cursor
+        for i, line_html in enumerate(lines):
+            row = rows - n + 1 + i
+            base = self._line_base_sgr(line_html)
+            effective_base = base or base_tb_sgr
+            _wr(f"\x1b[{row};1H")        # position cursor
+            _wr(effective_base)           # set line background
+            _wr("\x1b[K")                 # clear line (inherits bg)
+            ansi = self._html_to_ansi(line_html, effective_base)
+            _wr(ansi)
+        _wr("\x1b[0m")  # reset attributes
+        _wr("\x1b8")     # restore cursor
+
+    def paint_direct(self) -> None:
+        """Paint the toolbar directly to ``sys.__stdout__``.
+
+        Useful for contexts where the prompt_toolkit output is unavailable
+        (e.g. ``/cls``)."""
+        html = _render_toolbar(self._state)
+        lines = html.split("\n")
+        n = len(lines) if lines != [""] else 0
+        if n <= 0:
+            return
+        old_h = self._height
+        if n != self._height or not self._active:
+            self._height = n
+            self._active = True
+            self._set_scroll_region(n, sys.__stdout__)
+        if n < old_h:
+            self._clear_freed_rows(old_h, n, sys.__stdout__)
+
+        rows = shutil.get_terminal_size().lines
+        base_tb_sgr = self._sgr_map.get("bottom-toolbar", "")
+        out = sys.__stdout__
+
+        out.write("\x1b7")
+        for i, line_html in enumerate(lines):
+            row = rows - n + 1 + i
+            base = self._line_base_sgr(line_html)
+            effective_base = base or base_tb_sgr
+            out.write(f"\x1b[{row};1H")
+            out.write(effective_base)
+            out.write("\x1b[K")
+            out.write(self._html_to_ansi(line_html, effective_base))
+        out.write("\x1b[0m\x1b8")
+        out.flush()
+
+
+# ── Shift-Enter / Ctrl-Enter → newline patch ─────────────────────
+def _patch_enter_modifiers(app: "_PtkApp") -> None:
+    """Make Shift-Enter and Ctrl-Enter insert a newline (Ctrl-J) instead
+    of submitting.
+
+    prompt_toolkit 3.0 has no ``ShiftEnter`` key, so key bindings like
+    ``s-enter`` silently fail.  Instead we patch the two input layers:
+
+    * **Win32 console** – the ``ConsoleInputReader`` receives real
+      modifier flags but the shift-mapping table omits ``ControlM``
+      (Enter).  We wrap ``_event_to_key_presses`` to remap
+      ``ControlM → ControlJ`` when Shift or Ctrl is held.
+
+    * **VT100 / ANSI** – terminals that support ``modifyOtherKeys`` send
+      ``\\e[27;2;13~`` (Shift-Enter), ``\\e[27;5;13~`` (Ctrl-Enter),
+      etc.  prompt_toolkit maps these to ``ControlM`` (same as plain
+      Enter).  We patch the table so they map to ``ControlJ`` instead.
+    """
+    from prompt_toolkit.keys import Keys
+
+    # ── VT100 / ANSI escape sequences ────────────────────────────
+    try:
+        from prompt_toolkit.input.ansi_escape_sequences import (
+            ANSI_SEQUENCES,
+        )
+        _ENTER_MOD_SEQS = (
+            "\x1b[27;2;13~",   # Shift + Enter
+            "\x1b[27;5;13~",   # Ctrl + Enter
+            "\x1b[27;6;13~",   # Ctrl + Shift + Enter
+        )
+        for seq in _ENTER_MOD_SEQS:
+            if seq in ANSI_SEQUENCES:
+                ANSI_SEQUENCES[seq] = Keys.ControlJ
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ── Win32 console input ──────────────────────────────────────
+    if sys.platform != "win32":
+        return
+    try:
+        inp = app.input
+        reader = getattr(inp, "console_input_reader", None)
+        if reader is None:
+            return
+        _orig = reader._event_to_key_presses
+
+        SHIFT_PRESSED = 0x0010
+        LEFT_CTRL     = 0x0008
+        RIGHT_CTRL    = 0x0004
+
+        def _patched(ev):  # type: ignore[no-untyped-def]
+            result = _orig(ev)
+            ctrl_state = ev.ControlKeyState
+            has_shift = bool(ctrl_state & SHIFT_PRESSED)
+            has_ctrl  = bool(
+                (ctrl_state & LEFT_CTRL) or (ctrl_state & RIGHT_CTRL)
+            )
+            if (has_shift or has_ctrl) and result:
+                # If the original handler returned Enter (ControlM) with
+                # a modifier held, swap to ControlJ (linefeed = newline).
+                # For Ctrl+Enter the handler returns [Escape, ControlJ]
+                # (meta-enter) — replace with plain ControlJ.
+                from prompt_toolkit.key_binding.key_processor import KeyPress
+                keys_in = {kp.key for kp in result}
+                if Keys.ControlM in keys_in or Keys.ControlJ in keys_in:
+                    return [KeyPress(Keys.ControlJ, "\n")]
+            return result
+
+        reader._event_to_key_presses = _patched
+    except Exception:  # noqa: BLE001
+        pass
+
+
 EFFORT_LEVELS = ("low", "medium", "high", "max")
 # "auto" is not a real API value; it means "don't pass effort, let the model
 # pick its default" (which is typically 'high' for Opus/Sonnet 4.6).
@@ -789,41 +1214,40 @@ SLASH_COMMANDS = [
     "/exit!",
 ]
 
-STYLE = Style.from_dict(
-    {
-        "prompt": "fg:ansibrightcyan bold",
-        "bottom-toolbar": "bg:#cccccc fg:#333333 noreverse",
-        "bottom-toolbar.busy": "bg:#884400 fg:#ffffff bold noreverse",
-        # Note: `<panel-hint>` inside the toolbar adds this class; the
-        # plain "panel-hint" selector matches regardless of parent class,
-        # which is what prompt_toolkit's HTML processor expects.
-        "panel-hint": "bg:#333333 fg:#999999",
-        # Panel rows (task/bg detail lines) use this darker background
-        # to visually separate them from the status line above.
-        "panel-row": "bg:#333333 fg:#cccccc",
-        "bg-wait-label": "fg:ansimagenta",
-        # Status indicator classes — colors chosen to contrast against
-        # the light gray (#cccccc) toolbar background.
-        "status-working": "fg:#006600 bold",
-        "status-waiting": "fg:#886600 bold",
-        "status-done": "fg:#007777 bold",
-        "status-stalled": "fg:#880088 bold",
-        "status-error": "fg:#cc0000 bold",
-        "highlight": "fg:#005555 bold",
-        # Toolbar panel element classes — explicit fg: prefix so ANSI
-        # color names can't be misinterpreted as background colors.
-        "tool-label": "fg:ansiyellow",
-        "done-marker": "fg:ansigreen",
-        "panel-dim": "fg:ansibrightblack",
-        "claude": "fg:ansigreen",
-        "tool": "fg:ansiblue",
-        "tool-err": "fg:ansired",
-        "dim": "fg:ansibrightblack",
-        "warn": "fg:ansiyellow",
-        "sys": "fg:ansimagenta",
-        "err": "ansired bold",
-    }
-)
+_STYLE_RULES: dict[str, str] = {
+    "prompt": "fg:ansibrightcyan bold",
+    "bottom-toolbar": "bg:#cccccc fg:#333333 noreverse",
+    "bottom-toolbar.busy": "bg:#884400 fg:#ffffff bold noreverse",
+    # Note: `<panel-hint>` inside the toolbar adds this class; the
+    # plain "panel-hint" selector matches regardless of parent class,
+    # which is what prompt_toolkit's HTML processor expects.
+    "panel-hint": "bg:#333333 fg:#999999",
+    # Panel rows (task/bg detail lines) use this darker background
+    # to visually separate them from the status line above.
+    "panel-row": "bg:#333333 fg:#cccccc",
+    "bg-wait-label": "fg:ansimagenta",
+    # Status indicator classes — colors chosen to contrast against
+    # the light gray (#cccccc) toolbar background.
+    "status-working": "fg:#006600 bold",
+    "status-waiting": "fg:#886600 bold",
+    "status-done": "fg:#007777 bold",
+    "status-stalled": "fg:#880088 bold",
+    "status-error": "fg:#cc0000 bold",
+    "highlight": "fg:#005555 bold",
+    # Toolbar panel element classes — explicit fg: prefix so ANSI
+    # color names can't be misinterpreted as background colors.
+    "tool-label": "fg:ansiyellow",
+    "done-marker": "fg:ansigreen",
+    "panel-dim": "fg:ansibrightblack",
+    "claude": "fg:ansigreen",
+    "tool": "fg:ansiblue",
+    "tool-err": "fg:ansired",
+    "dim": "fg:ansibrightblack",
+    "warn": "fg:ansiyellow",
+    "sys": "fg:ansimagenta",
+    "err": "ansired bold",
+}
+STYLE = Style.from_dict(_STYLE_RULES)
 
 
 @dataclass
@@ -1251,8 +1675,9 @@ def classify(line: str) -> tuple[str, str]:
         return "clear-screen", ""
     if cmd in ("cost", "cwd"):
         return "status", ""
-    # Unknown slash — send raw (the CLI may have skills that handle it).
-    return "passthrough-slash", s
+    # Unknown slash command — report an error instead of silently
+    # forwarding to the SDK.
+    return "error", f"unknown command /{cmd} (try /help)"
 
 
 def brief_args(d: dict[str, Any], limit: int = 110) -> str:
@@ -1539,11 +1964,20 @@ def _emit_bg_completion(
     # so no dedicated hint line needed below. Letter prefix "b" per
     # the unified /show scheme.
     seq_prefix = _result_seq_prefix(seq, None, letter="b") if isinstance(seq, int) else ""
-    label = (name or summary or "(unnamed)").replace("\n", " ")
-    # Completion line is kept clean — no command appended. The command
-    # was already shown on the "bg-task ▶ started" line (or on the
-    # preceding Bash tool-call line), so repeating it here is redundant
-    # clutter, especially for long multi-part commands.
+    label = (name or summary or "(unnamed)").replace("\n", " ").strip()
+    is_full = state.show_tasks in ("full", "full+output")
+    # In compact mode, truncate the label so the completion line fits
+    # on one terminal line — long multi-part Bash commands are already
+    # visible on the "started" line or preceding tool-call line.
+    if not is_full:
+        base = (
+            f"{seq_prefix}{_C_MAGENTA}bg-task{_C_RESET} "
+            f"{color}{marker}{_C_RESET} {_C_MAGENTA}{status}{_C_RESET} "
+            f"{_C_DESC}-- {_C_RESET}"
+        )
+        avail = _term_width() - _visible_len(base)
+        if avail > 0 and len(label) > avail:
+            label = label[: max(1, avail - 1)] + "…"
     print(
         f"{seq_prefix}{_C_MAGENTA}bg-task{_C_RESET} "
         f"{color}{marker}{_C_RESET} {_C_MAGENTA}{status}{_C_RESET} "
@@ -4255,13 +4689,7 @@ def _panel_live_todos(state: "State") -> list[str]:
     return out
 
 
-# Tracks the toolbar's line count so the input echo can erase stale toolbar
-# rows after the Application exits.  Updated by _render_toolbar() each cycle.
-_last_toolbar_height: int = 0
-
-
 def _render_toolbar(state: "State") -> str:
-    global _last_toolbar_height  # noqa: PLW0603
 
     # Fixed status rows at the top, dynamic panels below. Fixed-row
     # sections flow section-at-a-time across however many lines are
@@ -4323,13 +4751,6 @@ def _render_toolbar(state: "State") -> str:
     # for the duration of that event. Collapse internal \n/\r per row so
     # the toolbar height only ever grows by intentional rows.
     lines = [ln.replace("\r", " ").replace("\n", " ") for ln in lines]
-
-    # Ghost-row fix is no longer needed: our custom layout uses
-    # dont_extend_height=True on BOTH the input and toolbar windows
-    # inside an HSplit.  When the toolbar shrinks the HSplit shrinks
-    # with it — there is no spacer window to absorb the difference
-    # and no _min_available_height that only ever ratchets upward.
-    _last_toolbar_height = len(lines)
 
     return "\n".join(lines)
 
@@ -4398,6 +4819,7 @@ class Orchestrator:
         self.dispatcher_task: asyncio.Task[None] | None = None
         self._prompt_app: _PtkApp | None = None
         self._prompt_buffer: _PtkBuffer | None = None
+        self._toolbar_renderer: _ToolbarRenderer | None = None
         self._input_queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._mcp_servers: dict[str, Any] | None = self._load_mcp_config()
         # Set if --resume was passed; cleared after the first connect so that
@@ -4604,26 +5026,38 @@ class Orchestrator:
         def _(event):  # type: ignore[no-untyped-def]
             event.current_buffer.undo()
 
+        # Backspace / Delete: selection-aware.  When a Shift-selection
+        # is active, delete the selection (same as Cut) instead of
+        # removing a single character.  Without a selection, fall
+        # through to prompt_toolkit's default behaviour.
+        @kb.add("c-h")  # Backspace
+        def _(event):  # type: ignore[no-untyped-def]
+            buf = event.app.current_buffer
+            if buf.selection_state is not None:
+                buf.cut_selection()
+            else:
+                buf.delete_before_cursor(count=event.arg)
+
+        @kb.add("delete")
+        def _(event):  # type: ignore[no-untyped-def]
+            buf = event.app.current_buffer
+            if buf.selection_state is not None:
+                buf.cut_selection()
+            else:
+                buf.delete(count=event.arg)
+
         # Multi-line input: Enter submits, Ctrl-J inserts a newline.
-        # (Alt-Enter is reserved by Windows Terminal for fullscreen toggle,
-        # so Ctrl-J is the primary newline key.)
+        # Shift-Enter and Ctrl-Enter also insert newlines — handled by
+        # _patch_enter_modifiers() which remaps modified Enter to Ctrl-J
+        # at the input layer (prompt_toolkit has no ShiftEnter key).
         @kb.add("enter")
         def _(event):  # type: ignore[no-untyped-def]
+            event.current_buffer.selection_state = None
             event.current_buffer.validate_and_handle()
 
         @kb.add("c-j")  # Ctrl-J (linefeed) – always works
         def _(event):  # type: ignore[no-untyped-def]
             event.current_buffer.insert_text("\n")
-
-        # Shift-Enter / Ctrl-Enter: most terminals can't distinguish these
-        # from plain Enter, and older prompt_toolkit versions reject the
-        # key names outright. Register them only if the installed version
-        # accepts them so startup doesn't fail.
-        for _extra_key in ("s-enter", "c-enter"):
-            try:
-                kb.add(_extra_key)(lambda event: event.current_buffer.insert_text("\n"))
-            except ValueError:
-                pass
 
         # Escape clears the whole input buffer.  Always eager so it fires
         # instantly without waiting for prompt_toolkit's key-sequence
@@ -4661,14 +5095,12 @@ class Orchestrator:
                 buf.complete_previous(count=event.arg)
                 return
             doc = buf.document
-            # Empirical calibration: `term_w - 2` = 2 left of target,
-            # `term_w - 4` = 2 right of target. The linear midpoint is
-            # `term_w - 3`. Likely reason the offset is odd: the
-            # prompt wraps at an effective text width that's `term_w -
-            # (_PROMPT_WIDTH + 1)` — perhaps prompt_toolkit reserves
-            # an extra 1-col right margin to avoid the classic
-            # "last-column auto-wrap" terminal glitch.
-            effective_w = max(1, _term_width() - _PROMPT_WIDTH - 1)
+            # prompt_toolkit wraps at the width its Output.get_size()
+            # reports.  On Windows, Win32Output subtracts 1 from the
+            # buffer width to prevent right-margin autowrap, so this
+            # can differ from shutil.get_terminal_size().columns.
+            # We MUST use the same source to match the wrap points.
+            effective_w = max(1, event.app.output.get_size().columns - _PROMPT_WIDTH)
             col_in_line = doc.cursor_position_col
             if col_in_line >= effective_w:
                 # Step up one visual row within current logical line.
@@ -4688,7 +5120,7 @@ class Orchestrator:
                 buf.complete_next(count=event.arg)
                 return
             doc = buf.document
-            effective_w = max(1, _term_width() - _PROMPT_WIDTH - 1)
+            effective_w = max(1, event.app.output.get_size().columns - _PROMPT_WIDTH)
             col_in_line = doc.cursor_position_col
             line_len = len(doc.current_line)
             if col_in_line + effective_w <= line_len:
@@ -4735,7 +5167,7 @@ class Orchestrator:
             buf.selection_state = None
             doc = buf.document
             col = doc.cursor_position_col
-            effective_w = max(1, _term_width() - _PROMPT_WIDTH - 1)
+            effective_w = max(1, event.app.output.get_size().columns - _PROMPT_WIDTH)
             visual_row_start = (col // effective_w) * effective_w
             buf.cursor_position -= (col - visual_row_start)
 
@@ -4746,9 +5178,13 @@ class Orchestrator:
             doc = buf.document
             col = doc.cursor_position_col
             line_len = len(doc.current_line)
-            effective_w = max(1, _term_width() - _PROMPT_WIDTH - 1)
+            effective_w = max(1, event.app.output.get_size().columns - _PROMPT_WIDTH)
+            # Last character of the current visual row, or line_len on
+            # the final (partial) row.  Using ``- 1`` so the cursor
+            # lands AT the last visible column rather than wrapping to
+            # the first column of the next visual row.
             visual_row_end = min(
-                (col // effective_w + 1) * effective_w,
+                (col // effective_w + 1) * effective_w - 1,
                 line_len,
             )
             buf.cursor_position += (visual_row_end - col)
@@ -4782,7 +5218,7 @@ class Orchestrator:
             buf = event.app.current_buffer
             _ensure_selection(buf)
             doc = buf.document
-            effective_w = max(1, _term_width() - _PROMPT_WIDTH - 1)
+            effective_w = max(1, event.app.output.get_size().columns - _PROMPT_WIDTH)
             col_in_line = doc.cursor_position_col
             if col_in_line >= effective_w:
                 buf.cursor_position -= effective_w
@@ -4794,7 +5230,7 @@ class Orchestrator:
             buf = event.app.current_buffer
             _ensure_selection(buf)
             doc = buf.document
-            effective_w = max(1, _term_width() - _PROMPT_WIDTH - 1)
+            effective_w = max(1, event.app.output.get_size().columns - _PROMPT_WIDTH)
             col_in_line = doc.cursor_position_col
             line_len = len(doc.current_line)
             if col_in_line + effective_w <= line_len:
@@ -4808,7 +5244,7 @@ class Orchestrator:
             _ensure_selection(buf)
             doc = buf.document
             col = doc.cursor_position_col
-            effective_w = max(1, _term_width() - _PROMPT_WIDTH - 1)
+            effective_w = max(1, event.app.output.get_size().columns - _PROMPT_WIDTH)
             visual_row_start = (col // effective_w) * effective_w
             buf.cursor_position -= (col - visual_row_start)
 
@@ -4819,9 +5255,9 @@ class Orchestrator:
             doc = buf.document
             col = doc.cursor_position_col
             line_len = len(doc.current_line)
-            effective_w = max(1, _term_width() - _PROMPT_WIDTH - 1)
+            effective_w = max(1, event.app.output.get_size().columns - _PROMPT_WIDTH)
             visual_row_end = min(
-                (col // effective_w + 1) * effective_w,
+                (col // effective_w + 1) * effective_w - 1,
                 line_len,
             )
             buf.cursor_position += (visual_row_end - col)
@@ -4843,6 +5279,23 @@ class Orchestrator:
             if pos:
                 buf.cursor_position += pos
 
+        # ── Selection-aware character insertion ───────────────────
+        # Typing a character while a Shift-selection is active should
+        # delete the selected text and insert the character in its
+        # place — standard text-editor behaviour.  prompt_toolkit's
+        # default Keys.Any handler just inserts without clearing the
+        # selection, which leaves a stale SelectionState that can
+        # cause rendering edge-cases (including apparent input hangs
+        # on Windows).
+        from prompt_toolkit.keys import Keys as _Keys
+
+        @kb.add(_Keys.Any)
+        def _(event):  # type: ignore[no-untyped-def]
+            buf = event.app.current_buffer
+            if buf.selection_state is not None:
+                buf.cut_selection()
+            buf.insert_text(event.data)
+
         return kb
 
     def _build_prompt_app(self, history_path: Path) -> None:
@@ -4850,15 +5303,15 @@ class Orchestrator:
 
         Unlike PromptSession (which creates a new Application per
         prompt_async call), our Application stays alive for the entire
-        session.  The prompt and toolbar are rendered by our own layout
-        — not by prompt_toolkit's built-in ``bottom_toolbar`` /
-        ``message`` parameters.
+        session.  prompt_toolkit handles input editing, history, and
+        completions.  The toolbar is rendered **outside** the layout
+        via ``_ToolbarRenderer`` (DECSTBM scroll-region approach).
 
         Benefits:
-        * No ghost rows when the toolbar shrinks — both windows use
-          ``dont_extend_height=True`` so the HSplit is always the exact
-          right height.  No spacer window, no ``_min_available_height``
-          ratchet.
+        * No ghost rows — the toolbar is painted via ANSI escapes in
+          fixed rows below the DECSTBM scroll region.  prompt_toolkit
+          cannot "reserve" space there, so shrinking the toolbar is
+          instant and clean.
         * No toolbar flicker or disappearance on ``/rename`` — the
           Application never exits between inputs, so ``render_as_done``
           never fires.
@@ -4893,17 +5346,11 @@ class Orchestrator:
             get_line_prefix=_get_line_prefix,
         )
 
-        toolbar_window = _PtkWindow(
-            content=_PtkFormattedTextControl(
-                lambda: HTML(_render_toolbar(self.state))
-            ),
-            dont_extend_height=True,
-            style="class:bottom-toolbar",
-        )
-
+        # Toolbar is rendered outside prompt_toolkit via _ToolbarRenderer
+        # (DECSTBM scroll region), so the layout contains only the input.
         layout = _PtkLayout(
             _PtkFloatContainer(
-                content=_PtkHSplit([input_window, toolbar_window]),
+                content=_PtkHSplit([input_window]),
                 floats=[
                     _PtkFloat(
                         xcursor=True,
@@ -4925,17 +5372,90 @@ class Orchestrator:
             refresh_interval=0.5,  # keep toolbar's live fields fresh
         )
         self._prompt_app._handle_exception = _async_exception_handler
+        _patch_enter_modifiers(self._prompt_app)
 
-        # Ghost-row prevention: prompt_toolkit's renderer ratchets
-        # _min_available_height upward (never shrinks).  When the toolbar
-        # loses rows the renderer pads with blank lines at the bottom.
-        # Resetting to 0 before each redraw lets the layout use the
-        # actual height; the diff against _last_screen clears old rows.
+        # ── DECSTBM toolbar rendering ──────────────────────────────
+        #
+        # The toolbar lives in fixed rows at the bottom of the terminal,
+        # outside prompt_toolkit's scroll region.  DECSTBM confines all
+        # scrolling (\n at the bottom margin, _output_screen_diff's
+        # \r\n "reserve space" dance) to the region above the toolbar.
+        # Ghost rows are impossible: the toolbar area is never part of
+        # prompt_toolkit's rendered UI, so there is no reservable space
+        # that the terminal fails to reclaim when the toolbar shrinks.
+        #
+        # The _redraw wrapper suppresses the final output.flush() inside
+        # render(), appends the toolbar paint to the same output buffer,
+        # and flushes once — so render + toolbar reach the terminal in
+        # a single write.  No frame ever shows a missing toolbar.
+        self._toolbar_renderer = _ToolbarRenderer(self.state)
+        self._toolbar_renderer.setup()
+
         _orig_redraw = self._prompt_app._redraw
-        def _capped_redraw() -> None:
-            self._prompt_app.renderer._min_available_height = 0
-            _orig_redraw()
-        self._prompt_app._redraw = _capped_redraw
+        _app_ref = self._prompt_app
+        _tb = self._toolbar_renderer
+
+        def _toolbar_redraw() -> None:
+            renderer = _app_ref.renderer
+            # Capture the previous render height BEFORE pre_render_adjust
+            # may clear _last_screen.  Needed for ghost-row cleanup below.
+            _prev_h = (
+                renderer._last_screen.height if renderer._last_screen else 0
+            )
+            # Prevent the height ratchet — keep the input window minimal.
+            renderer._min_available_height = 0
+            output = renderer.output
+            _real_flush = output.flush
+            output.flush = lambda: None  # suppress flush
+            try:
+                # Adjust scroll region BEFORE the render so
+                # prompt_toolkit positions its content above the toolbar.
+                tb_html = _tb.pre_render_adjust(output, renderer)
+                # Did pre_render_adjust clear _last_screen?  If so, the
+                # renderer won't know about the old content height and
+                # can't erase stale rows on its own.
+                _screen_was_reset = renderer._last_screen is None
+                _orig_redraw()
+            finally:
+                output.flush = _real_flush
+
+            # ── Ghost-row cleanup ──────────────────────────────
+            # When pre_render_adjust resets _last_screen (toolbar height
+            # changed), it also resets _cursor_pos to Point(0,0) with
+            # the physical cursor at the scroll-region bottom.  The
+            # renderer's erase_down() fires from that bottom position
+            # and therefore can't reach the old content rows above it.
+            # If the new render is shorter than the old one (e.g. Escape
+            # cleared a multi-line input), those stale rows become
+            # visible ghost text.
+            #
+            # Fix: explicitly blank the ghost rows.  They sit between
+            # the (shifted) old-content top and the new-content top,
+            # both adjusted for the scroll-ups that \r\n caused during
+            # the render.
+            _new_h = (
+                renderer._last_screen.height if renderer._last_screen else 0
+            )
+            if _screen_was_reset and _new_h < _prev_h:
+                _rows = shutil.get_terminal_size().lines
+                _nb = _rows - _tb._height  # new scroll-region bottom
+                _ghost_top = _nb - _prev_h - _new_h + 2
+                _ghost_end = _nb - _new_h
+                if _ghost_top < 1:
+                    _ghost_top = 1
+                if _ghost_end >= _ghost_top:
+                    output.write_raw("\x1b7")  # DECSC — save cursor
+                    for _r in range(_ghost_top, _ghost_end + 1):
+                        output.write_raw(f"\x1b[{_r};1H\x1b[2K")
+                    output.write_raw("\x1b8")  # DECRC — restore cursor
+
+            try:
+                _tb.paint_html(output, tb_html)
+            except Exception:  # noqa: BLE001
+                pass  # toolbar paint errors must not crash the app
+            output.flush()  # single flush: region-adjust + render + toolbar
+
+        self._prompt_app._redraw = _toolbar_redraw
 
         # Install _ScrollProxy on sys.stdout AFTER the Application is
         # created.  The Application already captured real stdout for its
@@ -4976,15 +5496,24 @@ class Orchestrator:
         print("  /todos  /plan                   show Claude's current TodoWrite plan")
         print("  /quit  /exit                    graceful exit (waits up to ~10s for CLI flush)")
         print("  /quit! /exit!                   force exit immediately (may lose last message)")
-        print("Input: Enter submits.  Ctrl-J inserts a newline (multi-line input).")
+        print("Input: Enter submits.  Shift-Enter / Ctrl-Enter / Ctrl-J inserts a newline.")
         print("       Ctrl-Z: undo.  Esc: clear input.  Ctrl-C: interrupt or clear.")
         print("Anything else is sent to Claude as a message.")
         print()
 
     def clear_screen(self) -> None:
-        sys.stdout.write("\033[2J\033[3J\033[H")
-        sys.stdout.flush()
+        # Write the clear sequence directly to __stdout__ (bypassing
+        # _ScrollProxy's line-buffering) so the screen clears immediately.
+        sys.__stdout__.write("\033[2J\033[3J\033[H")
+        sys.__stdout__.flush()
         print(f"{_C_DIM}[screen cleared -- session {self.state.session_id} continues]{_C_RESET}")
+        # Force re-setup of the scroll region and repaint the toolbar.
+        # The print() above goes through _ScrollProxy → _redraw which
+        # repaints automatically, but we force a region refresh in case
+        # the terminal was resized since the last paint.
+        if self._toolbar_renderer is not None:
+            self._toolbar_renderer._height = 0  # force region recalc
+            self._toolbar_renderer.paint_direct()
 
     def _check_api_stall(
         self, error_status: Any = None, error_info: Any = None
@@ -5531,9 +6060,7 @@ class Orchestrator:
         if self.args.append_system_prompt:
             kwargs["append_system_prompt"] = self.args.append_system_prompt
         options = ClaudeAgentOptions(**kwargs)
-        print()
         print(f"{_C_CYAN}> btw:{_C_RESET} {prompt_text}")
-        print()
         # Buffer the entire response and print at once — btw runs
         # concurrently with the main turn, and _write_indented uses
         # shared instance state that can't be safely interleaved.
@@ -7643,7 +8170,7 @@ class Orchestrator:
                     msg_buf: list[str] = []
                     for p in parts:
                         pk, _ = classify(p)
-                        if pk not in ("empty", "message", "passthrough-slash", "error"):
+                        if pk not in ("empty", "message", "error"):
                             # This line is a slash command.
                             if msg_buf:
                                 rewritten.append("\n".join(msg_buf))
@@ -7663,14 +8190,6 @@ class Orchestrator:
                                 else ("message", extra)
                             )
                 kind, payload = classify(line)
-                if kind == "passthrough-slash":
-                    # Unknown slash — forward to the CLI as a message
-                    # (so /init, /skill-name, /agents, etc. still work).
-                    print(
-                        f"{_C_DIM}[forwarding {payload.split()[0]} "
-                        f"to the CLI as a message]{_C_RESET}"
-                    )
-                    kind = "message"
                 if kind == "empty":
                     continue
                 if kind == "interrupt":
@@ -7705,6 +8224,8 @@ class Orchestrator:
                     await self.event_queue.put((kind, payload))
                     break
                 if kind == "force-quit":
+                    if self._toolbar_renderer is not None:
+                        self._toolbar_renderer.reset()
                     print(
                         f"{_C_RED}[force-quit: killing CLI subprocess "
                         "immediately -- last in-flight message may be "
@@ -7780,6 +8301,10 @@ class Orchestrator:
             # also armed one, we end up with two running, whichever
             # fires first kills the process.
             _arm_shutdown_watchdog(25.0)
+            # Reset DECSTBM scroll region before the Application exits
+            # so the terminal returns to normal full-screen scrolling.
+            if self._toolbar_renderer is not None:
+                self._toolbar_renderer.reset()
             # Shut down the persistent Application so the terminal is
             # restored to its normal state.
             if self._prompt_app is not None and self._prompt_app.is_running:
@@ -8023,6 +8548,14 @@ class Orchestrator:
                 next_prompt = await self._await_user_or_quit()
 
             while next_prompt is not None and not self.stop_event.is_set():
+                # Track whether this turn was auto-generated (continue
+                # prompt or /compact) vs user-initiated.  Post-compact
+                # auto-continue should only fire for auto-turns — if the
+                # user explicitly sent a message, they should decide what
+                # happens next, even if --auto-continue is on.
+                _is_auto_turn = next_prompt in (
+                    self.state.continue_prompt, "/compact",
+                )
                 try:
                     text, interrupted = await self.run_turn(next_prompt)
                 except asyncio.CancelledError:
@@ -8147,7 +8680,13 @@ class Orchestrator:
                     # if bg tasks are running we need the bg-wait path
                     # regardless of whether a compact just fired.
                     if not self.state.background_tasks:
-                        if self.args.auto_continue:
+                        # Only auto-continue after compact when the
+                        # compacted turn was itself auto-generated
+                        # (continue prompt or /compact).  If the user
+                        # explicitly sent a message, they own the flow —
+                        # wait for their next input even with
+                        # --auto-continue on.
+                        if self.args.auto_continue and _is_auto_turn:
                             print(
                                 f"{_C_DIM}[post-compact: auto-continuing]{_C_RESET}"
                             )
