@@ -101,12 +101,24 @@ try:  # Native session rename — present on recent SDKs.
     from claude_agent_sdk import rename_session as _sdk_rename_session  # type: ignore
 except ImportError:  # pragma: no cover — older SDK
     _sdk_rename_session = None  # type: ignore[assignment]
-from prompt_toolkit import PromptSession
+from prompt_toolkit.application import Application as _PtkApp
+from prompt_toolkit.buffer import Buffer as _PtkBuffer
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.layout import Layout as _PtkLayout
+from prompt_toolkit.layout.containers import (
+    Float as _PtkFloat,
+    FloatContainer as _PtkFloatContainer,
+    HSplit as _PtkHSplit,
+    Window as _PtkWindow,
+)
+from prompt_toolkit.layout.controls import (
+    BufferControl as _PtkBufferControl,
+    FormattedTextControl as _PtkFormattedTextControl,
+)
+from prompt_toolkit.layout.menus import CompletionsMenu as _PtkCompletionsMenu
 from prompt_toolkit.styles import Style
 
 #
@@ -384,6 +396,95 @@ _C_URL         = _spec_to_sgr(_COLORS["URL"])
 _C_PATTERN     = _spec_to_sgr(_COLORS["PATTERN"])
 _C_COMMAND     = _spec_to_sgr(_COLORS["COMMAND"])
 _C_DESC        = _spec_to_sgr(_COLORS["DESC"])
+
+
+# ── Clipboard helper ─────────────────────────────────────────────
+def _copy_to_clipboard(text: str) -> bool:
+    """Copy *text* to the system clipboard.  Returns True on success."""
+    import subprocess as _sp
+    try:
+        if sys.platform == "win32":
+            _sp.run(["clip"], input=text.encode(), check=True,
+                    capture_output=True, timeout=2)
+        elif sys.platform == "darwin":
+            _sp.run(["pbcopy"], input=text.encode("utf-8"), check=True,
+                    capture_output=True, timeout=2)
+        else:
+            try:
+                _sp.run(["xclip", "-selection", "clipboard"],
+                        input=text.encode("utf-8"), check=True,
+                        capture_output=True, timeout=2)
+            except FileNotFoundError:
+                _sp.run(["xsel", "--clipboard", "--input"],
+                        input=text.encode("utf-8"), check=True,
+                        capture_output=True, timeout=2)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ── Scroll proxy (replaces patch_stdout) ─────────────────────────
+class _ScrollProxy:
+    """stdout proxy: writes above the prompt Application without flash.
+
+    ``patch_stdout`` defers each write via ``ensure_future`` →
+    ``run_in_terminal``, so the renderer-erase and redraw land in
+    **separate** event-loop ticks — the gap between them is a visible
+    toolbar flash.
+
+    This proxy calls ``erase → write_raw → redraw`` synchronously in
+    one shot so the terminal processes all ANSI codes in a single
+    display frame.
+    """
+
+    def __init__(self) -> None:
+        self._app: _PtkApp | None = None
+        self._buf: list[str] = []
+        self.encoding: str = getattr(sys.__stdout__, "encoding", "utf-8")
+
+    # ── file-like interface ──────────────────────────────────────
+    def write(self, data: str) -> int:
+        self._buf.append(data)
+        if "\n" in data:
+            self.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        if not self._buf:
+            return
+        text = "".join(self._buf)
+        self._buf.clear()
+
+        app = self._app
+        if app is not None and app.is_running:
+            # Synchronous: erase → write → redraw.
+            # renderer.erase() calls reset() internally, so no separate
+            # reset() call needed.
+            app.renderer.erase()
+            app.output.write_raw(text)
+            app.output.flush()
+            app._request_absolute_cursor_position()
+            app._redraw()
+        else:
+            sys.__stdout__.write(text)
+            sys.__stdout__.flush()
+
+    def fileno(self) -> int:
+        return sys.__stdout__.fileno()
+
+    def isatty(self) -> bool:
+        return hasattr(sys.__stdout__, "isatty") and sys.__stdout__.isatty()
+
+    @property
+    def closed(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return False
+
 
 EFFORT_LEVELS = ("low", "medium", "high", "max")
 # "auto" is not a real API value; it means "don't pass effort, let the model
@@ -4130,23 +4231,13 @@ def _panel_live_todos(state: "State") -> list[str]:
     return out
 
 
-# Last toolbar line-count — used to detect when the toolbar shrinks so we
-# can force a full re-render (prompt_toolkit's renderer never lets the
-# layout height decrease and doesn't erase vacated rows, leaving ghost
-# text between the prompt and the toolbar).  Fix: when the toolbar
-# produces fewer lines than last time, we set renderer._last_screen =
-# None from inside the callback.  This makes the very same render cycle
-# treat the screen as "first render" → erase_down + full redraw on a
-# clean canvas, exactly like the first render or a terminal-width change.
-_toolbar_last_lines: int = 0
-# Filled in by the Orchestrator after creating the PromptSession so
-# _render_toolbar can poke at the renderer when it detects a height
-# decrease.  Stays None until then (safe — no-op).
-_toolbar_renderer: Any = None
+# Tracks the toolbar's line count so the input echo can erase stale toolbar
+# rows after the Application exits.  Updated by _render_toolbar() each cycle.
+_last_toolbar_height: int = 0
 
 
 def _render_toolbar(state: "State") -> str:
-    global _toolbar_last_lines  # noqa: PLW0603
+    global _last_toolbar_height  # noqa: PLW0603
 
     # Fixed status rows at the top, dynamic panels below. Fixed-row
     # sections flow section-at-a-time across however many lines are
@@ -4209,53 +4300,12 @@ def _render_toolbar(state: "State") -> str:
     # the toolbar height only ever grows by intentional rows.
     lines = [ln.replace("\r", " ").replace("\n", " ") for ln in lines]
 
-    # --- Anti-ghost-row fix ---
-    # The prompt's layout is: DefaultBufferWindow + spacer Window +
-    # bottom_toolbar Window (`dont_extend_height=True`), all inside a
-    # region sized to `_min_available_height` (cursor-to-bottom-of-
-    # terminal). When the toolbar shrinks by K rows, the spacer grows
-    # by K rows and the toolbar content moves DOWN by K rows within
-    # the same-sized region. prompt_toolkit's diff is supposed to
-    # clear the vacated upper rows of the toolbar, but in practice
-    # the ghost persists — especially for shrink-by-2-or-more.
-    #
-    # The reliable hammer: from the next event-loop tick (AFTER the
-    # racy in-flight render has committed), directly emit `erase_down`
-    # on the output to physically clear the terminal below the render
-    # region's top-left cursor, then null `_last_screen` and
-    # `_min_available_height` and invalidate — so the following render
-    # is a full clean repaint onto a blanked canvas.
-    n = len(lines)
-    if n < _toolbar_last_lines and _toolbar_renderer is not None:
-        try:
-            from prompt_toolkit.application import get_app as _get_app
-            _app = _get_app()
-
-            def _force_full_redraw_next_tick() -> None:
-                r = _toolbar_renderer
-                if r is None:
-                    return
-                # Null both caches and call `_redraw()` synchronously
-                # so the collapse-to-preferred + re-measure + repaint
-                # happen in ONE event-loop tick, too fast for the
-                # terminal to show an intermediate frame. With
-                # `_min_available_height=0`, the next render's height
-                # calc `max(0, 0, preferred)` = preferred — which is
-                # correct content size, forcing prompt_toolkit to
-                # draw only the new (shorter) region.
-                r._last_screen = None
-                r._min_available_height = 0
-                try:
-                    _app._redraw()
-                except Exception:  # noqa: BLE001
-                    _app.invalidate()
-
-            asyncio.get_running_loop().call_soon(_force_full_redraw_next_tick)
-        except (RuntimeError, LookupError):
-            # No running app/loop — in-render nulls (partial fix).
-            _toolbar_renderer._last_screen = None
-            _toolbar_renderer._min_available_height = 0
-    _toolbar_last_lines = n
+    # Ghost-row fix is no longer needed: our custom layout uses
+    # dont_extend_height=True on BOTH the input and toolbar windows
+    # inside an HSplit.  When the toolbar shrinks the HSplit shrinks
+    # with it — there is no spacer window to absorb the difference
+    # and no _min_available_height that only ever ratchets upward.
+    _last_toolbar_height = len(lines)
 
     return "\n".join(lines)
 
@@ -4322,7 +4372,9 @@ class Orchestrator:
         self.stop_event = asyncio.Event()
         self.client: ClaudeSDKClient | None = None
         self.dispatcher_task: asyncio.Task[None] | None = None
-        self.session: PromptSession | None = None
+        self._prompt_app: _PtkApp | None = None
+        self._prompt_buffer: _PtkBuffer | None = None
+        self._input_queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._mcp_servers: dict[str, Any] | None = self._load_mcp_config()
         # Set if --resume was passed; cleared after the first connect so that
         # /effort and /model reconnects fall back to state.session_id.
@@ -4470,6 +4522,17 @@ class Orchestrator:
         @kb.add("c-c")
         def _(event):  # type: ignore[no-untyped-def]
             buf = event.app.current_buffer
+            # Text selected via Shift+Arrow → copy to system clipboard.
+            if buf.selection_state is not None:
+                start = min(buf.cursor_position,
+                            buf.selection_state.original_cursor_position)
+                end = max(buf.cursor_position,
+                          buf.selection_state.original_cursor_position)
+                selected = buf.text[start:end]
+                if selected:
+                    _copy_to_clipboard(selected)
+                buf.selection_state = None
+                return
             if self.state.busy:
                 self.interrupt_event.set()
             elif buf.text:
@@ -4486,7 +4549,14 @@ class Orchestrator:
         def _(event):  # type: ignore[no-untyped-def]
             self.interrupt_event.set()
             self.stop_event.set()
-            event.app.exit(exception=EOFError)
+            # Signal EOF to input_loop and stop the persistent Application.
+            self._input_queue.put_nowait(None)
+            event.app.exit()
+
+        # Ctrl+Z: undo last edit in the input buffer.
+        @kb.add("c-z")
+        def _(event):  # type: ignore[no-untyped-def]
+            event.current_buffer.undo()
 
         # Multi-line input: Enter submits, Ctrl-J inserts a newline.
         # (Alt-Enter is reserved by Windows Terminal for fullscreen toggle,
@@ -4496,10 +4566,6 @@ class Orchestrator:
             event.current_buffer.validate_and_handle()
 
         @kb.add("c-j")  # Ctrl-J (linefeed) – always works
-        def _(event):  # type: ignore[no-untyped-def]
-            event.current_buffer.insert_text("\n")
-
-        @kb.add("escape", "enter")  # Alt-Enter – works on non-Windows terminals
         def _(event):  # type: ignore[no-untyped-def]
             event.current_buffer.insert_text("\n")
 
@@ -4513,19 +4579,12 @@ class Orchestrator:
             except ValueError:
                 pass
 
-        # Escape clears the whole input buffer. On Windows, use eager
-        # so it fires instantly — the non-eager version required 2-3
-        # presses because each one restarted prompt_toolkit's key-
-        # sequence timeout. Alt-Enter is intercepted by Windows
-        # Terminal for fullscreen anyway, so losing it is fine.
-        # On Linux/macOS, Alt+key combos are sent as Escape + key, so
-        # eager Escape would break Alt+Enter (newline). Use non-eager
-        # there to preserve it — the extra press is less annoying when
-        # the timeout is shorter (most Unix terminals use ~50-100ms vs
-        # prompt_toolkit's default ~500ms).
-        _esc_eager = sys.platform == "win32"
-
-        @kb.add("escape", eager=_esc_eager)
+        # Escape clears the whole input buffer.  Always eager so it fires
+        # instantly without waiting for prompt_toolkit's key-sequence
+        # timeout (~500ms).  This sacrifices Alt+Enter (Esc then Enter)
+        # as a newline shortcut, but Ctrl+J / Shift+Enter are available
+        # and more reliable across terminals anyway.
+        @kb.add("escape", eager=True)
         def _(event):  # type: ignore[no-untyped-def]
             event.current_buffer.reset()
 
@@ -4539,19 +4598,19 @@ class Orchestrator:
         # history-backward, which isn't what we want.
         #
         # We emulate "visual row" navigation by jumping the cursor
-        # by one VISUAL-row's worth of characters. prompt_toolkit
-        # indents continuation (wrapped) lines by `prompt_w` cols so
-        # they visually align under the first row — which means every
-        # visual row has effective width `term_w - prompt_w`. Jumping
+        # by one VISUAL-row's worth of characters. The get_line_prefix
+        # callback indents every visual row by `_PROMPT_WIDTH` cols so
+        # the effective text width is `term_w - _PROMPT_WIDTH`. Jumping
         # by that delta preserves the visual column on the new row.
         # When we can't step within the current logical line, fall
         # through to `cursor_up` / `cursor_down` for real multi-line
         # navigation.
-        _PROMPT_WIDTH = 2  # `"> "` at the left edge of every visual row
+        _PROMPT_WIDTH = 2  # `"> "` / `"  "` at the left edge of every visual row
 
         @kb.add("up", eager=True)
         def _(event):  # type: ignore[no-untyped-def]
             buf = event.app.current_buffer
+            buf.selection_state = None
             if buf.complete_state:
                 buf.complete_previous(count=event.arg)
                 return
@@ -4578,17 +4637,11 @@ class Orchestrator:
         @kb.add("down", eager=True)
         def _(event):  # type: ignore[no-untyped-def]
             buf = event.app.current_buffer
+            buf.selection_state = None
             if buf.complete_state:
                 buf.complete_next(count=event.arg)
                 return
             doc = buf.document
-            # Empirical calibration: `term_w - 2` = 2 left of target,
-            # `term_w - 4` = 2 right of target. The linear midpoint is
-            # `term_w - 3`. Likely reason the offset is odd: the
-            # prompt wraps at an effective text width that's `term_w -
-            # (_PROMPT_WIDTH + 1)` — perhaps prompt_toolkit reserves
-            # an extra 1-col right margin to avoid the classic
-            # "last-column auto-wrap" terminal glitch.
             effective_w = max(1, _term_width() - _PROMPT_WIDTH - 1)
             col_in_line = doc.cursor_position_col
             line_len = len(doc.current_line)
@@ -4601,26 +4654,30 @@ class Orchestrator:
         # Left / Right: cross line boundaries so the cursor wraps from
         # column 0 to end-of-previous-line and from end-of-line to
         # start-of-next-line, rather than stopping at the edge.
-        # prompt_toolkit's default emacs-mode `backward-char` /
-        # `forward-char` should already do this, but some builds or
-        # terminal configurations restrict movement to the current
-        # logical line. Explicit bindings guarantee the behavior.
         @kb.add("left")
         def _(event):  # type: ignore[no-untyped-def]
             buf = event.app.current_buffer
+            if buf.selection_state is not None:
+                start = min(buf.cursor_position,
+                            buf.selection_state.original_cursor_position)
+                buf.selection_state = None
+                buf.cursor_position = start
+                return
             if buf.cursor_position > 0:
                 buf.cursor_position -= 1
 
         @kb.add("right")
         def _(event):  # type: ignore[no-untyped-def]
             buf = event.app.current_buffer
+            if buf.selection_state is not None:
+                end = max(buf.cursor_position,
+                          buf.selection_state.original_cursor_position)
+                buf.selection_state = None
+                buf.cursor_position = end
+                return
             if buf.cursor_position < len(buf.text):
                 buf.cursor_position += 1
 
-        # Home / End: go to start / end of the current LOGICAL line
-        # (delimited by \n), not the entire buffer. In a multi-line
-        # input, the default prompt_toolkit behavior jumps to the
-        # very first / very last character of the whole buffer.
         # Home / End: visual-row-aware, consistent with our Up/Down.
         # In a long single-line input that wraps visually, Home goes to
         # the start of the current *visual* row and End to the end of
@@ -4629,6 +4686,7 @@ class Orchestrator:
         @kb.add("home", eager=True)
         def _(event):  # type: ignore[no-untyped-def]
             buf = event.app.current_buffer
+            buf.selection_state = None
             doc = buf.document
             col = doc.cursor_position_col
             effective_w = max(1, _term_width() - _PROMPT_WIDTH - 1)
@@ -4638,6 +4696,7 @@ class Orchestrator:
         @kb.add("end", eager=True)
         def _(event):  # type: ignore[no-untyped-def]
             buf = event.app.current_buffer
+            buf.selection_state = None
             doc = buf.document
             col = doc.cursor_position_col
             line_len = len(doc.current_line)
@@ -4648,13 +4707,182 @@ class Orchestrator:
             )
             buf.cursor_position += (visual_row_end - col)
 
+        # ── Shift-selection bindings ──────────────────────────────
+        # Shift+movement starts/extends a selection; releasing Shift
+        # (any plain movement) clears it.  HighlightSelectionProcessor
+        # in BufferControl provides the visual highlighting.
+
+        def _ensure_selection(buf):  # type: ignore[no-untyped-def]
+            """Start a character selection if one isn't active."""
+            if buf.selection_state is None:
+                buf.start_selection()
+
+        @kb.add("s-left")
+        def _(event):  # type: ignore[no-untyped-def]
+            buf = event.app.current_buffer
+            _ensure_selection(buf)
+            if buf.cursor_position > 0:
+                buf.cursor_position -= 1
+
+        @kb.add("s-right")
+        def _(event):  # type: ignore[no-untyped-def]
+            buf = event.app.current_buffer
+            _ensure_selection(buf)
+            if buf.cursor_position < len(buf.text):
+                buf.cursor_position += 1
+
+        @kb.add("s-up", eager=True)
+        def _(event):  # type: ignore[no-untyped-def]
+            buf = event.app.current_buffer
+            _ensure_selection(buf)
+            doc = buf.document
+            effective_w = max(1, _term_width() - _PROMPT_WIDTH - 1)
+            col_in_line = doc.cursor_position_col
+            if col_in_line >= effective_w:
+                buf.cursor_position -= effective_w
+            elif doc.cursor_position_row > 0:
+                buf.cursor_up(count=event.arg)
+
+        @kb.add("s-down", eager=True)
+        def _(event):  # type: ignore[no-untyped-def]
+            buf = event.app.current_buffer
+            _ensure_selection(buf)
+            doc = buf.document
+            effective_w = max(1, _term_width() - _PROMPT_WIDTH - 1)
+            col_in_line = doc.cursor_position_col
+            line_len = len(doc.current_line)
+            if col_in_line + effective_w <= line_len:
+                buf.cursor_position += effective_w
+            elif doc.cursor_position_row < doc.line_count - 1:
+                buf.cursor_down(count=event.arg)
+
+        @kb.add("s-home", eager=True)
+        def _(event):  # type: ignore[no-untyped-def]
+            buf = event.app.current_buffer
+            _ensure_selection(buf)
+            doc = buf.document
+            col = doc.cursor_position_col
+            effective_w = max(1, _term_width() - _PROMPT_WIDTH - 1)
+            visual_row_start = (col // effective_w) * effective_w
+            buf.cursor_position -= (col - visual_row_start)
+
+        @kb.add("s-end", eager=True)
+        def _(event):  # type: ignore[no-untyped-def]
+            buf = event.app.current_buffer
+            _ensure_selection(buf)
+            doc = buf.document
+            col = doc.cursor_position_col
+            line_len = len(doc.current_line)
+            effective_w = max(1, _term_width() - _PROMPT_WIDTH - 1)
+            visual_row_end = min(
+                (col // effective_w + 1) * effective_w,
+                line_len,
+            )
+            buf.cursor_position += (visual_row_end - col)
+
+        # Ctrl+Shift+Left/Right: word-level selection.
+        @kb.add("c-s-left")
+        def _(event):  # type: ignore[no-untyped-def]
+            buf = event.app.current_buffer
+            _ensure_selection(buf)
+            pos = buf.document.find_previous_word_beginning(count=event.arg)
+            if pos:
+                buf.cursor_position += pos
+
+        @kb.add("c-s-right")
+        def _(event):  # type: ignore[no-untyped-def]
+            buf = event.app.current_buffer
+            _ensure_selection(buf)
+            pos = buf.document.find_next_word_ending(count=event.arg)
+            if pos:
+                buf.cursor_position += pos
+
         return kb
 
-    def _bottom_toolbar(self):  # returns HTML; multi-line per the layout
-        return HTML(_render_toolbar(self.state))
+    def _build_prompt_app(self, history_path: Path) -> None:
+        """Build the persistent Application, Buffer, and Layout.
 
-    def _prompt_message(self):
-        return HTML("<prompt>> </prompt>")
+        Unlike PromptSession (which creates a new Application per
+        prompt_async call), our Application stays alive for the entire
+        session.  The prompt and toolbar are rendered by our own layout
+        — not by prompt_toolkit's built-in ``bottom_toolbar`` /
+        ``message`` parameters.
+
+        Benefits:
+        * No ghost rows when the toolbar shrinks — both windows use
+          ``dont_extend_height=True`` so the HSplit is always the exact
+          right height.  No spacer window, no ``_min_available_height``
+          ratchet.
+        * No toolbar flicker or disappearance on ``/rename`` — the
+          Application never exits between inputs, so ``render_as_done``
+          never fires.
+        * No blank line before ``you:`` lines — ``render_as_done`` was
+          the source of the inconsistent extra newline.
+        """
+        completer = WordCompleter(SLASH_COMMANDS, ignore_case=True, sentence=False)
+
+        self._prompt_buffer = _PtkBuffer(
+            name="input",
+            history=FileHistory(str(history_path)),
+            completer=completer,
+            complete_while_typing=False,
+            multiline=True,
+            accept_handler=lambda buf: self._input_queue.put_nowait(buf.text),
+        )
+
+        def _get_line_prefix(
+            line_no: int, wrap_count: int
+        ) -> list[tuple[str, str]]:
+            """Prefix for each line: ``> `` on the first line, ``  ``
+            on continuation lines and wraps.  Replaces PromptSession's
+            ``message=`` parameter."""
+            if line_no == 0 and wrap_count == 0:
+                return [("class:prompt", "> ")]
+            return [("", "  ")]
+
+        input_window = _PtkWindow(
+            content=_PtkBufferControl(buffer=self._prompt_buffer),
+            dont_extend_height=True,
+            wrap_lines=True,
+            get_line_prefix=_get_line_prefix,
+        )
+
+        toolbar_window = _PtkWindow(
+            content=_PtkFormattedTextControl(
+                lambda: HTML(_render_toolbar(self.state))
+            ),
+            dont_extend_height=True,
+            style="class:bottom-toolbar",
+        )
+
+        layout = _PtkLayout(
+            _PtkFloatContainer(
+                content=_PtkHSplit([input_window, toolbar_window]),
+                floats=[
+                    _PtkFloat(
+                        xcursor=True,
+                        ycursor=True,
+                        content=_PtkCompletionsMenu(
+                            max_height=16, scroll_offset=1
+                        ),
+                    ),
+                ],
+            ),
+            focused_element=self._prompt_buffer,
+        )
+
+        self._prompt_app = _PtkApp(
+            layout=layout,
+            key_bindings=self._keybindings(),
+            style=STYLE,
+            full_screen=False,
+            refresh_interval=0.5,  # keep toolbar's live fields fresh
+        )
+        self._prompt_app._handle_exception = _async_exception_handler
+        # Give the _ScrollProxy (sys.stdout) a reference to the Application
+        # so it can coordinate erase → write → redraw synchronously.
+        if isinstance(sys.stdout, _ScrollProxy):
+            sys.stdout._app = self._prompt_app
 
     def print_help(self) -> None:
         print()
@@ -4688,6 +4916,7 @@ class Orchestrator:
         print("  /quit  /exit                    graceful exit (waits up to ~10s for CLI flush)")
         print("  /quit! /exit!                   force exit immediately (may lose last message)")
         print("Input: Enter submits.  Ctrl-J inserts a newline (multi-line input).")
+        print("       Ctrl-Z: undo.  Esc: clear input.  Ctrl-C: interrupt or clear.")
         print("Anything else is sent to Claude as a message.")
         print()
 
@@ -6204,7 +6433,7 @@ class Orchestrator:
         dim `[cli-err]` prefix so the user can see what the CLI is doing
         during slow startups or wedges. SDK calls this from the stderr-
         reader task (async context), so `print` here is fine under
-        `patch_stdout(raw=True)`."""
+        the _ScrollProxy stdout redirect."""
         line = line.rstrip()
         if not line:
             return
@@ -6840,18 +7069,12 @@ class Orchestrator:
         # Reset the streaming state explicitly so nothing from a prior
         # claude-text block bleeds into the echo (stale word buffer or
         # pending indent would drop/mangle the leading characters).
+        # With the persistent Application, all print() output goes
+        # through _ScrollProxy and appears above the prompt — no
+        # render_as_done blank-line issue.
         self._claude_col = 5
         self._claude_word_buf = ""
         self._claude_pending_indent = False
-        # NOTE: an earlier version used `\033[F\033[2K` here (cursor-up
-        # + erase-line) to reclaim a blank row that prompt_toolkit's
-        # `render_as_done` sometimes leaves between the `> ...` input
-        # and our `you:` echo. Removed because it over-erased: when
-        # prompt_toolkit *didn't* leave a blank row (varies by version
-        # and terminal), it nuked the `> ...` prompt text itself,
-        # making the user's original typed line disappear. A possible
-        # blank line is purely cosmetic; deleting the user's input
-        # echo is not.
         sys.stdout.write(f"{_C_CYAN}you:{_C_RESET} ")
         self._write_indented(prompt_text, 5, flush=True)
         self._flush_claude_text()
@@ -7010,7 +7233,7 @@ class Orchestrator:
                                 )
                     # End-of-AssistantMessage: flush a newline if we left
                     # an unterminated streamed-text line, otherwise
-                    # patch_stdout buffers it and the prompt redraws on
+                    # _ScrollProxy buffers it and the prompt redraws on
                     # top of the partial line.
                     if in_text:
                         self._flush_claude_text()
@@ -7282,19 +7505,33 @@ class Orchestrator:
         return True
 
     async def input_loop(self) -> None:
-        assert self.session is not None
+        assert self._prompt_app is not None
+        # Run the persistent Application in a background task.  It stays
+        # alive for the entire session: prompt and toolbar remain visible,
+        # keystrokes flow through keybindings → accept_handler → queue.
+        app_task: asyncio.Task[None] = asyncio.create_task(
+            self._prompt_app.run_async(), name="prompt-app"
+        )
         try:
             while not self.stop_event.is_set():
                 try:
-                    line = await self.session.prompt_async()
-                except EOFError:
-                    break
-                except KeyboardInterrupt:
-                    continue  # should not happen with our c-c binding, be safe
-                if self.stop_event.is_set():
+                    line = await self._input_queue.get()
+                except asyncio.CancelledError:
                     break
                 if line is None:
-                    continue
+                    break  # EOF (Ctrl+D)
+                if self.stop_event.is_set():
+                    break
+                # Echo submitted text into scrollback.  Replaces the
+                # "> <text>" that prompt_toolkit's render-as-done used to
+                # leave behind when the Application exited per input.
+                # Goes through _ScrollProxy → appears above the prompt.
+                if line.strip():
+                    _echo_parts = line.split("\n")
+                    _echo = _echo_parts[0]
+                    for _ep in _echo_parts[1:]:
+                        _echo += f"\n  {_ep}"
+                    print(f"{_C_CYAN}>{_C_RESET} {_echo}")
                 # Intercept input as a permission response when the SDK's
                 # can_use_tool callback is waiting on us. The line won't
                 # be routed anywhere else — it resolves the Future and
@@ -7482,6 +7719,14 @@ class Orchestrator:
             # also armed one, we end up with two running, whichever
             # fires first kills the process.
             _arm_shutdown_watchdog(25.0)
+            # Shut down the persistent Application so the terminal is
+            # restored to its normal state.
+            if self._prompt_app is not None and self._prompt_app.is_running:
+                self._prompt_app.exit()
+            try:
+                await app_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
 
     # ---- main worker loop ---------------------------------------------
 
@@ -8000,8 +8245,8 @@ class Orchestrator:
                 f"Then start the orchestrator again.{_C_RESET}"
             )
             return
-        # Resolve --resume FIRST (before PromptSession & history file are
-        # created and before we connect), so a session whose recorded cwd
+        # Resolve --resume FIRST (before the prompt Application & history
+        # file are created and before we connect), so a session whose cwd
         # differs from --cwd can switch us cleanly.
         if self.args.resume == _PICKER_SENTINEL:
             chosen = await self._pick_session()
@@ -8045,30 +8290,7 @@ class Orchestrator:
                 history_jsonl = find_most_recent_session_for_cwd(self.args.cwd)
 
         history_path = Path(self.args.cwd) / ".orchestrator_history"
-        completer = WordCompleter(SLASH_COMMANDS, ignore_case=True, sentence=False)
-        self.session = PromptSession(
-            message=self._prompt_message,
-            history=FileHistory(str(history_path)),
-            key_bindings=self._keybindings(),
-            completer=completer,
-            complete_while_typing=False,
-            bottom_toolbar=self._bottom_toolbar,
-            style=STYLE,
-            multiline=True,  # Ctrl-J newline, Enter submit (see keybindings)
-            refresh_interval=0.5,  # keep toolbar's busy/ctx/cost fields fresh
-        )
-
-        # Ghost-row fix: when the toolbar shrinks, `_render_toolbar`
-        # nulls `renderer._last_screen` so the diff algorithm treats
-        # the frame as a first-render (erase_down + full repaint).
-        global _toolbar_renderer  # noqa: PLW0603
-        _toolbar_renderer = self.session.app.renderer
-
-        # prompt_toolkit's prompt_async() reinstalls Application._handle_exception
-        # as the loop's exception handler each turn, which would override the
-        # one we set in _amain. Override the instance attribute so its lookup
-        # picks up our handler (logs to orchestrator.log + brief notice).
-        self.session.app._handle_exception = _async_exception_handler
+        self._build_prompt_app(history_path)
 
         tool_summary = (
             "all Claude Code tools (Read, Write, Edit, Glob, Grep, Bash "
@@ -8083,7 +8305,7 @@ class Orchestrator:
         print("=" * 78)
         print(" Claude Orchestrator")
         print("  - type + Enter to send; Tab completes /commands")
-        print("  - Ctrl-C: interrupt turn / clear input (never exits — use /exit)")
+        print("  - Ctrl-C: interrupt turn / clear input   Ctrl-Z: undo   Esc: clear input")
         print("  - Ctrl-D: exit")
         if self.args.auto_continue:
             ac_summary = (
@@ -8690,7 +8912,7 @@ def _async_exception_handler(
         f"{_EXCEPTION_LOG_PATH.name}]{_C_RESET}"
     )
     try:
-        # patch_stdout(raw=True) is active during run(), so plain print
+        # _ScrollProxy is active during run(), so plain print
         # is buffered safely between renderer frames.
         print(notice)
     except Exception:  # noqa: BLE001
@@ -8709,11 +8931,15 @@ async def _amain() -> None:
     # Route uncaught asyncio exceptions to orchestrator.log with a brief
     # on-screen notice instead of the default multi-line traceback dump.
     # (Application-level override happens in Orchestrator.run() after the
-    # PromptSession is created -- see _install_pt_exception_override.)
+    # prompt Application is created -- see _build_prompt_app.)
     asyncio.get_running_loop().set_exception_handler(_async_exception_handler)
     orch = Orchestrator(args)
-    with patch_stdout(raw=True):
+    _proxy = _ScrollProxy()
+    sys.stdout = _proxy
+    try:
         await orch.run()
+    finally:
+        sys.stdout = sys.__stdout__
 
 
 def _enable_windows_ansi() -> None:
