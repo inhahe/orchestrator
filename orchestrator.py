@@ -441,6 +441,7 @@ class _ScrollProxy:
         self._app: _PtkApp | None = None
         self._buf: list[str] = []
         self.encoding: str = getattr(sys.__stdout__, "encoding", "utf-8")
+        self._last_flush_nl: bool = False
 
     # ── file-like interface ──────────────────────────────────────
     def write(self, data: str) -> int:
@@ -454,17 +455,40 @@ class _ScrollProxy:
             return
         text = "".join(self._buf)
         self._buf.clear()
+        if not text:
+            return
 
         app = self._app
         if app is not None and app.is_running:
-            # Synchronous: erase → write → redraw.
-            # renderer.erase() calls reset() internally, so no separate
-            # reset() call needed.
-            app.renderer.erase()
-            app.output.write_raw(text)
-            app.output.flush()
+            # Only write *complete* lines (up to the last \n).
+            # Text after the last \n stays in the buffer — otherwise
+            # the toolbar re-render overwrites the partial line
+            # (the renderer starts from column 0 of the same row).
+            last_nl = text.rfind("\n")
+            if last_nl < 0:
+                # No newline at all — put everything back.
+                self._buf.append(text)
+                return
+            to_write = text[: last_nl + 1]
+            remainder = text[last_nl + 1 :]
+            if remainder:
+                self._buf.append(remainder)
+
+            output = app.output
+            # Suppress the intermediate output.flush() calls inside
+            # renderer.erase() (and its internal reset()) so that
+            # erase + text + toolbar-redraw all reach the terminal in
+            # a single flush — no frame where the toolbar is blank.
+            _real_flush = output.flush
+            output.flush = lambda: None
+            try:
+                app.renderer.erase()
+            finally:
+                output.flush = _real_flush
+            output.write_raw(to_write)
             app._request_absolute_cursor_position()
-            app._redraw()
+            app._redraw()  # renderer.render() flushes once at the end
+            self._last_flush_nl = True  # to_write always ends with \n
         else:
             sys.__stdout__.write(text)
             sys.__stdout__.flush()
@@ -4436,6 +4460,21 @@ class Orchestrator:
         col = getattr(self, "_claude_col", 0)
         word = getattr(self, "_claude_word_buf", "")
         pending_indent = getattr(self, "_claude_pending_indent", False)
+
+        # After a proxy flush whose text ended with \n, the physical
+        # cursor sits at column 0 of a fresh line — but _claude_col
+        # still holds whatever the previous _write_indented call left.
+        # Reset col to match reality.  The extra guard `not proxy._buf`
+        # skips the reset when unflushed text (like "claude: ") is
+        # sitting in the buffer — that text precedes ours in the same
+        # flush, so the logical col from _claude_col is still correct.
+        proxy = sys.stdout
+        if (isinstance(proxy, _ScrollProxy)
+                and proxy._last_flush_nl
+                and not proxy._buf):
+            col = 0
+            pending_indent = True
+
         pad = " " * indent
         out: list[str] = []
 
@@ -4495,6 +4534,13 @@ class Orchestrator:
         if flush:
             emit_word(word)
             word = ""
+            # Include the trailing newline so it ships in the same
+            # _ScrollProxy flush as the text — a standalone "\n" flush
+            # would create a visible blank line via erase→write→redraw.
+            if col != 0:
+                out.append("\n")
+                col = 0
+                pending_indent = False
         self._claude_col = col
         self._claude_word_buf = word
         self._claude_pending_indent = pending_indent
@@ -4879,10 +4925,25 @@ class Orchestrator:
             refresh_interval=0.5,  # keep toolbar's live fields fresh
         )
         self._prompt_app._handle_exception = _async_exception_handler
-        # Give the _ScrollProxy (sys.stdout) a reference to the Application
-        # so it can coordinate erase → write → redraw synchronously.
-        if isinstance(sys.stdout, _ScrollProxy):
-            sys.stdout._app = self._prompt_app
+
+        # Ghost-row prevention: prompt_toolkit's renderer ratchets
+        # _min_available_height upward (never shrinks).  When the toolbar
+        # loses rows the renderer pads with blank lines at the bottom.
+        # Resetting to 0 before each redraw lets the layout use the
+        # actual height; the diff against _last_screen clears old rows.
+        _orig_redraw = self._prompt_app._redraw
+        def _capped_redraw() -> None:
+            self._prompt_app.renderer._min_available_height = 0
+            _orig_redraw()
+        self._prompt_app._redraw = _capped_redraw
+
+        # Install _ScrollProxy on sys.stdout AFTER the Application is
+        # created.  The Application already captured real stdout for its
+        # own rendering; the proxy only intercepts print() calls and
+        # coordinates erase → write → redraw through the renderer.
+        _proxy = _ScrollProxy()
+        _proxy._app = self._prompt_app
+        sys.stdout = _proxy
 
     def print_help(self) -> None:
         print()
@@ -8934,12 +8995,13 @@ async def _amain() -> None:
     # prompt Application is created -- see _build_prompt_app.)
     asyncio.get_running_loop().set_exception_handler(_async_exception_handler)
     orch = Orchestrator(args)
-    _proxy = _ScrollProxy()
-    sys.stdout = _proxy
     try:
         await orch.run()
     finally:
-        sys.stdout = sys.__stdout__
+        # _build_prompt_app installs _ScrollProxy on sys.stdout after
+        # the Application captures real stdout for its own rendering.
+        if sys.stdout is not sys.__stdout__:
+            sys.stdout = sys.__stdout__
 
 
 def _enable_windows_ansi() -> None:
