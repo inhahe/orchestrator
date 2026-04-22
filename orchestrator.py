@@ -1612,10 +1612,31 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
         # symmetrically with the completion message below. "bg-task"
         # carries the "this is a background task" signal; "▶ started"
         # is the status pair that matches "✓ completed" etc. on exit.
-        # The name/description is always shown (including local_bash)
-        # — it's Claude's human-readable label, not the raw command.
+        # Name/description: include in the label only if it fits on
+        # one line (compact). If too long or multi-line, show a size
+        # hint instead — consistent with how other compact tools behave.
         seq_prefix = _call_seq_prefix(seq, letter="b") if isinstance(seq, int) else ""
-        label_suffix = f" -- {name}" if name else ""
+        is_full = state.show_tasks in ("full", "full+output")
+        label_suffix = ""
+        if name:
+            flat_name = name.replace("\n", " ").strip()
+            if is_full:
+                label_suffix = f" -- {flat_name}"
+            else:
+                # Trial-fit: would the label fit on one line?
+                trial_base = (
+                    f"{seq_prefix}{_C_MAGENTA}bg-task {_mark('start')} started{_C_RESET} "
+                    f"{_C_DESC}-- {task_type} -- {flat_name}{_C_RESET}"
+                )
+                if (
+                    "\n" not in name
+                    and _visible_len(trial_base) <= _term_width()
+                ):
+                    label_suffix = f" -- {flat_name}"
+                else:
+                    label_suffix = (
+                        f"  {_C_DIM}({_humanize_size(name)}){_C_RESET}"
+                    )
         # MAGENTA carries the "bg-task started" signal; everything
         # past that (task_type + optional name) is supporting context,
         # dimmed to DESC so only the status pair stands out.
@@ -1623,7 +1644,6 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
         #   compact → only if single-line and fits terminal width
         #   full/full+output → always (even if it overflows)
         cmd_suffix = ""
-        is_full = state.show_tasks in ("full", "full+output")
         if task_type == "local_bash":
             tu_id = d.get("tool_use_id")
             if tu_id:
