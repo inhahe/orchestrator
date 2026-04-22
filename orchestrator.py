@@ -1190,6 +1190,8 @@ SLASH_COMMANDS = [
     "/effort",
     "/thinking",
     "/model",
+    "/connect",
+    "/reconnect",
     "/rename",
     "/auto",
     "/burst",
@@ -1675,6 +1677,8 @@ def classify(line: str) -> tuple[str, str]:
         return "clear-screen", ""
     if cmd in ("cost", "cwd"):
         return "status", ""
+    if cmd in ("connect", "reconnect"):
+        return "connect", ""
     # Unknown slash command — report an error instead of silently
     # forwarding to the SDK.
     return "error", f"unknown command /{cmd} (try /help)"
@@ -5477,6 +5481,7 @@ class Orchestrator:
         print(f"  /effort <level>                 one of {', '.join(EFFORT_CHOICES)}  (auto = no override)")
         print("  /thinking [on|off|toggle]       enable/disable API-level extended thinking (reconnects)")
         print("  /model <name>                   e.g. claude-opus-4-6, claude-sonnet-4-6")
+        print("  /connect                        reconnect to the CLI (if disconnected)")
         print("  /rename <name>                  set a custom title for this session")
         print("  /auto [on|off|toggle]           enable/disable autonomous continue prompting")
         print("  /burst N [T]                    set continue-burst limit (and window seconds)")
@@ -8535,6 +8540,11 @@ class Orchestrator:
                 await self._reconnect()
             elif kind == "model-show":
                 self.show_model_info()
+            elif kind == "connect":
+                if self.state.session_id:
+                    await self._reconnect()
+                else:
+                    await self._connect()
             # loop and keep waiting
 
     async def worker_loop(self) -> None:
