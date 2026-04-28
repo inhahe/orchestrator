@@ -14,7 +14,7 @@ Parity with Claude Code:
   * Resumes the last session in cwd by default (`--no-continue` to start fresh).
 
 Install:
-    pip install claude-agent-sdk prompt_toolkit
+    pip install claude-agent-sdk prompt_toolkit   # prompt_toolkit only used for --resume session picker
 
 Run:
     python orchestrator.py                         # resume last session, interactive
@@ -101,22 +101,8 @@ try:  # Native session rename — present on recent SDKs.
     from claude_agent_sdk import rename_session as _sdk_rename_session  # type: ignore
 except ImportError:  # pragma: no cover — older SDK
     _sdk_rename_session = None  # type: ignore[assignment]
-from prompt_toolkit.application import Application as _PtkApp
-from prompt_toolkit.buffer import Buffer as _PtkBuffer
-from prompt_toolkit.completion import WordCompleter
-from prompt_toolkit.formatted_text import HTML
-from prompt_toolkit.history import FileHistory
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import Layout as _PtkLayout
-from prompt_toolkit.layout.containers import (
-    Float as _PtkFloat,
-    FloatContainer as _PtkFloatContainer,
-    HSplit as _PtkHSplit,
-    Window as _PtkWindow,
-)
-from prompt_toolkit.layout.controls import BufferControl as _PtkBufferControl
-from prompt_toolkit.layout.menus import CompletionsMenu as _PtkCompletionsMenu
-from prompt_toolkit.styles import Style
+# prompt_toolkit is only used for the interactive session picker (_pick_item);
+# the main input loop uses _InputWidget / _PlatformKeyReader instead.
 
 #
 # ANSI colour scheme for scrollback output.
@@ -435,7 +421,7 @@ class _ScrollProxy:
     """
 
     def __init__(self) -> None:
-        self._app: _PtkApp | None = None
+        self._widget: _InputWidget | None = None
         self._buf: list[str] = []
         self.encoding: str = getattr(sys.__stdout__, "encoding", "utf-8")
         self._last_flush_nl: bool = False
@@ -447,14 +433,6 @@ class _ScrollProxy:
             self.flush()
         return len(data)
 
-    def write_deferred(self, data: str) -> None:
-        """Append *data* to the buffer without triggering an automatic
-        flush.  Used to batch text that should ship in the *next*
-        flush together with whatever follows it — e.g. the ``> echo``
-        line and the ``you:`` line go out in one atomic
-        erase→write→redraw cycle."""
-        self._buf.append(data)
-
     def flush(self) -> None:
         if not self._buf:
             return
@@ -463,15 +441,13 @@ class _ScrollProxy:
         if not text:
             return
 
-        app = self._app
-        if app is not None and app.is_running:
+        widget = self._widget
+        if widget is not None and widget.is_running:
             # Only write *complete* lines (up to the last \n).
-            # Text after the last \n stays in the buffer — otherwise
-            # the toolbar re-render overwrites the partial line
-            # (the renderer starts from column 0 of the same row).
+            # Text after the last \n stays in the buffer — the next
+            # redraw would overwrite a partial line.
             last_nl = text.rfind("\n")
             if last_nl < 0:
-                # No newline at all — put everything back.
                 self._buf.append(text)
                 return
             to_write = text[: last_nl + 1]
@@ -479,21 +455,10 @@ class _ScrollProxy:
             if remainder:
                 self._buf.append(remainder)
 
-            output = app.output
-            # Suppress the intermediate output.flush() calls inside
-            # renderer.erase() (and its internal reset()) so that
-            # erase + text + toolbar-redraw all reach the terminal in
-            # a single flush — no frame where the toolbar is blank.
-            _real_flush = output.flush
-            output.flush = lambda: None
-            try:
-                app.renderer.erase()
-            finally:
-                output.flush = _real_flush
-            output.write_raw(to_write)
-            app._request_absolute_cursor_position()
-            app._redraw()  # renderer.render() flushes once at the end
-            self._last_flush_nl = True  # to_write always ends with \n
+            widget.erase()
+            sys.__stdout__.write(to_write)
+            widget.redraw()                     # redraws input + toolbar
+            self._last_flush_nl = True
         else:
             sys.__stdout__.write(text)
             sys.__stdout__.flush()
@@ -524,7 +489,7 @@ class _ToolbarRenderer:
     cursor positioning and ANSI SGR colour sequences.
 
     This eliminates ghost rows entirely: the toolbar is never part of
-    prompt_toolkit's rendered area, so there is no "reserved space" that
+    the input widget's rendered area, so there is no "reserved space" that
     the terminal can fail to un-reserve when the toolbar shrinks.
     """
 
@@ -673,8 +638,8 @@ class _ToolbarRenderer:
     def _set_scroll_region(self, n_rows: int, writer: Any) -> None:
         """Set DECSTBM to reserve ``n_rows`` at the bottom for the toolbar.
 
-        ``writer`` must expose either ``write_raw`` (prompt_toolkit output)
-        or ``write`` (plain file).
+        ``writer`` must expose either ``write_raw`` or ``write``
+        (plain file).
         """
         rows = shutil.get_terminal_size().lines
         top_bound = max(1, rows - n_rows)
@@ -724,94 +689,18 @@ class _ToolbarRenderer:
         sys.__stdout__.write("\x1b[r")
         sys.__stdout__.flush()
 
-    # ── pre-render region adjustment ────────────────────────────────
-
-    def pre_render_adjust(self, output: Any, renderer: Any) -> str:
-        """Compute toolbar HTML, adjust scroll region if the height
-        changed, and return the HTML for ``paint_html`` to use.
-
-        **Must be called BEFORE ``_orig_redraw()``** so that
-        prompt_toolkit renders within the correct scroll region.
-
-        When the toolbar *grows*, the content in the scroll region is
-        scrolled up (via ``\\n`` at the bottom margin) so the input
-        prompt stays above the new, larger toolbar.  The renderer's
-        cursor state is reset to force a fresh render from the correct
-        position.
-        """
-        html = _render_toolbar(self._state)
-        lines = html.split("\n")
-        new_h = len(lines) if lines != [""] else 0
-        old_h = self._height
-
-        if new_h == old_h and self._active:
-            return html  # nothing to adjust
-
-        rows = shutil.get_terminal_size().lines
-
-        if self._active and new_h > old_h:
-            # ── toolbar growing ─────────────────────────────────
-            delta = new_h - old_h
-            old_bottom = rows - old_h
-            # Scroll content UP by delta within the *current* region so
-            # the prompt doesn't end up under the new toolbar.
-            output.write_raw(f"\x1b[{old_bottom};1H")
-            output.write_raw("\n" * delta)
-            # Now update the region to the new (smaller) size.
-            self._height = new_h
-            self._set_scroll_region(new_h, output)
-            # Move cursor to the bottom of the *new* scroll region and
-            # force a fresh render.  The content has shifted, so the
-            # incremental diff would be wrong.
-            new_bottom = rows - new_h
-            output.write_raw(f"\x1b[{new_bottom};1H")
-            from prompt_toolkit.data_structures import Point
-            renderer._cursor_pos = Point(x=0, y=0)
-            renderer._last_screen = None
-        elif self._active and new_h < old_h:
-            # ── toolbar shrinking ───────────────────────────────
-            delta = old_h - new_h
-            self._height = new_h
-            self._set_scroll_region(new_h, output)
-            # SD (Scroll Down): shift content in the *new* (larger) region
-            # down by delta rows.  This fills the freed rows with content
-            # from above, so there is no visible gap between the last
-            # output line and the toolbar.
-            output.write_raw(f"\x1b[{delta}T")
-            # Reposition cursor at the bottom of the new region and
-            # force a fresh render — the content shifted.
-            new_bottom = rows - new_h
-            output.write_raw(f"\x1b[{new_bottom};1H")
-            from prompt_toolkit.data_structures import Point
-            renderer._cursor_pos = Point(x=0, y=0)
-            renderer._last_screen = None
-        elif not self._active and new_h > 0:
-            # ── first activation ────────────────────────────────
-            self._height = new_h
-            self._active = True
-            self._set_scroll_region(new_h, output)
-
-        return html
-
     # ── painting ────────────────────────────────────────────────────
 
     def _line_base_sgr(self, line: str) -> str:
-        """Determine the base SGR for a toolbar line.
-
-        ``<panel-hint>``-wrapped lines get their own dark background;
-        everything else gets the standard toolbar background.
-        """
-        stripped = line.lstrip()
-        if stripped.startswith("<panel-hint"):
-            return self._sgr_map.get("panel-hint", "")
+        """Determine the base SGR for a toolbar line."""
         return self._sgr_map.get("bottom-toolbar", "")
 
     def paint_html(self, output: Any, html: str) -> None:
         """Paint pre-computed toolbar *html* to *output*.
 
-        The scroll region must already be correct (see
-        ``pre_render_adjust``).  Call **before** ``output.flush()``
-        so paint is batched with the render.
+        The scroll region must already be correct.
+        Call **before** ``output.flush()`` so paint is batched with
+        the render.
         """
         lines = html.split("\n")
         n = len(lines) if lines != [""] else 0
@@ -838,8 +727,7 @@ class _ToolbarRenderer:
     def paint_direct(self) -> None:
         """Paint the toolbar directly to ``sys.__stdout__``.
 
-        Useful for contexts where the prompt_toolkit output is unavailable
-        (e.g. ``/cls``)."""
+        Useful for standalone repaints (e.g. ``/cls``)."""
         html = _render_toolbar(self._state)
         lines = html.split("\n")
         n = len(lines) if lines != [""] else 0
@@ -870,77 +758,917 @@ class _ToolbarRenderer:
         out.flush()
 
 
-# ── Shift-Enter / Ctrl-Enter → newline patch ─────────────────────
-def _patch_enter_modifiers(app: "_PtkApp") -> None:
-    """Make Shift-Enter and Ctrl-Enter insert a newline (Ctrl-J) instead
-    of submitting.
+# ── Custom terminal input (replaces prompt_toolkit) ────────────
+# Reads keystrokes directly via Win32 console API (Windows) or
+# raw termios + VT100 escape parsing (Linux/macOS).  Benefits:
+#  - Zero-delay Escape (no ambiguity timeout)
+#  - True Shift+Enter / Ctrl+Enter via native modifier flags
+#  - No background renderer timer → no ghost blank rows
+#  - No height-ratchet or reserve-space bugs
+#  - _ScrollProxy becomes simple erase → write → redraw
 
-    prompt_toolkit 3.0 has no ``ShiftEnter`` key, so key bindings like
-    ``s-enter`` silently fail.  Instead we patch the two input layers:
+_INPUT_PREFIX_W = 2  # "> " or "  " — always 2 visible cols
 
-    * **Win32 console** – the ``ConsoleInputReader`` receives real
-      modifier flags but the shift-mapping table omits ``ControlM``
-      (Enter).  We wrap ``_event_to_key_presses`` to remap
-      ``ControlM → ControlJ`` when Shift or Ctrl is held.
 
-    * **VT100 / ANSI** – terminals that support ``modifyOtherKeys`` send
-      ``\\e[27;2;13~`` (Shift-Enter), ``\\e[27;5;13~`` (Ctrl-Enter),
-      etc.  prompt_toolkit maps these to ``ControlM`` (same as plain
-      Enter).  We patch the table so they map to ``ControlJ`` instead.
-    """
-    from prompt_toolkit.keys import Keys
+@dataclass(slots=True)
+class _KeyPress:
+    key: str        # e.g. "char", "enter", "escape", "shift+left", "ctrl+c"
+    data: str = ""  # the character for printable keys ("char")
 
-    # ── VT100 / ANSI escape sequences ────────────────────────────
-    try:
-        from prompt_toolkit.input.ansi_escape_sequences import (
-            ANSI_SEQUENCES,
-        )
-        _ENTER_MOD_SEQS = (
-            "\x1b[27;2;13~",   # Shift + Enter
-            "\x1b[27;5;13~",   # Ctrl + Enter
-            "\x1b[27;6;13~",   # Ctrl + Shift + Enter
-        )
-        for seq in _ENTER_MOD_SEQS:
-            if seq in ANSI_SEQUENCES:
-                ANSI_SEQUENCES[seq] = Keys.ControlJ
-    except Exception:  # noqa: BLE001
-        pass
 
-    # ── Win32 console input ──────────────────────────────────────
-    if sys.platform != "win32":
-        return
-    try:
-        inp = app.input
-        reader = getattr(inp, "console_input_reader", None)
-        if reader is None:
+# ── Platform key reader ────────────────────────────────────────
+
+if sys.platform == "win32":
+    import ctypes as _ct
+    import ctypes.wintypes as _wt
+
+    class _KEY_EVENT_RECORD(_ct.Structure):
+        _fields_ = [
+            ("bKeyDown", _wt.BOOL),
+            ("wRepeatCount", _wt.WORD),
+            ("wVirtualKeyCode", _wt.WORD),
+            ("wVirtualScanCode", _wt.WORD),
+            ("uChar", _ct.c_wchar),
+            ("dwControlKeyState", _wt.DWORD),
+        ]
+
+    class _INPUT_RECORD_UNION(_ct.Union):
+        _fields_ = [("KeyEvent", _KEY_EVENT_RECORD),
+                     ("_pad", _ct.c_byte * 16)]
+
+    class _INPUT_RECORD(_ct.Structure):
+        _fields_ = [("EventType", _wt.WORD),
+                     ("Event", _INPUT_RECORD_UNION)]
+
+    _VK_MAP: dict[int, str] = {
+        0x08: "backspace", 0x09: "tab", 0x0D: "enter",
+        0x1B: "escape", 0x21: "page_up", 0x22: "page_down",
+        0x23: "end", 0x24: "home", 0x25: "left", 0x26: "up",
+        0x27: "right", 0x28: "down", 0x2E: "delete",
+    }
+    _W32_SHIFT = 0x0010
+    _W32_LCTRL = 0x0008
+    _W32_RCTRL = 0x0004
+    _W32_LALT  = 0x0002
+    _W32_RALT  = 0x0001
+
+    class _PlatformKeyReader:
+        """Read key events via Win32 ``ReadConsoleInputW``."""
+
+        def __init__(self) -> None:
+            self._k32 = _ct.windll.kernel32
+            self._h = self._k32.GetStdHandle(_wt.DWORD(0xFFFFFFF6))  # STD_INPUT
+            self._orig_mode = _wt.DWORD()
+            self._k32.GetConsoleMode(self._h, _ct.byref(self._orig_mode))
+            # Raw: no echo, no line input, no processed input.
+            # ENABLE_WINDOW_INPUT (0x0008) so resize events still arrive.
+            self._k32.SetConsoleMode(self._h, _wt.DWORD(0x0008))
+            # VT processing on stdout for ANSI escapes.
+            _oh = self._k32.GetStdHandle(_wt.DWORD(0xFFFFFFF5))  # STD_OUTPUT
+            _om = _wt.DWORD()
+            self._k32.GetConsoleMode(_oh, _ct.byref(_om))
+            self._k32.SetConsoleMode(_oh, _wt.DWORD(_om.value | 0x0004))
+            self._closed = False
+
+        def read_key_sync(self, timeout_ms: int = 500) -> _KeyPress | None:
+            if self._closed:
+                return None
+            if self._k32.WaitForSingleObject(self._h, _wt.DWORD(timeout_ms)) != 0:
+                return None  # timeout
+            rec = _INPUT_RECORD()
+            n = _wt.DWORD()
+            if not self._k32.ReadConsoleInputW(
+                self._h, _ct.byref(rec), _wt.DWORD(1), _ct.byref(n)
+            ):
+                return None
+            if n.value == 0 or rec.EventType != 0x0001:
+                return None
+            ev = rec.Event.KeyEvent
+            if not ev.bKeyDown:
+                return None
+            return self._map(ev)
+
+        def _map(self, ev: _KEY_EVENT_RECORD) -> _KeyPress | None:
+            vk = ev.wVirtualKeyCode
+            ch = ev.uChar
+            cs = ev.dwControlKeyState
+            shift = bool(cs & _W32_SHIFT)
+            ctrl  = bool(cs & (_W32_LCTRL | _W32_RCTRL))
+            alt   = bool(cs & (_W32_LALT | _W32_RALT))
+            name = _VK_MAP.get(vk)
+            if name:
+                if name == "enter" and (shift or ctrl):
+                    return _KeyPress("shift+enter" if shift else "ctrl+enter", "\n")
+                pfx = ("ctrl+" if ctrl else "") + ("shift+" if shift else "") + ("alt+" if alt else "")
+                return _KeyPress(pfx + name)
+            if ctrl and not alt and 0x41 <= vk <= 0x5A:
+                return _KeyPress(f"ctrl+{chr(vk).lower()}")
+            if ch and ch >= " ":
+                return _KeyPress("char", ch)
+            return None
+
+        def close(self) -> None:
+            if not self._closed:
+                self._closed = True
+                self._k32.SetConsoleMode(self._h, self._orig_mode)
+
+else:  # ── POSIX ───────────────────────────────────────────────
+    import select as _sel
+    import termios as _termios
+    import tty as _tty
+
+    _VT_ESC_MAP: dict[str, str] = {
+        "[A": "up", "[B": "down", "[C": "right", "[D": "left",
+        "OA": "up", "OB": "down", "OC": "right", "OD": "left",
+        "[H": "home", "[F": "end", "OH": "home", "OF": "end",
+        "[2~": "insert", "[3~": "delete",
+        "[5~": "page_up", "[6~": "page_down",
+        # shift (mod 2)
+        "[1;2A": "shift+up", "[1;2B": "shift+down",
+        "[1;2C": "shift+right", "[1;2D": "shift+left",
+        "[1;2H": "shift+home", "[1;2F": "shift+end",
+        # ctrl (mod 5)
+        "[1;5A": "ctrl+up", "[1;5B": "ctrl+down",
+        "[1;5C": "ctrl+right", "[1;5D": "ctrl+left",
+        "[1;5H": "ctrl+home", "[1;5F": "ctrl+end",
+        # ctrl+shift (mod 6)
+        "[1;6A": "ctrl+shift+up", "[1;6B": "ctrl+shift+down",
+        "[1;6C": "ctrl+shift+right", "[1;6D": "ctrl+shift+left",
+        "[1;6H": "ctrl+shift+home", "[1;6F": "ctrl+shift+end",
+        # modifyOtherKeys
+        "[27;2;13~": "shift+enter", "[27;5;13~": "ctrl+enter",
+        "[27;6;13~": "ctrl+shift+enter",
+    }
+    _VT_CTRL_MAP: dict[str, str] = {
+        "\x01": "ctrl+a", "\x02": "ctrl+b", "\x03": "ctrl+c",
+        "\x04": "ctrl+d", "\x05": "ctrl+e", "\x06": "ctrl+f",
+        "\x08": "backspace", "\x09": "tab", "\x0a": "ctrl+j",
+        "\x0b": "ctrl+k", "\x0c": "ctrl+l", "\x0d": "enter",
+        "\x15": "ctrl+u", "\x16": "ctrl+v", "\x17": "ctrl+w",
+        "\x18": "ctrl+x", "\x19": "ctrl+y", "\x1a": "ctrl+z",
+        "\x7f": "backspace",
+    }
+
+    class _PlatformKeyReader:
+        """Read key events via raw termios + VT100 escape parsing."""
+
+        def __init__(self) -> None:
+            self._fd: int = sys.stdin.fileno()
+            self._old_attr = _termios.tcgetattr(self._fd)
+            _tty.setraw(self._fd, when=_termios.TCSANOW)
+            self._closed = False
+
+        def read_key_sync(self, timeout_ms: int = 500) -> _KeyPress | None:
+            if self._closed:
+                return None
+            if not _sel.select([self._fd], [], [], timeout_ms / 1000.0)[0]:
+                return None
+            b = os.read(self._fd, 1)
+            if not b:
+                return _KeyPress("ctrl+d")
+            first = b[0]
+            # Multi-byte UTF-8
+            if first >= 0xC0:
+                trail = (2 if first < 0xE0 else 3 if first < 0xF0 else 4) - 1
+                buf = bytearray(b)
+                for _ in range(trail):
+                    nb = os.read(self._fd, 1)
+                    if not nb:
+                        break
+                    buf.extend(nb)
+                return _KeyPress("char", buf.decode("utf-8", errors="replace"))
+            ch = chr(first)
+            if ch == "\x1b":
+                return self._read_escape()
+            name = _VT_CTRL_MAP.get(ch)
+            if name:
+                return _KeyPress(name, "\n" if name == "enter" else "")
+            if ch >= " ":
+                return _KeyPress("char", ch)
+            return None
+
+        def _read_escape(self) -> _KeyPress:
+            buf = ""
+            while _sel.select([self._fd], [], [], 0.005)[0]:
+                b = os.read(self._fd, 1)
+                if not b:
+                    break
+                buf += chr(b[0])
+            if not buf:
+                return _KeyPress("escape")
+            name = _VT_ESC_MAP.get(buf)
+            if name:
+                return _KeyPress(name, "\n" if "enter" in name else "")
+            return _KeyPress("escape")
+
+        def close(self) -> None:
+            if not self._closed:
+                self._closed = True
+                _termios.tcsetattr(self._fd, _termios.TCSAFLUSH, self._old_attr)
+
+
+# ── Edit buffer ────────────────────────────────────────────────
+
+class _EditBuffer:
+    """Editable text with cursor, selection, and file-backed history."""
+
+    def __init__(self, history_path: Path | None = None) -> None:
+        self.text: str = ""
+        self.cursor: int = 0
+        self.sel_anchor: int | None = None
+        self._hist: list[str] = []
+        self._hist_pos: int = -1
+        self._saved: str = ""
+        self._hist_path = history_path
+        self._undo: list[tuple[str, int]] = []
+        if history_path and history_path.exists():
+            self._load_history()
+
+    # ── history (prompt_toolkit-compatible format) ───────────
+    def _load_history(self) -> None:
+        try:
+            lines = self._hist_path.read_text(encoding="utf-8").splitlines()  # type: ignore[union-attr]
+        except OSError:
             return
-        _orig = reader._event_to_key_presses
+        entry: list[str] = []
+        for ln in lines:
+            if ln.startswith("+"):
+                entry.append(ln[1:])
+            elif entry:
+                self._hist.append("\n".join(entry))
+                entry = []
+        if entry:
+            self._hist.append("\n".join(entry))
 
-        SHIFT_PRESSED = 0x0010
-        LEFT_CTRL     = 0x0008
-        RIGHT_CTRL    = 0x0004
+    def save_to_history(self, text: str) -> None:
+        text = text.strip()
+        if not text:
+            return
+        if self._hist and self._hist[-1] == text:
+            return
+        self._hist.append(text)
+        if self._hist_path:
+            try:
+                with self._hist_path.open("a", encoding="utf-8") as f:
+                    f.write(f"\n# {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    for part in text.split("\n"):
+                        f.write(f"+{part}\n")
+            except OSError:
+                pass
 
-        def _patched(ev):  # type: ignore[no-untyped-def]
-            result = _orig(ev)
-            ctrl_state = ev.ControlKeyState
-            has_shift = bool(ctrl_state & SHIFT_PRESSED)
-            has_ctrl  = bool(
-                (ctrl_state & LEFT_CTRL) or (ctrl_state & RIGHT_CTRL)
-            )
-            if (has_shift or has_ctrl) and result:
-                # If the original handler returned Enter (ControlM) with
-                # a modifier held, swap to ControlJ (linefeed = newline).
-                # For Ctrl+Enter the handler returns [Escape, ControlJ]
-                # (meta-enter) — replace with plain ControlJ.
-                from prompt_toolkit.key_binding.key_processor import KeyPress
-                keys_in = {kp.key for kp in result}
-                if Keys.ControlM in keys_in or Keys.ControlJ in keys_in:
-                    return [KeyPress(Keys.ControlJ, "\n")]
-            return result
+    # ── undo ─────────────────────────────────────────────────
+    def _snap(self) -> None:
+        if not self._undo or self._undo[-1] != (self.text, self.cursor):
+            self._undo.append((self.text, self.cursor))
+            if len(self._undo) > 200:
+                self._undo = self._undo[-100:]
 
-        reader._event_to_key_presses = _patched
-    except Exception:  # noqa: BLE001
-        pass
+    def undo(self) -> None:
+        if self._undo:
+            self.text, self.cursor = self._undo.pop()
+            self.sel_anchor = None
+
+    # ── edits ────────────────────────────────────────────────
+    def insert(self, ch: str) -> None:
+        self._snap()
+        if self.sel_anchor is not None:
+            self.delete_selection()
+        self.text = self.text[:self.cursor] + ch + self.text[self.cursor:]
+        self.cursor += len(ch)
+
+    def delete_before(self, count: int = 1) -> None:
+        if self.sel_anchor is not None:
+            self.delete_selection(); return
+        if self.cursor <= 0:
+            return
+        self._snap()
+        n = min(count, self.cursor)
+        self.text = self.text[:self.cursor - n] + self.text[self.cursor:]
+        self.cursor -= n
+
+    def delete_after(self, count: int = 1) -> None:
+        if self.sel_anchor is not None:
+            self.delete_selection(); return
+        if self.cursor >= len(self.text):
+            return
+        self._snap()
+        n = min(count, len(self.text) - self.cursor)
+        self.text = self.text[:self.cursor] + self.text[self.cursor + n:]
+
+    def delete_selection(self) -> str:
+        if self.sel_anchor is None:
+            return ""
+        self._snap()
+        lo, hi = sorted((self.cursor, self.sel_anchor))
+        cut = self.text[lo:hi]
+        self.text = self.text[:lo] + self.text[hi:]
+        self.cursor = lo
+        self.sel_anchor = None
+        return cut
+
+    def selected_text(self) -> str:
+        if self.sel_anchor is None:
+            return ""
+        lo, hi = sorted((self.cursor, self.sel_anchor))
+        return self.text[lo:hi]
+
+    # ── line helpers ─────────────────────────────────────────
+    def _line_range(self) -> tuple[int, int]:
+        s = self.text.rfind("\n", 0, self.cursor)
+        s = s + 1 if s >= 0 else 0
+        e = self.text.find("\n", self.cursor)
+        return s, e if e >= 0 else len(self.text)
+
+    def _col(self) -> int:
+        s, _ = self._line_range()
+        return self.cursor - s
+
+    def _row(self) -> int:
+        return self.text[:self.cursor].count("\n")
+
+    def _nlines(self) -> int:
+        return self.text.count("\n") + 1
+
+    # ── cursor movement ──────────────────────────────────────
+    def move_left(self) -> None:
+        self.sel_anchor = None
+        if self.cursor > 0:
+            self.cursor -= 1
+
+    def move_right(self) -> None:
+        self.sel_anchor = None
+        if self.cursor < len(self.text):
+            self.cursor += 1
+
+    def move_word_left(self) -> None:
+        self.sel_anchor = None
+        p = self.cursor
+        while p > 0 and not self.text[p - 1].isalnum():
+            p -= 1
+        while p > 0 and self.text[p - 1].isalnum():
+            p -= 1
+        self.cursor = p
+
+    def move_word_right(self) -> None:
+        self.sel_anchor = None
+        p, n = self.cursor, len(self.text)
+        while p < n and not self.text[p].isalnum():
+            p += 1
+        while p < n and self.text[p].isalnum():
+            p += 1
+        self.cursor = p
+
+    def _at_wrap_boundary(self, ew: int, affinity: str) -> bool:
+        """True when cursor sits at a visual-wrap seam with backward affinity."""
+        col = self._col()
+        return affinity == "backward" and col > 0 and col % ew == 0
+
+    def move_up(self, ew: int, affinity: str = "forward") -> None:
+        self.sel_anchor = None
+        col = self._col()
+        if self._at_wrap_boundary(ew, affinity):
+            # At end of visual row N. Move up to end of row N-1.
+            if col > ew:
+                self.cursor -= ew
+            elif self._row() > 0:
+                s, _ = self._line_range()
+                pe = s - 1
+                ps = self.text.rfind("\n", 0, pe)
+                ps = ps + 1 if ps >= 0 else 0
+                self.cursor = ps + min(ew, pe - ps)
+        elif col >= ew:
+            self.cursor -= ew
+        elif self._row() > 0:
+            s, _ = self._line_range()
+            pe = s - 1
+            ps = self.text.rfind("\n", 0, pe)
+            ps = ps + 1 if ps >= 0 else 0
+            self.cursor = ps + min(col, pe - ps)
+
+    def move_down(self, ew: int, affinity: str = "forward") -> None:
+        self.sel_anchor = None
+        col = self._col()
+        s, e = self._line_range()
+        ll = e - s
+        if self._at_wrap_boundary(ew, affinity):
+            # At end of visual row. Target: end of next visual row.
+            next_start = col
+            if next_start < ll:
+                next_len = min(ew, ll - next_start)
+                self.cursor = s + next_start + next_len
+            elif self._row() < self._nlines() - 1:
+                ns = e + 1
+                ne = self.text.find("\n", ns)
+                ne = ne if ne >= 0 else len(self.text)
+                self.cursor = ns + min(ew, ne - ns)
+        elif col + ew <= ll:
+            self.cursor += ew
+        elif self._row() < self._nlines() - 1:
+            ns = e + 1
+            ne = self.text.find("\n", ns)
+            ne = ne if ne >= 0 else len(self.text)
+            self.cursor = ns + min(col, ne - ns)
+
+    def move_home(self, ew: int, affinity: str = "forward") -> None:
+        self.sel_anchor = None
+        col = self._col()
+        if self._at_wrap_boundary(ew, affinity):
+            self.cursor -= ew  # start of the visual row we're on
+        else:
+            self.cursor -= col % ew
+
+    def move_end(self, ew: int) -> None:
+        self.sel_anchor = None
+        col = self._col()
+        _, e = self._line_range()
+        s, _ = self._line_range()
+        ll = e - s
+        re = min((col // ew + 1) * ew, ll)
+        self.cursor += re - col
+
+    # ── shift-selection ──────────────────────────────────────
+    def _ensure_sel(self) -> None:
+        if self.sel_anchor is None:
+            self.sel_anchor = self.cursor
+
+    def sel_left(self) -> None:
+        self._ensure_sel()
+        if self.cursor > 0: self.cursor -= 1
+
+    def sel_right(self) -> None:
+        self._ensure_sel()
+        if self.cursor < len(self.text): self.cursor += 1
+
+    def sel_up(self, ew: int, affinity: str = "forward") -> None:
+        self._ensure_sel()
+        col = self._col()
+        if self._at_wrap_boundary(ew, affinity):
+            if col > ew:
+                self.cursor -= ew
+            elif self._row() > 0:
+                s, _ = self._line_range()
+                pe = s - 1
+                ps = self.text.rfind("\n", 0, pe)
+                ps = ps + 1 if ps >= 0 else 0
+                self.cursor = ps + min(ew, pe - ps)
+        elif col >= ew:
+            self.cursor -= ew
+        elif self._row() > 0:
+            s, _ = self._line_range()
+            pe = s - 1
+            ps = self.text.rfind("\n", 0, pe)
+            ps = ps + 1 if ps >= 0 else 0
+            self.cursor = ps + min(col, pe - ps)
+
+    def sel_down(self, ew: int, affinity: str = "forward") -> None:
+        self._ensure_sel()
+        col = self._col()
+        s, e = self._line_range()
+        ll = e - s
+        if self._at_wrap_boundary(ew, affinity):
+            next_start = col
+            if next_start < ll:
+                next_len = min(ew, ll - next_start)
+                self.cursor = s + next_start + next_len
+            elif self._row() < self._nlines() - 1:
+                ns = e + 1
+                ne = self.text.find("\n", ns)
+                ne = ne if ne >= 0 else len(self.text)
+                self.cursor = ns + min(ew, ne - ns)
+        elif col + ew <= ll:
+            self.cursor += ew
+        elif self._row() < self._nlines() - 1:
+            ns = e + 1
+            ne = self.text.find("\n", ns)
+            ne = ne if ne >= 0 else len(self.text)
+            self.cursor = ns + min(col, ne - ns)
+
+    def sel_home(self, ew: int, affinity: str = "forward") -> None:
+        self._ensure_sel()
+        col = self._col()
+        if self._at_wrap_boundary(ew, affinity):
+            self.cursor -= ew
+        else:
+            self.cursor -= col % ew
+
+    def sel_end(self, ew: int) -> None:
+        self._ensure_sel()
+        col = self._col()
+        _, e = self._line_range()
+        s, _ = self._line_range()
+        ll = e - s
+        re = min((col // ew + 1) * ew, ll)
+        self.cursor += re - col
+
+    def sel_word_left(self) -> None:
+        self._ensure_sel()
+        p = self.cursor
+        while p > 0 and not self.text[p - 1].isalnum(): p -= 1
+        while p > 0 and self.text[p - 1].isalnum(): p -= 1
+        self.cursor = p
+
+    def sel_word_right(self) -> None:
+        self._ensure_sel()
+        p, n = self.cursor, len(self.text)
+        while p < n and not self.text[p].isalnum(): p += 1
+        while p < n and self.text[p].isalnum(): p += 1
+        self.cursor = p
+
+    # ── history ──────────────────────────────────────────────
+    def history_prev(self) -> None:
+        if not self._hist:
+            return
+        if self._hist_pos < 0:
+            self._saved = self.text
+            self._hist_pos = len(self._hist) - 1
+        elif self._hist_pos > 0:
+            self._hist_pos -= 1
+        else:
+            return
+        self.text = self._hist[self._hist_pos]
+        self.cursor = len(self.text)
+        self.sel_anchor = None
+
+    def history_next(self) -> None:
+        if self._hist_pos < 0:
+            return
+        if self._hist_pos < len(self._hist) - 1:
+            self._hist_pos += 1
+            self.text = self._hist[self._hist_pos]
+        else:
+            self._hist_pos = -1
+            self.text = self._saved
+        self.cursor = len(self.text)
+        self.sel_anchor = None
+
+    # ── submit / reset ───────────────────────────────────────
+    def submit(self) -> str:
+        t = self.text
+        self.save_to_history(t)
+        self.text = ""
+        self.cursor = 0
+        self.sel_anchor = None
+        self._hist_pos = -1
+        self._saved = ""
+        self._undo.clear()
+        return t
+
+    def reset(self) -> None:
+        self._snap()
+        self.text = ""
+        self.cursor = 0
+        self.sel_anchor = None
+        self._hist_pos = -1
+        self._saved = ""
+
+
+# ── Input widget ───────────────────────────────────────────────
+
+class _InputWidget:
+    """Terminal input prompt: key reading, editing, and rendering.
+
+    Replaces the prompt_toolkit Application.  Provides ``erase()``
+    and ``redraw()`` for ``_ScrollProxy`` coordination.
+    """
+
+    def __init__(
+        self,
+        *,
+        history_path: Path,
+        completions: list[str],
+        toolbar: _ToolbarRenderer | None,
+        on_accept: Callable[[str], None],
+        on_interrupt: Callable[[], None],
+        on_exit: Callable[[], None],
+    ) -> None:
+        self.buf = _EditBuffer(history_path)
+        self._completions = sorted(completions)
+        self._toolbar = toolbar
+        self._on_accept = on_accept
+        self._on_interrupt = on_interrupt
+        self._on_exit = on_exit
+        self._reader = _PlatformKeyReader()
+        self._running = False
+        self._drawn_height: int = 0
+        self._cursor_display_row: int = 0
+        self._comp_state: list[str] | None = None
+        self._comp_idx: int = 0
+        self._cursor_affinity: str = "forward"  # "backward" for End (prefers end of visual row)
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    # ── async entry point ────────────────────────────────────
+    async def run_async(self) -> None:
+        loop = asyncio.get_event_loop()
+        self._running = True
+        try:
+            self.redraw()
+            while self._running:
+                kp = await loop.run_in_executor(
+                    None, lambda: self._reader.read_key_sync(timeout_ms=500)
+                )
+                if kp is not None:
+                    self._dispatch(kp)
+                self.redraw()
+        finally:
+            self._running = False
+            self._reader.close()
+
+    def exit(self) -> None:
+        self._running = False
+
+    # ── display geometry ─────────────────────────────────────
+    def _effective_w(self) -> int:
+        cols = shutil.get_terminal_size().columns
+        if sys.platform == "win32":
+            cols -= 1  # avoid autowrap at right margin
+        return max(1, cols - _INPUT_PREFIX_W)
+
+    def _compute_display(self) -> list[tuple[int, str]]:
+        """Return ``[(text_offset, display_text), ...]``."""
+        ew = self._effective_w()
+        result: list[tuple[int, str]] = []
+        logicals = self.buf.text.split("\n")
+        pos = 0
+        for li, logical in enumerate(logicals):
+            if not logical:
+                result.append((pos, ""))
+            else:
+                rem, p = logical, pos
+                while len(rem) > ew:
+                    result.append((p, rem[:ew]))
+                    rem = rem[ew:]
+                    p += ew
+                result.append((p, rem))
+            pos += len(logical)
+            if li < len(logicals) - 1:
+                pos += 1  # \n
+        return result or [(0, "")]
+
+    def _cursor_display_pos(self) -> tuple[int, int]:
+        display = self._compute_display()
+        for i, (off, txt) in enumerate(display):
+            end = off + len(txt)
+            if off <= self.buf.cursor <= end:
+                # At a visual-wrap boundary, prefer the next visual row
+                # unless affinity is "backward" (set by End).  \n boundaries
+                # are NOT ambiguous — the next row's offset will be end+1
+                # (past the \n), so the condition below won't match.
+                if (self.buf.cursor == end
+                        and i + 1 < len(display)
+                        and display[i + 1][0] == end
+                        and self._cursor_affinity != "backward"):
+                    continue
+                return i, self.buf.cursor - off
+        return len(display) - 1, len(display[-1][1])
+
+    # ── erase / redraw ───────────────────────────────────────
+    def erase(self) -> None:
+        """Clear the input area.  Cursor ends at top of former input."""
+        if self._drawn_height <= 0:
+            return
+        w = sys.__stdout__
+        parts: list[str] = []
+        if self._cursor_display_row > 0:
+            parts.append(f"\x1b[{self._cursor_display_row}A")
+        parts.append("\r")
+        for i in range(self._drawn_height):
+            parts.append("\x1b[2K")
+            if i < self._drawn_height - 1:
+                parts.append("\x1b[1B")
+        if self._drawn_height > 1:
+            parts.append(f"\x1b[{self._drawn_height - 1}A")
+        parts.append("\r")
+        w.write("".join(parts))
+        self._drawn_height = 0
+        self._cursor_display_row = 0
+
+    def redraw(self) -> None:
+        """Redraw input area + toolbar."""
+        w = sys.__stdout__
+        parts: list[str] = []
+        # Move to top of current input
+        if self._drawn_height > 0:
+            if self._cursor_display_row > 0:
+                parts.append(f"\x1b[{self._cursor_display_row}A")
+            parts.append("\r")
+
+        display = self._compute_display()
+        n_lines = len(display)
+        sel_lo = sel_hi = -1
+        if self.buf.sel_anchor is not None:
+            sel_lo, sel_hi = sorted((self.buf.cursor, self.buf.sel_anchor))
+
+        for i, (offset, dline) in enumerate(display):
+            pfx = "\x1b[96m> \x1b[0m" if i == 0 else "  "
+            parts.append(pfx)
+            if sel_lo >= 0:
+                ls, le = offset, offset + len(dline)
+                s = max(sel_lo, ls) - ls
+                e = min(sel_hi, le) - ls
+                if 0 <= s < e:
+                    parts.append(dline[:s])
+                    parts.append(f"\x1b[7m{dline[s:e]}\x1b[27m")
+                    parts.append(dline[e:])
+                else:
+                    parts.append(dline)
+            else:
+                parts.append(dline)
+            parts.append("\x1b[K")
+            if i < n_lines - 1:
+                parts.append("\r\n")
+
+        # Clear leftover rows from a taller previous render
+        for _ in range(n_lines, self._drawn_height):
+            parts.append("\r\n\x1b[2K")
+
+        total = max(n_lines, self._drawn_height)
+        self._drawn_height = n_lines
+        crow, ccol = self._cursor_display_pos()
+        self._cursor_display_row = crow
+        up = total - 1 - crow
+        if up > 0:
+            parts.append(f"\x1b[{up}A")
+        parts.append(f"\x1b[{ccol + _INPUT_PREFIX_W + 1}G")
+        w.write("".join(parts))
+
+        # Toolbar (save/restore cursor keeps our position)
+        if self._toolbar and self._toolbar._active:
+            tb_html = _render_toolbar(self._toolbar._state)
+            tb_lines = tb_html.split("\n")
+            new_h = len(tb_lines) if tb_lines != [""] else 0
+            old_h = self._toolbar._height
+            if new_h != old_h:
+                self._adjust_toolbar(w, old_h, new_h)
+            if new_h > 0:
+                rows = shutil.get_terminal_size().lines
+                base_sgr = self._toolbar._sgr_map.get("bottom-toolbar", "")
+                w.write("\x1b7")
+                for i, lh in enumerate(tb_lines):
+                    row = rows - new_h + 1 + i
+                    base = self._toolbar._line_base_sgr(lh)
+                    eff = base or base_sgr
+                    w.write(f"\x1b[{row};1H{eff}\x1b[K")
+                    w.write(self._toolbar._html_to_ansi(lh, eff))
+                w.write("\x1b[0m\x1b8")
+        w.flush()
+
+    def _adjust_toolbar(self, w: Any, old_h: int, new_h: int) -> None:
+        """Resize the DECSTBM scroll region and compensate the cursor.
+
+        Avoids ``_set_scroll_region`` to prevent nested ``\\x1b7``/``\\x1b8``
+        (DECSC/DECRC use a single slot — nesting clobbers the outer save).
+        Instead, the DECSTBM command is issued directly inside one
+        save/restore pair, and the cursor is shifted to match the content
+        that moved.
+        """
+        rows = shutil.get_terminal_size().lines
+        tb = self._toolbar
+        assert tb is not None
+        if tb._active and new_h > old_h:
+            delta = new_h - old_h
+            new_bottom = max(1, rows - new_h)
+            w.write("\x1b7")                              # save cursor
+            w.write(f"\x1b[{rows - old_h};1H")            # old bottom margin
+            w.write("\n" * delta)                          # scroll content up
+            w.write(f"\x1b[1;{new_bottom}r")              # new scroll region
+            w.write("\x1b8")                               # restore cursor
+            w.write(f"\x1b[{delta}A")                      # content moved up
+            tb._height = new_h
+        elif tb._active and new_h < old_h:
+            delta = old_h - new_h
+            new_bottom = max(1, rows - new_h)
+            w.write("\x1b7")                               # save cursor
+            w.write(f"\x1b[1;{new_bottom}r")               # bigger scroll region
+            w.write("\x1b8")                               # restore cursor
+            w.write(f"\x1b[{delta}T")                      # scroll content down
+            w.write(f"\x1b[{delta}B")                      # content moved down
+            tb._height = new_h
+        elif not tb._active and new_h > 0:
+            new_bottom = max(1, rows - new_h)
+            w.write("\x1b7")                               # save cursor
+            w.write(f"\x1b[{new_bottom};1H")               # future bottom margin
+            w.write("\n" * new_h)                           # scroll up to make room
+            w.write(f"\x1b[1;{new_bottom}r")               # set scroll region
+            w.write("\x1b8")                               # restore cursor
+            w.write(f"\x1b[{new_h}A")                      # content moved up
+            tb._height = new_h
+            tb._active = True
+
+    # ── key dispatch ─────────────────────────────────────────
+    def _maybe_keep_backward(self, ew: int, prev_aff: str) -> None:
+        """After Up/Down, maintain backward affinity if we landed at a wrap boundary."""
+        if prev_aff != "backward":
+            return
+        col = self.buf._col()
+        if col > 0 and col % ew == 0:
+            _, e = self.buf._line_range()
+            s, _ = self.buf._line_range()
+            if col < e - s:          # not at end of logical line
+                self._cursor_affinity = "backward"
+
+    def _dispatch(self, kp: _KeyPress) -> None:
+        k = kp.key
+        ew = self._effective_w()
+        prev_aff = self._cursor_affinity
+        self._cursor_affinity = "forward"  # End overrides to "backward"
+        if k != "tab" and self._comp_state is not None:
+            self._comp_state = None
+        if k == "char":
+            if self.buf.sel_anchor is not None:
+                self.buf.delete_selection()
+            self.buf.insert(kp.data)
+        elif k == "enter":
+            self.buf.sel_anchor = None
+            self._on_accept(self.buf.submit())
+        elif k in ("shift+enter", "ctrl+enter", "ctrl+j"):
+            self.buf.insert("\n")
+        elif k == "escape":
+            self.buf.reset()
+        elif k == "ctrl+c":
+            if self.buf.sel_anchor is not None:
+                sel = self.buf.selected_text()
+                if sel:
+                    _copy_to_clipboard(sel)
+                self.buf.sel_anchor = None
+            elif self.buf.text:
+                self.buf.reset()
+            else:
+                self._on_interrupt()
+        elif k == "ctrl+d":
+            self._on_exit()
+        elif k == "ctrl+z":
+            self.buf.undo()
+        elif k == "backspace":
+            self.buf.delete_before()
+        elif k == "delete":
+            self.buf.delete_after()
+        elif k == "left":
+            if self.buf.sel_anchor is not None:
+                lo = min(self.buf.cursor, self.buf.sel_anchor)
+                self.buf.sel_anchor = None
+                self.buf.cursor = lo
+            elif self.buf.cursor > 0:
+                self.buf.cursor -= 1
+        elif k == "right":
+            if self.buf.sel_anchor is not None:
+                hi = max(self.buf.cursor, self.buf.sel_anchor)
+                self.buf.sel_anchor = None
+                self.buf.cursor = hi
+            elif self.buf.cursor < len(self.buf.text):
+                self.buf.cursor += 1
+        elif k == "up":
+            self.buf.move_up(ew, prev_aff)
+            self._maybe_keep_backward(ew, prev_aff)
+        elif k == "down":
+            self.buf.move_down(ew, prev_aff)
+            self._maybe_keep_backward(ew, prev_aff)
+        elif k == "home":     self.buf.move_home(ew, prev_aff)
+        elif k == "end":
+            self.buf.move_end(ew); self._cursor_affinity = "backward"
+        elif k == "ctrl+up":    self.buf.history_prev()
+        elif k == "ctrl+down":  self.buf.history_next()
+        elif k == "ctrl+left":  self.buf.move_word_left()
+        elif k == "ctrl+right": self.buf.move_word_right()
+        elif k == "shift+left":  self.buf.sel_left()
+        elif k == "shift+right": self.buf.sel_right()
+        elif k == "shift+up":
+            self.buf.sel_up(ew, prev_aff)
+            self._maybe_keep_backward(ew, prev_aff)
+        elif k == "shift+down":
+            self.buf.sel_down(ew, prev_aff)
+            self._maybe_keep_backward(ew, prev_aff)
+        elif k == "shift+home":  self.buf.sel_home(ew, prev_aff)
+        elif k == "shift+end":
+            self.buf.sel_end(ew); self._cursor_affinity = "backward"
+        elif k == "ctrl+shift+left":  self.buf.sel_word_left()
+        elif k == "ctrl+shift+right": self.buf.sel_word_right()
+        elif k == "tab":
+            self._tab_complete()
+
+    def _tab_complete(self) -> None:
+        if self._comp_state is not None:
+            self._comp_idx = (self._comp_idx + 1) % len(self._comp_state)
+            self.buf.text = self._comp_state[self._comp_idx]
+            self.buf.cursor = len(self.buf.text)
+            return
+        word = self.buf.text.lstrip()
+        if not word:
+            return
+        matches = [c for c in self._completions if c.lower().startswith(word.lower())]
+        if not matches:
+            return
+        if len(matches) == 1:
+            self.buf.text = matches[0] + " "
+            self.buf.cursor = len(self.buf.text)
+            return
+        prefix = os.path.commonprefix(matches)
+        self._comp_state = [prefix] + matches
+        self._comp_idx = 0
+        self.buf.text = prefix
+        self.buf.cursor = len(self.buf.text)
 
 
 EFFORT_LEVELS = ("low", "medium", "high", "max")
@@ -1230,10 +1958,10 @@ _STYLE_RULES: dict[str, str] = {
     "prompt": "fg:ansibrightcyan bold",
     "bottom-toolbar": "bg:#cccccc fg:#333333 noreverse",
     "bottom-toolbar.busy": "bg:#884400 fg:#ffffff bold noreverse",
-    # Note: `<panel-hint>` inside the toolbar adds this class; the
-    # plain "panel-hint" selector matches regardless of parent class,
-    # which is what prompt_toolkit's HTML processor expects.
-    "panel-hint": "bg:#333333 fg:#999999",
+    # `<panel-hint>` wraps command-help text in panel headers.
+    # No style override — inherits the row's base colours; only the
+    # nested <b> tags add boldness for the actual command names.
+    "panel-hint": "",
     # Panel rows (task/bg detail lines) use this darker background
     # to visually separate them from the status line above.
     "panel-row": "bg:#333333 fg:#cccccc",
@@ -1259,7 +1987,7 @@ _STYLE_RULES: dict[str, str] = {
     "sys": "fg:ansimagenta",
     "err": "ansired bold",
 }
-STYLE = Style.from_dict(_STYLE_RULES)
+# _STYLE_RULES is consumed by _ToolbarRenderer._build_sgr_map().
 
 
 @dataclass
@@ -2375,7 +3103,7 @@ _ASSISTANT_API_ERROR_RE = re.compile(
 
 def _visible_len(s: str) -> int:
     """Length of `s` after stripping both ANSI color escapes and
-    prompt_toolkit HTML markup (`<b>`, `<ansibrightcyan>`, ...). Toolbar
+    HTML markup (`<b>`, `<ansibrightcyan>`, ...). Toolbar
     sections use HTML; inline scrollback uses ANSI. Both produce zero
     visible columns and need to be excluded from width calculations."""
     return len(_HTML_TAG_RE.sub("", _ANSI_RE.sub("", s)))
@@ -4263,7 +4991,7 @@ def _panel_todos(state: "State") -> str:
 
 
 def _tb_escape(s: str) -> str:
-    """Escape text for prompt_toolkit HTML — only `<`, `>`, `&` need handling."""
+    """Escape text for toolbar HTML — only `<`, `>`, `&` need handling."""
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
@@ -4313,26 +5041,25 @@ def _describe_current_sub(info: dict[str, Any]) -> str:
 
 _LIVE_TASKS_CAP = 20  # max top-level tasks shown in the panel before overflow
 
-_PANEL_HEADER_BAND_WIDTH = 50  # dashes-around-title band, before centering
-
 
 def _panel_header(title: str, hint: str = "") -> str:
-    """A fixed-width band of dashes around the title (about 50 chars
-    total), padded with leading spaces to sit centered in the terminal.
-    Width-tunable via `_PANEL_HEADER_BAND_WIDTH`.
+    """Centered row of ``--- title  hint ---`` dashes.
 
-    *hint* (optional): short markup string (e.g. ``"(<b>/bg</b>: list)"``)
-    appended after the dash-band, wrapped in ``<panel-hint>`` so it gets
-    the darker hint background but lives on the **same row** as the header.
+    The *title* and optional *hint* sit together in the middle of a
+    dash band that spans the terminal width (minus 2 chars of toolbar
+    padding).  The hint is wrapped in ``<panel-hint>``; command names
+    inside use ``<b>`` for bold.
     """
-    band = f" {title} ".center(_PANEL_HEADER_BAND_WIDTH, "-")
-    # Toolbar wraps each row in 2 chars of padding; offset that.
-    avail = max(_PANEL_HEADER_BAND_WIDTH, _term_width(default=100) - 2)
-    pad = (avail - _PANEL_HEADER_BAND_WIDTH) // 2
-    hdr = " " * pad + band
     if hint:
-        hdr += f"  <panel-hint>{hint}</panel-hint>"
-    return hdr
+        inner = f" {title}  <panel-hint>{hint}</panel-hint> "
+    else:
+        inner = f" {title} "
+    inner_vis = _visible_len(inner)
+    avail = max(inner_vis + 4, _term_width(default=100) - 2)
+    dash_total = avail - inner_vis
+    left = dash_total // 2
+    right = dash_total - left
+    return "-" * left + inner + "-" * right
 
 
 def _panel_live_tasks(state: "State") -> list[str]:
@@ -4859,8 +5586,7 @@ class Orchestrator:
         self.stop_event = asyncio.Event()
         self.client: ClaudeSDKClient | None = None
         self.dispatcher_task: asyncio.Task[None] | None = None
-        self._prompt_app: _PtkApp | None = None
-        self._prompt_buffer: _PtkBuffer | None = None
+        self._input_widget: _InputWidget | None = None
         self._toolbar_renderer: _ToolbarRenderer | None = None
         self._input_queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._mcp_servers: dict[str, Any] | None = self._load_mcp_config()
@@ -4880,9 +5606,6 @@ class Orchestrator:
         # _drain_between_turns() to catch an orphaned event_queue duplicate
         # of the same text. Reset to None after the drain.
         self._last_sent_prompt: str | None = None
-        # Deferred "> echo" text from input_loop, to be batched with
-        # "you:" in run_turn's _ScrollProxy flush (avoids blank-line gap).
-        self._deferred_input_echo: str | None = None
 
     def _load_mcp_config(self) -> dict[str, Any] | None:
         """Load MCP server config from --mcp-config path, or auto-detect .mcp.json in cwd."""
@@ -5033,487 +5756,32 @@ class Orchestrator:
         self._claude_col = 0
         self._claude_pending_indent = False
 
-    def _keybindings(self) -> KeyBindings:
-        kb = KeyBindings()
+    def _build_input(self, history_path: Path) -> None:
+        """Create the custom ``_InputWidget`` and ``_ScrollProxy``.
 
-        @kb.add("c-c")
-        def _(event):  # type: ignore[no-untyped-def]
-            buf = event.app.current_buffer
-            # Text selected via Shift+Arrow → copy to system clipboard.
-            if buf.selection_state is not None:
-                start = min(buf.cursor_position,
-                            buf.selection_state.original_cursor_position)
-                end = max(buf.cursor_position,
-                          buf.selection_state.original_cursor_position)
-                selected = buf.text[start:end]
-                if selected:
-                    _copy_to_clipboard(selected)
-                buf.selection_state = None
-                return
-            if self.state.busy:
-                self.interrupt_event.set()
-            elif buf.text:
-                buf.reset()
-            else:
-                # Ctrl+C never exits the orchestrator — only /exit does.
-                # Still set the interrupt flag in case something is
-                # running outside a foreground turn (e.g. the
-                # `_interrupt_watcher` if one is armed, or a
-                # reconnect-in-progress that eventually checks it).
-                self.interrupt_event.set()
-
-        @kb.add("c-d")
-        def _(event):  # type: ignore[no-untyped-def]
-            self.interrupt_event.set()
-            self.stop_event.set()
-            # Signal EOF to input_loop and stop the persistent Application.
-            self._input_queue.put_nowait(None)
-            event.app.exit()
-
-        # Ctrl+Z: undo last edit in the input buffer.
-        @kb.add("c-z")
-        def _(event):  # type: ignore[no-untyped-def]
-            event.current_buffer.undo()
-
-        # Backspace / Delete: selection-aware.  When a Shift-selection
-        # is active, delete the selection (same as Cut) instead of
-        # removing a single character.  Without a selection, fall
-        # through to prompt_toolkit's default behaviour.
-        @kb.add("c-h")  # Backspace
-        def _(event):  # type: ignore[no-untyped-def]
-            buf = event.app.current_buffer
-            if buf.selection_state is not None:
-                buf.cut_selection()
-            else:
-                buf.delete_before_cursor(count=event.arg)
-
-        @kb.add("delete")
-        def _(event):  # type: ignore[no-untyped-def]
-            buf = event.app.current_buffer
-            if buf.selection_state is not None:
-                buf.cut_selection()
-            else:
-                buf.delete(count=event.arg)
-
-        # Multi-line input: Enter submits, Ctrl-J inserts a newline.
-        # Shift-Enter and Ctrl-Enter also insert newlines — handled by
-        # _patch_enter_modifiers() which remaps modified Enter to Ctrl-J
-        # at the input layer (prompt_toolkit has no ShiftEnter key).
-        @kb.add("enter")
-        def _(event):  # type: ignore[no-untyped-def]
-            event.current_buffer.selection_state = None
-            event.current_buffer.validate_and_handle()
-
-        @kb.add("c-j")  # Ctrl-J (linefeed) – always works
-        def _(event):  # type: ignore[no-untyped-def]
-            event.current_buffer.insert_text("\n")
-
-        # Escape clears the whole input buffer.  Always eager so it fires
-        # instantly without waiting for prompt_toolkit's key-sequence
-        # timeout (~500ms).  This sacrifices Alt+Enter (Esc then Enter)
-        # as a newline shortcut, but Ctrl+J / Shift+Enter are available
-        # and more reliable across terminals anyway.
-        @kb.add("escape", eager=True)
-        def _(event):  # type: ignore[no-untyped-def]
-            event.current_buffer.reset()
-
-        # Up / Down: visual-wrap navigation for wrapped input.
-        #
-        # prompt_toolkit's default `auto_up` / `auto_down` only know
-        # about LOGICAL rows (separated by `\n`). For our prompt,
-        # users typically have one long logical line that wraps onto
-        # multiple terminal rows — those visual wraps are NOT rows in
-        # the document, so the default binding falls through to
-        # history-backward, which isn't what we want.
-        #
-        # We emulate "visual row" navigation by jumping the cursor
-        # by one VISUAL-row's worth of characters. The get_line_prefix
-        # callback indents every visual row by `_PROMPT_WIDTH` cols so
-        # the effective text width is `term_w - _PROMPT_WIDTH`. Jumping
-        # by that delta preserves the visual column on the new row.
-        # When we can't step within the current logical line, fall
-        # through to `cursor_up` / `cursor_down` for real multi-line
-        # navigation.
-        _PROMPT_WIDTH = 2  # `"> "` / `"  "` at the left edge of every visual row
-
-        @kb.add("up", eager=True)
-        def _(event):  # type: ignore[no-untyped-def]
-            buf = event.app.current_buffer
-            buf.selection_state = None
-            if buf.complete_state:
-                buf.complete_previous(count=event.arg)
-                return
-            doc = buf.document
-            # prompt_toolkit wraps at the width its Output.get_size()
-            # reports.  On Windows, Win32Output subtracts 1 from the
-            # buffer width to prevent right-margin autowrap, so this
-            # can differ from shutil.get_terminal_size().columns.
-            # We MUST use the same source to match the wrap points.
-            effective_w = max(1, event.app.output.get_size().columns - _PROMPT_WIDTH)
-            col_in_line = doc.cursor_position_col
-            if col_in_line >= effective_w:
-                # Step up one visual row within current logical line.
-                buf.cursor_position -= effective_w
-            elif doc.cursor_position_row > 0:
-                # Already at visual row 0 of this logical line —
-                # step to previous logical line.
-                buf.cursor_up(count=event.arg)
-            # Else: first visual row of first logical line — swallow
-            # (deliberately skip history-backward).
-
-        @kb.add("down", eager=True)
-        def _(event):  # type: ignore[no-untyped-def]
-            buf = event.app.current_buffer
-            buf.selection_state = None
-            if buf.complete_state:
-                buf.complete_next(count=event.arg)
-                return
-            doc = buf.document
-            effective_w = max(1, event.app.output.get_size().columns - _PROMPT_WIDTH)
-            col_in_line = doc.cursor_position_col
-            line_len = len(doc.current_line)
-            if col_in_line + effective_w <= line_len:
-                buf.cursor_position += effective_w
-            elif doc.cursor_position_row < doc.line_count - 1:
-                buf.cursor_down(count=event.arg)
-            # Else: last visual row of last logical line — swallow.
-
-        # Left / Right: cross line boundaries so the cursor wraps from
-        # column 0 to end-of-previous-line and from end-of-line to
-        # start-of-next-line, rather than stopping at the edge.
-        @kb.add("left")
-        def _(event):  # type: ignore[no-untyped-def]
-            buf = event.app.current_buffer
-            if buf.selection_state is not None:
-                start = min(buf.cursor_position,
-                            buf.selection_state.original_cursor_position)
-                buf.selection_state = None
-                buf.cursor_position = start
-                return
-            if buf.cursor_position > 0:
-                buf.cursor_position -= 1
-
-        @kb.add("right")
-        def _(event):  # type: ignore[no-untyped-def]
-            buf = event.app.current_buffer
-            if buf.selection_state is not None:
-                end = max(buf.cursor_position,
-                          buf.selection_state.original_cursor_position)
-                buf.selection_state = None
-                buf.cursor_position = end
-                return
-            if buf.cursor_position < len(buf.text):
-                buf.cursor_position += 1
-
-        # Home / End: visual-row-aware, consistent with our Up/Down.
-        # In a long single-line input that wraps visually, Home goes to
-        # the start of the current *visual* row and End to the end of
-        # it — not the very first / very last character of the whole
-        # logical line. Uses the same effective_w calculation as Up/Down.
-        @kb.add("home", eager=True)
-        def _(event):  # type: ignore[no-untyped-def]
-            buf = event.app.current_buffer
-            buf.selection_state = None
-            doc = buf.document
-            col = doc.cursor_position_col
-            effective_w = max(1, event.app.output.get_size().columns - _PROMPT_WIDTH)
-            visual_row_start = (col // effective_w) * effective_w
-            buf.cursor_position -= (col - visual_row_start)
-
-        @kb.add("end", eager=True)
-        def _(event):  # type: ignore[no-untyped-def]
-            buf = event.app.current_buffer
-            buf.selection_state = None
-            doc = buf.document
-            col = doc.cursor_position_col
-            line_len = len(doc.current_line)
-            effective_w = max(1, event.app.output.get_size().columns - _PROMPT_WIDTH)
-            # Last character of the current visual row, or line_len on
-            # the final (partial) row.  Using ``- 1`` so the cursor
-            # lands AT the last visible column rather than wrapping to
-            # the first column of the next visual row.
-            visual_row_end = min(
-                (col // effective_w + 1) * effective_w - 1,
-                line_len,
-            )
-            buf.cursor_position += (visual_row_end - col)
-
-        # ── Shift-selection bindings ──────────────────────────────
-        # Shift+movement starts/extends a selection; releasing Shift
-        # (any plain movement) clears it.  HighlightSelectionProcessor
-        # in BufferControl provides the visual highlighting.
-
-        def _ensure_selection(buf):  # type: ignore[no-untyped-def]
-            """Start a character selection if one isn't active."""
-            if buf.selection_state is None:
-                buf.start_selection()
-
-        @kb.add("s-left")
-        def _(event):  # type: ignore[no-untyped-def]
-            buf = event.app.current_buffer
-            _ensure_selection(buf)
-            if buf.cursor_position > 0:
-                buf.cursor_position -= 1
-
-        @kb.add("s-right")
-        def _(event):  # type: ignore[no-untyped-def]
-            buf = event.app.current_buffer
-            _ensure_selection(buf)
-            if buf.cursor_position < len(buf.text):
-                buf.cursor_position += 1
-
-        @kb.add("s-up", eager=True)
-        def _(event):  # type: ignore[no-untyped-def]
-            buf = event.app.current_buffer
-            _ensure_selection(buf)
-            doc = buf.document
-            effective_w = max(1, event.app.output.get_size().columns - _PROMPT_WIDTH)
-            col_in_line = doc.cursor_position_col
-            if col_in_line >= effective_w:
-                buf.cursor_position -= effective_w
-            elif doc.cursor_position_row > 0:
-                buf.cursor_up(count=event.arg)
-
-        @kb.add("s-down", eager=True)
-        def _(event):  # type: ignore[no-untyped-def]
-            buf = event.app.current_buffer
-            _ensure_selection(buf)
-            doc = buf.document
-            effective_w = max(1, event.app.output.get_size().columns - _PROMPT_WIDTH)
-            col_in_line = doc.cursor_position_col
-            line_len = len(doc.current_line)
-            if col_in_line + effective_w <= line_len:
-                buf.cursor_position += effective_w
-            elif doc.cursor_position_row < doc.line_count - 1:
-                buf.cursor_down(count=event.arg)
-
-        @kb.add("s-home", eager=True)
-        def _(event):  # type: ignore[no-untyped-def]
-            buf = event.app.current_buffer
-            _ensure_selection(buf)
-            doc = buf.document
-            col = doc.cursor_position_col
-            effective_w = max(1, event.app.output.get_size().columns - _PROMPT_WIDTH)
-            visual_row_start = (col // effective_w) * effective_w
-            buf.cursor_position -= (col - visual_row_start)
-
-        @kb.add("s-end", eager=True)
-        def _(event):  # type: ignore[no-untyped-def]
-            buf = event.app.current_buffer
-            _ensure_selection(buf)
-            doc = buf.document
-            col = doc.cursor_position_col
-            line_len = len(doc.current_line)
-            effective_w = max(1, event.app.output.get_size().columns - _PROMPT_WIDTH)
-            visual_row_end = min(
-                (col // effective_w + 1) * effective_w - 1,
-                line_len,
-            )
-            buf.cursor_position += (visual_row_end - col)
-
-        # Ctrl+Shift+Left/Right: word-level selection.
-        @kb.add("c-s-left")
-        def _(event):  # type: ignore[no-untyped-def]
-            buf = event.app.current_buffer
-            _ensure_selection(buf)
-            pos = buf.document.find_previous_word_beginning(count=event.arg)
-            if pos:
-                buf.cursor_position += pos
-
-        @kb.add("c-s-right")
-        def _(event):  # type: ignore[no-untyped-def]
-            buf = event.app.current_buffer
-            _ensure_selection(buf)
-            pos = buf.document.find_next_word_ending(count=event.arg)
-            if pos:
-                buf.cursor_position += pos
-
-        # ── Selection-aware character insertion ───────────────────
-        # Typing a character while a Shift-selection is active should
-        # delete the selected text and insert the character in its
-        # place — standard text-editor behaviour.  prompt_toolkit's
-        # default Keys.Any handler just inserts without clearing the
-        # selection, which leaves a stale SelectionState that can
-        # cause rendering edge-cases (including apparent input hangs
-        # on Windows).
-        from prompt_toolkit.keys import Keys as _Keys
-
-        @kb.add(_Keys.Any)
-        def _(event):  # type: ignore[no-untyped-def]
-            buf = event.app.current_buffer
-            if buf.selection_state is not None:
-                buf.cut_selection()
-            buf.insert_text(event.data)
-
-        return kb
-
-    def _build_prompt_app(self, history_path: Path) -> None:
-        """Build the persistent Application, Buffer, and Layout.
-
-        Unlike PromptSession (which creates a new Application per
-        prompt_async call), our Application stays alive for the entire
-        session.  prompt_toolkit handles input editing, history, and
-        completions.  The toolbar is rendered **outside** the layout
-        via ``_ToolbarRenderer`` (DECSTBM scroll-region approach).
-
-        Benefits:
-        * No ghost rows — the toolbar is painted via ANSI escapes in
-          fixed rows below the DECSTBM scroll region.  prompt_toolkit
-          cannot "reserve" space there, so shrinking the toolbar is
-          instant and clean.
-        * No toolbar flicker or disappearance on ``/rename`` — the
-          Application never exits between inputs, so ``render_as_done``
-          never fires.
-        * No blank line before ``you:`` lines — the ``> echo`` print
-          is deferred for messages going straight to run_turn (not busy)
-          and batched into the same ``_ScrollProxy`` flush as ``you:``,
-          so no async gap allows the renderer to inject a ghost row.
+        Replaces prompt_toolkit entirely.  The widget handles keystroke
+        reading, editing, completion, and rendering of the input area
+        plus the toolbar.  ``_ScrollProxy`` coordinates scroll output
+        via ``erase → write → redraw``.
         """
-        completer = WordCompleter(SLASH_COMMANDS, ignore_case=True, sentence=False)
-
-        self._prompt_buffer = _PtkBuffer(
-            name="input",
-            history=FileHistory(str(history_path)),
-            completer=completer,
-            complete_while_typing=False,
-            multiline=True,
-            accept_handler=lambda buf: self._input_queue.put_nowait(buf.text),
-        )
-
-        def _get_line_prefix(
-            line_no: int, wrap_count: int
-        ) -> list[tuple[str, str]]:
-            """Prefix for each line: ``> `` on the first line, ``  ``
-            on continuation lines and wraps.  Replaces PromptSession's
-            ``message=`` parameter."""
-            if line_no == 0 and wrap_count == 0:
-                return [("class:prompt", "> ")]
-            return [("", "  ")]
-
-        input_window = _PtkWindow(
-            content=_PtkBufferControl(buffer=self._prompt_buffer),
-            dont_extend_height=True,
-            wrap_lines=True,
-            get_line_prefix=_get_line_prefix,
-        )
-
-        # Toolbar is rendered outside prompt_toolkit via _ToolbarRenderer
-        # (DECSTBM scroll region), so the layout contains only the input.
-        layout = _PtkLayout(
-            _PtkFloatContainer(
-                content=_PtkHSplit([input_window]),
-                floats=[
-                    _PtkFloat(
-                        xcursor=True,
-                        ycursor=True,
-                        content=_PtkCompletionsMenu(
-                            max_height=16, scroll_offset=1
-                        ),
-                    ),
-                ],
-            ),
-            focused_element=self._prompt_buffer,
-        )
-
-        self._prompt_app = _PtkApp(
-            layout=layout,
-            key_bindings=self._keybindings(),
-            style=STYLE,
-            full_screen=False,
-            refresh_interval=0.5,  # keep toolbar's live fields fresh
-        )
-        self._prompt_app._handle_exception = _async_exception_handler
-        _patch_enter_modifiers(self._prompt_app)
-
-        # ── DECSTBM toolbar rendering ──────────────────────────────
-        #
-        # The toolbar lives in fixed rows at the bottom of the terminal,
-        # outside prompt_toolkit's scroll region.  DECSTBM confines all
-        # scrolling (\n at the bottom margin, _output_screen_diff's
-        # \r\n "reserve space" dance) to the region above the toolbar.
-        # Ghost rows are impossible: the toolbar area is never part of
-        # prompt_toolkit's rendered UI, so there is no reservable space
-        # that the terminal fails to reclaim when the toolbar shrinks.
-        #
-        # The _redraw wrapper suppresses the final output.flush() inside
-        # render(), appends the toolbar paint to the same output buffer,
-        # and flushes once — so render + toolbar reach the terminal in
-        # a single write.  No frame ever shows a missing toolbar.
         self._toolbar_renderer = _ToolbarRenderer(self.state)
         self._toolbar_renderer.setup()
 
-        _orig_redraw = self._prompt_app._redraw
-        _app_ref = self._prompt_app
-        _tb = self._toolbar_renderer
+        self._input_widget = _InputWidget(
+            history_path=history_path,
+            completions=SLASH_COMMANDS,
+            toolbar=self._toolbar_renderer,
+            on_accept=lambda text: self._input_queue.put_nowait(text),
+            on_interrupt=lambda: self.interrupt_event.set(),
+            on_exit=lambda: (
+                self.interrupt_event.set(),
+                self.stop_event.set(),
+                self._input_queue.put_nowait(None),
+            ),
+        )
 
-        def _toolbar_redraw() -> None:
-            renderer = _app_ref.renderer
-            # Capture the previous render height BEFORE pre_render_adjust
-            # may clear _last_screen.  Needed for ghost-row cleanup below.
-            _prev_h = (
-                renderer._last_screen.height if renderer._last_screen else 0
-            )
-            # Prevent the height ratchet — keep the input window minimal.
-            renderer._min_available_height = 0
-            output = renderer.output
-            _real_flush = output.flush
-            output.flush = lambda: None  # suppress flush
-            try:
-                # Adjust scroll region BEFORE the render so
-                # prompt_toolkit positions its content above the toolbar.
-                tb_html = _tb.pre_render_adjust(output, renderer)
-                # Did pre_render_adjust clear _last_screen?  If so, the
-                # renderer won't know about the old content height and
-                # can't erase stale rows on its own.
-                _screen_was_reset = renderer._last_screen is None
-                _orig_redraw()
-            finally:
-                output.flush = _real_flush
-
-            # ── Ghost-row cleanup ──────────────────────────────
-            # When pre_render_adjust resets _last_screen (toolbar height
-            # changed), it also resets _cursor_pos to Point(0,0) with
-            # the physical cursor at the scroll-region bottom.  The
-            # renderer's erase_down() fires from that bottom position
-            # and therefore can't reach the old content rows above it.
-            # If the new render is shorter than the old one (e.g. Escape
-            # cleared a multi-line input), those stale rows become
-            # visible ghost text.
-            #
-            # Fix: explicitly blank the ghost rows.  They sit between
-            # the (shifted) old-content top and the new-content top,
-            # both adjusted for the scroll-ups that \r\n caused during
-            # the render.
-            _new_h = (
-                renderer._last_screen.height if renderer._last_screen else 0
-            )
-            if _screen_was_reset and _new_h < _prev_h:
-                _rows = shutil.get_terminal_size().lines
-                _nb = _rows - _tb._height  # new scroll-region bottom
-                _ghost_top = _nb - _prev_h - _new_h + 2
-                _ghost_end = _nb - _new_h
-                if _ghost_top < 1:
-                    _ghost_top = 1
-                if _ghost_end >= _ghost_top:
-                    output.write_raw("\x1b7")  # DECSC — save cursor
-                    for _r in range(_ghost_top, _ghost_end + 1):
-                        output.write_raw(f"\x1b[{_r};1H\x1b[2K")
-                    output.write_raw("\x1b8")  # DECRC — restore cursor
-
-            try:
-                _tb.paint_html(output, tb_html)
-            except Exception:  # noqa: BLE001
-                pass  # toolbar paint errors must not crash the app
-            output.flush()  # single flush: region-adjust + render + toolbar
-
-        self._prompt_app._redraw = _toolbar_redraw
-
-        # Install _ScrollProxy on sys.stdout AFTER the Application is
-        # created.  The Application already captured real stdout for its
-        # own rendering; the proxy only intercepts print() calls and
-        # coordinates erase → write → redraw through the renderer.
         _proxy = _ScrollProxy()
-        _proxy._app = self._prompt_app
+        _proxy._widget = self._input_widget
         sys.stdout = _proxy
 
     def print_help(self) -> None:
@@ -7786,18 +8054,6 @@ class Orchestrator:
         self._claude_col = 5
         self._claude_word_buf = ""
         self._claude_pending_indent = False
-        # Batch the deferred "> echo" from input_loop into the same
-        # _ScrollProxy flush as the "you:" line — avoids the ghost
-        # blank line that appears when two independent flushes are
-        # separated by an await and the renderer's timer fires between.
-        _deferred = self._deferred_input_echo
-        self._deferred_input_echo = None
-        if _deferred:
-            _proxy = sys.stdout
-            if isinstance(_proxy, _ScrollProxy):
-                _proxy.write_deferred(_deferred + "\n")
-            else:
-                print(_deferred)
         sys.stdout.write(f"{_C_CYAN}you:{_C_RESET} ")
         self._write_indented(prompt_text, 5, flush=True)
         self._flush_claude_text()
@@ -8237,12 +8493,12 @@ class Orchestrator:
         return True
 
     async def input_loop(self) -> None:
-        assert self._prompt_app is not None
-        # Run the persistent Application in a background task.  It stays
+        assert self._input_widget is not None
+        # Run the custom input widget in a background task.  It stays
         # alive for the entire session: prompt and toolbar remain visible,
-        # keystrokes flow through keybindings → accept_handler → queue.
-        app_task: asyncio.Task[None] = asyncio.create_task(
-            self._prompt_app.run_async(), name="prompt-app"
+        # keystrokes flow through _InputWidget → on_accept → queue.
+        widget_task: asyncio.Task[None] = asyncio.create_task(
+            self._input_widget.run_async(), name="input-widget"
         )
         try:
             while not self.stop_event.is_set():
@@ -8254,16 +8510,9 @@ class Orchestrator:
                     break  # EOF (Ctrl+D)
                 if self.stop_event.is_set():
                     break
-                # Echo submitted text into scrollback.  For messages
-                # that go straight to run_turn (not busy), the echo is
-                # deferred — run_turn will batch it with "you:" into
-                # one _ScrollProxy flush so the renderer's timer can't
-                # inject a ghost blank line between them.
-                #
-                # For queued messages (busy) the gap is intentional and
-                # long, so "> echo" gives immediate feedback.
-                # For non-message input (slash commands, etc.) there is
-                # no "you:" counterpart, so we always echo.
+                # Echo submitted text into scrollback.  No ghost-row
+                # risk since the custom input widget has no background
+                # renderer timer.  For /btw, ask_btw prints its own echo.
                 if line.strip():
                     _echo_parts = line.split("\n")
                     _echo = _echo_parts[0]
@@ -8347,16 +8596,10 @@ class Orchestrator:
                 if kind == "empty":
                     continue
 
-                # Decide whether to print the "> echo" line now.
-                # For messages going straight to run_turn (not busy),
-                # defer the echo — run_turn will batch it with "you:"
-                # into one _ScrollProxy flush so no ghost blank line
-                # can appear between them.
-                # For /btw, ask_btw() prints its own "btw:" echo, so
-                # the input_loop's "> /btw ..." echo is redundant.
-                if kind == "message" and not self.state.busy and _echo_line:
-                    self._deferred_input_echo = _echo_line
-                elif kind != "btw" and _echo_line:
+                # Print the "> echo" line.  No ghost-row risk: the custom
+                # input widget has no background renderer timer.
+                # For /btw, ask_btw() prints its own echo, so skip.
+                if _echo_line and kind != "btw":
                     print(_echo_line)
 
                 if kind == "interrupt":
@@ -8468,16 +8711,15 @@ class Orchestrator:
             # also armed one, we end up with two running, whichever
             # fires first kills the process.
             _arm_shutdown_watchdog(25.0)
-            # Reset DECSTBM scroll region before the Application exits
-            # so the terminal returns to normal full-screen scrolling.
+            # Reset DECSTBM scroll region so the terminal returns to
+            # normal full-screen scrolling.
             if self._toolbar_renderer is not None:
                 self._toolbar_renderer.reset()
-            # Shut down the persistent Application so the terminal is
-            # restored to its normal state.
-            if self._prompt_app is not None and self._prompt_app.is_running:
-                self._prompt_app.exit()
+            # Shut down the input widget so the terminal mode is restored.
+            if self._input_widget is not None and self._input_widget.is_running:
+                self._input_widget.exit()
             try:
-                await app_task
+                await widget_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
 
@@ -9073,7 +9315,7 @@ class Orchestrator:
                 history_jsonl = find_most_recent_session_for_cwd(self.args.cwd)
 
         history_path = Path(self.args.cwd) / ".orchestrator_history"
-        self._build_prompt_app(history_path)
+        self._build_input(history_path)
 
         tool_summary = (
             "all Claude Code tools (Read, Write, Edit, Glob, Grep, Bash "
@@ -9667,9 +9909,8 @@ def _async_exception_handler(
 ) -> None:
     """Log full traceback to orchestrator.log; print a one-line notice.
 
-    Replaces both the default asyncio handler and prompt_toolkit's
-    `Application._handle_exception` (which would otherwise dump the full
-    traceback into the scrollback and block on "Press ENTER to continue...").
+    Replaces the default asyncio handler so uncaught exceptions go to
+    orchestrator.log instead of dumping full tracebacks into scrollback.
     """
     import traceback as _tb
     exc = context.get("exception")
@@ -9714,14 +9955,14 @@ async def _amain() -> None:
     # Route uncaught asyncio exceptions to orchestrator.log with a brief
     # on-screen notice instead of the default multi-line traceback dump.
     # (Application-level override happens in Orchestrator.run() after the
-    # prompt Application is created -- see _build_prompt_app.)
+    # input widget is created -- see _build_input.)
     asyncio.get_running_loop().set_exception_handler(_async_exception_handler)
     orch = Orchestrator(args)
     try:
         await orch.run()
     finally:
-        # _build_prompt_app installs _ScrollProxy on sys.stdout after
-        # the Application captures real stdout for its own rendering.
+        # _build_input installs _ScrollProxy on sys.stdout; restore
+        # the real stdout on shutdown.
         if sys.stdout is not sys.__stdout__:
             sys.stdout = sys.__stdout__
 
