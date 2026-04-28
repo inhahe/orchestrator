@@ -1485,6 +1485,7 @@ class _InputWidget:
             parts.append("\r\n\x1b[2K")
 
         total = max(n_lines, self._drawn_height)
+        old_drawn = self._drawn_height
         self._drawn_height = n_lines
         crow, ccol = self._cursor_display_pos()
         self._cursor_display_row = crow
@@ -1493,6 +1494,19 @@ class _InputWidget:
             parts.append(f"\x1b[{up}A")
         parts.append(f"\x1b[{ccol + _INPUT_PREFIX_W + 1}G")
         w.write("".join(parts))
+
+        # If input shrunk, shift content down so the prompt stays
+        # pinned to the bottom of the scroll region.  RI (Reverse
+        # Index) at the top margin is universally supported.
+        if n_lines < old_drawn and self._toolbar and self._toolbar._active:
+            delta = old_drawn - n_lines
+            rows = shutil.get_terminal_size().lines
+            bottom = max(1, rows - self._toolbar._height)
+            w.write("\x1b7")                               # save cursor
+            w.write(f"\x1b[1;{bottom}r")                   # DECSTBM → cursor to (1,1)
+            w.write("\x1bM" * delta)                       # RI × delta: scroll down
+            w.write("\x1b8")                               # restore cursor
+            w.write(f"\x1b[{delta}B")                      # cursor follows content
 
         # Toolbar (save/restore cursor keeps our position)
         if self._toolbar and self._toolbar._active:
