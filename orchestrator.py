@@ -447,6 +447,14 @@ class _ScrollProxy:
             self.flush()
         return len(data)
 
+    def write_deferred(self, data: str) -> None:
+        """Append *data* to the buffer without triggering an automatic
+        flush.  Used to batch text that should ship in the *next*
+        flush together with whatever follows it — e.g. the ``> echo``
+        line and the ``you:`` line go out in one atomic
+        erase→write→redraw cycle."""
+        self._buf.append(data)
+
     def flush(self) -> None:
         if not self._buf:
             return
@@ -1199,6 +1207,8 @@ SLASH_COMMANDS = [
     "/tools",
     "/tasks",
     "/bg",
+    "/bg dismiss",
+    "/bg dismiss all",
     "/background",
     "/show",
     "/btw",
@@ -1298,7 +1308,7 @@ class State:
     # When the orchestrator is parked because something needs you:
     #   "waiting"  -> Claude emitted [WAITING] (red WAITING in toolbar)
     #   "burst"    -> burst-limit brake fired, Claude was spinning
-    #                 (magenta STALLED in toolbar)
+    #                 (magenta "stalled" in toolbar)
     #   None       -> nothing demanding attention (idle/dim gray)
     # Cleared at run_turn start.
     needs_user_attention: str | None = None
@@ -1333,6 +1343,9 @@ class State:
     # Monotonic counter for bg task seq numbers. Never resets — matches the
     # way tool seqs work, so /bg N stays stable across turns.
     next_bg_seq: int = 1
+    # Mirror of --debug for module-level rendering helpers that don't
+    # have access to argparse state.
+    debug: bool = False
     # Sliding-window timestamps of recent api_retry events. Used by the
     # API-stall detector to flip `needs_user_attention` to "api-error"
     # when failures get dense.
@@ -1365,7 +1378,7 @@ class State:
     # The model actually in use per the CLI, extracted from AssistantMessage
     # metadata. Distinct from `model` (the user-pinned override). Fills in
     # after the first assistant reply; until then the window-sizing / label
-    # logic falls back to `(auto)` + a 200k safe default.
+    # logic falls back to `auto` + a 200k safe default.
     active_model: str | None = None
     # Mirror of --inline-all-tools so the rendering helpers (panel + inline)
     # don't have to reach into argparse state.
@@ -1635,6 +1648,10 @@ def classify(line: str) -> tuple[str, str]:
     if cmd in ("tasks", "task"):
         return "tasks", ""
     if cmd in ("bg", "background", "bgtasks"):
+        parts = arg.strip().split()
+        if parts and parts[0] in ("dismiss", "remove", "drop", "clear"):
+            # /bg dismiss [N|all] — remove stale bg task entries.
+            return "bg-dismiss", " ".join(parts[1:])
         if arg.strip():
             # Detail mode moved to the unified /show b<N> command.
             # Redirect the user so they don't hit a silent failure.
@@ -1926,14 +1943,24 @@ def _emit_bg_completion(
     task_id = task_id_full[:8] if task_id_full else "?"
     turn_entry = state.current_turn_bg.get(task_id_full)
     bg_entry = state.background_tasks.get(task_id_full)
+    if state.debug:
+        print(
+            f"{_C_DIM}[debug] _emit_bg_completion: id={task_id} "
+            f"status={status} turn_entry={'yes' if turn_entry else 'no'} "
+            f"bg_entry={'yes' if bg_entry else 'no'}{_C_RESET}"
+        )
     # Dedupe: if turn_entry already has ended_at set, a prior handler (the
     # other of task_notification/task_updated for the same task) already
     # rendered this completion. Skip the duplicate.
     if turn_entry is not None and turn_entry.get("ended_at") is not None:
+        if state.debug:
+            print(f"{_C_DIM}[debug]   -> skipped (dedup: already ended){_C_RESET}")
         return False
     # No tracker entry at all means the task started before we did or came
     # through a channel we didn't record — still skip; no seq to show.
     if turn_entry is None and bg_entry is None:
+        if state.debug:
+            print(f"{_C_DIM}[debug]   -> skipped (no tracker entry){_C_RESET}")
         return False
     seq = None
     name = None
@@ -2245,7 +2272,13 @@ def render_system_message(msg: SystemMessage, state: "State") -> None:
         return
 
     if sub == "task_progress":
-        return  # high-frequency; suppress unless debugging
+        # High-frequency; suppress visual output. But update the bg-task
+        # entry's last-activity timestamp so we can detect truly stale tasks
+        # (ones whose CLI stopped sending progress long ago).
+        task_id_full = d.get("task_id") or ""
+        if task_id_full and task_id_full in state.background_tasks:
+            state.background_tasks[task_id_full]["last_progress_at"] = time.monotonic()
+        return
 
     if sub == "hook_started":
         name = d.get("hook_name", "?")
@@ -4033,7 +4066,7 @@ def _panel_session(state: "State") -> str:
         and state.rate_limit_resets_at > int(time.time())
     )
     if _rate_limited:
-        busy = "<status-error>RATE-LIMIT</status-error>"
+        busy = "<status-error>rate-limit</status-error>"
     elif state.connecting:
         # Shown during the SDK's `client.connect()` call. Distinct from
         # "idle" so the user doesn't type expecting it to send -- input
@@ -4042,22 +4075,22 @@ def _panel_session(state: "State") -> str:
         # being made or it's truly wedged.
         if state.connect_started_at is not None:
             elapsed_s = time.monotonic() - state.connect_started_at
-            label = f"CONNECTING ({int(elapsed_s)}s)"
+            label = f"connecting ({int(elapsed_s)}s)"
         else:
-            label = "CONNECTING"
+            label = "connecting"
         busy = f"<status-waiting>{label}</status-waiting>"
     elif state.busy:
         if state.turn_started_at is not None:
             elapsed = _fmt_duration(time.monotonic() - state.turn_started_at)
-            busy = f"<status-working>WORKING ({elapsed})</status-working>"
+            busy = f"<status-working>working ({elapsed})</status-working>"
         else:
-            busy = "<status-working>WORKING</status-working>"
+            busy = "<status-working>working</status-working>"
     elif state.background_tasks:
-        # bg-wait takes precedence over WAITING/done/burst — the
+        # bg-wait takes precedence over waiting/done/burst — the
         # orchestrator's actual behavior while bg tasks are running is
         # to wait for them first, regardless of what sentinel Claude
         # emitted. The needs_user_attention flag is still set, so once
-        # bg tasks drain the toolbar switches to WAITING/done/burst.
+        # bg tasks drain the toolbar switches to waiting/done/burst.
         # Show elapsed time of the oldest (longest-running) bg task.
         oldest = min(
             (t.get("started_at", time.monotonic()) for t in state.background_tasks.values()),
@@ -4075,16 +4108,16 @@ def _panel_session(state: "State") -> str:
                 f"({len(state.background_tasks)})</bg-wait-label>"
             )
     elif state.needs_user_attention == "waiting":
-        busy = "<status-waiting>WAITING</status-waiting>"
+        busy = "<status-waiting>waiting</status-waiting>"
     elif state.needs_user_attention == "done":
         busy = "<status-done>done</status-done>"
     elif state.needs_user_attention == "burst":
-        busy = "<status-stalled>STALLED</status-stalled>"
+        busy = "<status-stalled>stalled</status-stalled>"
     elif state.needs_user_attention == "api-error":
-        label = "API-STALL"
+        label = "api-stall"
         if state.api_status_description:
             desc = _tb_escape(state.api_status_description)[:40]
-            label = f"API-STALL ({desc})"
+            label = f"api-stall ({desc})"
         busy = f"<status-error>{label}</status-error>"
     else:
         busy = "idle"
@@ -4111,7 +4144,7 @@ def _panel_session(state: "State") -> str:
         )
         if is_hit:
             resets = state.rate_limit_resets_at or 0
-            # Normal foreground — informational; the red RATE-LIMIT in the
+            # Normal foreground — informational; the red rate-limit in the
             # state field already flags the critical status.
             rate_field = f"rate-limit reset: {_fmt_reset_time(resets)}"
         elif state.rate_limit_utils:
@@ -4137,7 +4170,7 @@ def _panel_session(state: "State") -> str:
     else:
         plan_field = f"cost: ${state.total_cost_usd:.4f}"
     # Model: prefer user-pinned (--model) over the CLI-reported active model
-    # (discovered from AssistantMessage.model). Shows "(auto)" only when we
+    # (discovered from AssistantMessage.model). Shows "auto" only when we
     # haven't seen an AssistantMessage yet.
     effective_model = state.model or state.active_model or ""
     short_model = (
@@ -4145,7 +4178,7 @@ def _panel_session(state: "State") -> str:
         if effective_model.startswith("claude-")
         else effective_model
     )
-    model_part = short_model if short_model else "(auto)"
+    model_part = short_model if short_model else "auto"
     effort_part = state.effort if state.effort else "auto"
     # API-level thinking toggle — shows "off" only when the user
     # explicitly disabled thinking via --no-thinking or /thinking off.
@@ -4283,15 +4316,23 @@ _LIVE_TASKS_CAP = 20  # max top-level tasks shown in the panel before overflow
 _PANEL_HEADER_BAND_WIDTH = 50  # dashes-around-title band, before centering
 
 
-def _panel_header(title: str) -> str:
+def _panel_header(title: str, hint: str = "") -> str:
     """A fixed-width band of dashes around the title (about 50 chars
     total), padded with leading spaces to sit centered in the terminal.
-    Width-tunable via `_PANEL_HEADER_BAND_WIDTH`."""
+    Width-tunable via `_PANEL_HEADER_BAND_WIDTH`.
+
+    *hint* (optional): short markup string (e.g. ``"(<b>/bg</b>: list)"``)
+    appended after the dash-band, wrapped in ``<panel-hint>`` so it gets
+    the darker hint background but lives on the **same row** as the header.
+    """
     band = f" {title} ".center(_PANEL_HEADER_BAND_WIDTH, "-")
     # Toolbar wraps each row in 2 chars of padding; offset that.
     avail = max(_PANEL_HEADER_BAND_WIDTH, _term_width(default=100) - 2)
     pad = (avail - _PANEL_HEADER_BAND_WIDTH) // 2
-    return " " * pad + band
+    hdr = " " * pad + band
+    if hint:
+        hdr += f"  <panel-hint>{hint}</panel-hint>"
+    return hdr
 
 
 def _panel_live_tasks(state: "State") -> list[str]:
@@ -4315,11 +4356,11 @@ def _panel_live_tasks(state: "State") -> list[str]:
     rendered_count = 0
     overflow = 0
     header_lines = [
-        _panel_header("tasks"),
-        "<panel-hint>"
-        "(<b>/tasks</b>: list, <b>/show N</b>: detail, "
-        "<b>/show N -tail K</b>: last K lines of output)"
-        "</panel-hint>",
+        _panel_header(
+            "tasks",
+            "(<b>/tasks</b>: list, <b>/show N</b>: detail, "
+            "<b>/show N -tail K</b>: last K lines of output)",
+        ),
     ]
     for tid, info in state.active_tools.items():
         if info.get("parent_id"):
@@ -4593,10 +4634,10 @@ def _panel_live_bg(state: "State") -> list[str]:
     # user could type it the task is already gone from the panel.
     if out:
         out[0:0] = [
-            _panel_header("background tasks"),
-            "<panel-hint>"
-            "(<b>/bg</b>: list, <b>/bg N</b>: detail)"
-            "</panel-hint>",
+            _panel_header(
+                "background tasks",
+                "(<b>/bg</b>: list, <b>/show bN</b>: detail)",
+            ),
         ]
     return out
 
@@ -4630,11 +4671,11 @@ def _panel_queued_prompts(state: "State") -> list[str]:
             f"{'s' if overflow != 1 else ''} (/queue for all)"
         )
     out[0:0] = [
-        _panel_header("queued prompts"),
-        "<panel-hint>"
-        "(<b>/queue</b>: list, <b>/queue N</b>: view full, "
-        "<b>/queue drop N</b>: remove, <b>/queue clear</b>: clear all)"
-        "</panel-hint>",
+        _panel_header(
+            "queued prompts",
+            "(<b>/queue</b>: list, <b>/queue N</b>: view full, "
+            "<b>/queue drop N</b>: remove, <b>/queue clear</b>: clear all)",
+        ),
     ]
     return out
 
@@ -4687,8 +4728,7 @@ def _panel_live_todos(state: "State") -> list[str]:
             f"(/todos for all)"
         )
     out[0:0] = [
-        _panel_header("todos"),
-        "<panel-hint>(<b>/todos</b>: full plan in scrollback)</panel-hint>",
+        _panel_header("todos", "(<b>/todos</b>: full plan in scrollback)"),
     ]
     return out
 
@@ -4733,12 +4773,9 @@ def _render_toolbar(state: "State") -> str:
     if cur:
         lines.append(" " + sep.join(cur) + " ")
     # Task rows and headers inherit the toolbar's light background.
-    # Hint rows (fully wrapped in <panel-hint>) get the darker background
-    # across the whole row including the padding spaces.
+    # Hints are now inline within header rows (via <panel-hint> tags),
+    # so no standalone hint-row detection is needed.
     def _wrap_panel_row(row: str) -> str:
-        if row.startswith("<panel-hint>") and row.endswith("</panel-hint>"):
-            inner = row[len("<panel-hint>"):-len("</panel-hint>")]
-            return f"<panel-hint> {inner} </panel-hint>"
         return " " + row + " "
     if state.show_tasks_panel:
         for row in _panel_live_tasks(state):
@@ -4813,6 +4850,7 @@ class Orchestrator:
             panel_delay=float(getattr(args, "panel_delay", 0.0)),
             panel_grace=float(getattr(args, "panel_grace", 10.0)),
             bell_events=_parse_bell_events(getattr(args, "bell_on", "")),
+            debug=bool(getattr(args, "debug", False)),
         )
         self.event_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self.turn_msg_queue: asyncio.Queue[Any] = asyncio.Queue()
@@ -4838,6 +4876,13 @@ class Orchestrator:
         # Periodic task that rings the `rate-reset` bell + wakes the
         # worker when a subscription rate-limit's resets_at passes.
         self._rate_watcher_task: asyncio.Task[None] | None = None
+        # The prompt that was just sent to the SDK via run_turn(). Used by
+        # _drain_between_turns() to catch an orphaned event_queue duplicate
+        # of the same text. Reset to None after the drain.
+        self._last_sent_prompt: str | None = None
+        # Deferred "> echo" text from input_loop, to be batched with
+        # "you:" in run_turn's _ScrollProxy flush (avoids blank-line gap).
+        self._deferred_input_echo: str | None = None
 
     def _load_mcp_config(self) -> dict[str, Any] | None:
         """Load MCP server config from --mcp-config path, or auto-detect .mcp.json in cwd."""
@@ -5319,8 +5364,10 @@ class Orchestrator:
         * No toolbar flicker or disappearance on ``/rename`` — the
           Application never exits between inputs, so ``render_as_done``
           never fires.
-        * No blank line before ``you:`` lines — ``render_as_done`` was
-          the source of the inconsistent extra newline.
+        * No blank line before ``you:`` lines — the ``> echo`` print
+          is deferred for messages going straight to run_turn (not busy)
+          and batched into the same ``_ScrollProxy`` flush as ``you:``,
+          so no async gap allows the renderer to inject a ghost row.
         """
         completer = WordCompleter(SLASH_COMMANDS, ignore_case=True, sentence=False)
 
@@ -5489,6 +5536,7 @@ class Orchestrator:
         print("  /tools                          list active tool calls and background tasks")
         print("  /tasks                          list every task this turn (in-flight + completed)")
         print("  /bg  /background                list background shells / Task subagents still running")
+        print("  /bg dismiss [N|all]             remove stale bg tasks that never got a completion")
         print("  /show [tN|bN|kN ...]            unified viewer — tN=tool call, bN=bg task, kN=thinking block")
         print("                                  (bare number = tN; add -tail K for last K output lines)")
         print("  /btw <question>                 ask a side question (doesn't enter main session history)")
@@ -6531,6 +6579,7 @@ class Orchestrator:
                     "task_type": info.get("task_type"),
                     "started_at": info.get("started_at"),
                     "tool_use_id": info.get("tool_use_id"),
+                    "last_progress_at": info.get("last_progress_at"),
                     "ended_at": None,
                     "status": None,
                     "summary": None,
@@ -6547,6 +6596,46 @@ class Orchestrator:
         always empty at this point (kept as a param for dispatch-table
         uniformity). See `show_detail` for the detail renderer."""
         self._print_bg_summary(self._bg_entry_index())
+
+    def dismiss_bg_tasks(self, payload: str = "") -> None:
+        """`/bg dismiss [N|all]` — remove stale bg task entries that
+        never received a completion notification from the SDK. Without
+        args or with ``all``, clears every entry in ``background_tasks``.
+        With a sequence number, removes just that one task."""
+        arg = payload.strip().lower()
+        if not arg or arg == "all":
+            n = len(self.state.background_tasks)
+            if n == 0:
+                print(f"{_C_DIM}no background tasks to dismiss{_C_RESET}")
+                return
+            self.state.background_tasks.clear()
+            print(f"{_C_YELLOW}dismissed {n} background task{'s' if n != 1 else ''}{_C_RESET}")
+            return
+        # Parse as sequence number.
+        try:
+            seq_num = int(arg)
+        except ValueError:
+            print(f"{_C_RED}usage: /bg dismiss [N|all]{_C_RESET}")
+            return
+        # Find the task_id matching this seq.
+        target_tid: str | None = None
+        for tid, info in self.state.background_tasks.items():
+            if info.get("seq") == seq_num:
+                target_tid = tid
+                break
+        if target_tid is None:
+            print(
+                f"{_C_RED}no running bg task with seq #{seq_num} "
+                f"(use /bg to list){_C_RESET}"
+            )
+            return
+        popped = self.state.background_tasks.pop(target_tid)
+        name = (popped.get("name") or "(unnamed)").replace("\n", " ")
+        if len(name) > 60:
+            name = name[:59] + "…"
+        print(
+            f"{_C_YELLOW}dismissed bg task #{seq_num}: {name}{_C_RESET}"
+        )
 
     def _print_bg_summary(self, index: dict[int, tuple[str, dict[str, Any]]]) -> None:
         now = time.monotonic()
@@ -6573,7 +6662,14 @@ class Orchestrator:
             ended = info.get("ended_at")
             if ended is None:
                 elapsed = now - started
-                status = f"{_C_YELLOW}… {_fmt_duration(elapsed)}{_C_RESET}"
+                # Flag tasks with no recent progress as possibly stale.
+                last_prog = info.get("last_progress_at")
+                stale_hint = ""
+                if last_prog is not None and (now - last_prog) > 300:
+                    stale_hint = f" {_C_RED}(no progress {_fmt_duration(now - last_prog)}){_C_RESET}"
+                elif last_prog is None and elapsed > 600:
+                    stale_hint = f" {_C_RED}(no progress ever){_C_RESET}"
+                status = f"{_C_YELLOW}… {_fmt_duration(elapsed)}{_C_RESET}{stale_hint}"
             else:
                 dur = ended - started
                 st = info.get("status") or "completed"
@@ -6591,6 +6687,13 @@ class Orchestrator:
                 f"  [{_C_DIM}#{seq}{_C_RESET}] {status}  "
                 f"{_C_BLUE}{task_type}{_C_RESET}: {short_name}  "
                 f"{_C_MAGENTA}{tid[:8]}{_C_RESET}{carry}"
+            )
+        # Hint when there are stale carryover tasks the user can dismiss.
+        has_carryover = any(info.get("carryover") for _, info in index.values())
+        if has_carryover:
+            print(
+                f"  {_C_DIM}/bg dismiss N to remove a stale task, "
+                f"/bg dismiss all to clear all{_C_RESET}"
             )
         print()
 
@@ -7166,6 +7269,17 @@ class Orchestrator:
             f"model={self.state.model or 'default'}, "
             f"resume={self.state.session_id})"
         )
+        # Purge background-task entries — they were child processes of the
+        # old CLI subprocess and are now dead.  If any are still alive in
+        # the OS (e.g. detached), the new CLI will emit fresh task_started
+        # messages and we'll re-register them.
+        n_stale = len(self.state.background_tasks)
+        if n_stale:
+            self.state.background_tasks.clear()
+            print(
+                f"{_C_DIM}[cleared {n_stale} stale bg task"
+                f"{'s' if n_stale != 1 else ''}]{_C_RESET}"
+            )
         await self._disconnect()
         await self._connect(resume_id=self.state.session_id)
 
@@ -7408,7 +7522,7 @@ class Orchestrator:
         Assistant content arriving here (Claude's auto-response to bg-task
         notifications, etc.) is rendered identically to in-turn content
         — same `claude:` prefix, same 8-col indent, same busy-state
-        tracking — so the toolbar correctly reports "WORKING" while
+        tracking — so the toolbar correctly reports "working" while
         Claude is actively streaming and it doesn't look visually
         different from a user-driven turn."""
         # Debug print — deferred for ResultMessage so it appears AFTER
@@ -7458,7 +7572,8 @@ class Orchestrator:
                     # "claude:" prefix, flip busy=True, record start time
                     # (used for the matching [turn done] line). Subsequent
                     # TextBlocks in the same stream just append text.
-                    if not getattr(self, "_async_in_text", False):
+                    _first_async_chunk = not getattr(self, "_async_in_text", False)
+                    if _first_async_chunk:
                         # Reset streaming state so stale word buffer
                         # from a prior turn doesn't leak into this one.
                         self._claude_word_buf = ""
@@ -7469,7 +7584,10 @@ class Orchestrator:
                         self.state.busy = True
                         self._async_turn_started = time.monotonic()
                         self.state.turn_started_at = self._async_turn_started
-                    self._write_indented(block.text, 8)
+                    chunk = block.text
+                    if _first_async_chunk:
+                        chunk = chunk.lstrip("\n")
+                    self._write_indented(chunk, 8)
                     sys.stdout.flush()
                 elif isinstance(block, ToolUseBlock):
                     if getattr(self, "_async_in_text", False):
@@ -7668,6 +7786,18 @@ class Orchestrator:
         self._claude_col = 5
         self._claude_word_buf = ""
         self._claude_pending_indent = False
+        # Batch the deferred "> echo" from input_loop into the same
+        # _ScrollProxy flush as the "you:" line — avoids the ghost
+        # blank line that appears when two independent flushes are
+        # separated by an await and the renderer's timer fires between.
+        _deferred = self._deferred_input_echo
+        self._deferred_input_echo = None
+        if _deferred:
+            _proxy = sys.stdout
+            if isinstance(_proxy, _ScrollProxy):
+                _proxy.write_deferred(_deferred + "\n")
+            else:
+                print(_deferred)
         sys.stdout.write(f"{_C_CYAN}you:{_C_RESET} ")
         self._write_indented(prompt_text, 5, flush=True)
         self._flush_claude_text()
@@ -7716,7 +7846,13 @@ class Orchestrator:
                                 self._claude_col = 8  # "claude: " width
                             # Continuation lines (real \n + visual wraps)
                             # indent to line up with the first line.
-                            self._write_indented(block.text, 8)
+                            # Strip leading newlines from the very first
+                            # chunk so "claude:" isn't followed by a blank
+                            # line when the model starts with whitespace.
+                            chunk = block.text
+                            if not assistant_parts:
+                                chunk = chunk.lstrip("\n")
+                            self._write_indented(chunk, 8)
                             sys.stdout.flush()
                             assistant_parts.append(block.text)
                         elif isinstance(block, ToolUseBlock):
@@ -7906,12 +8042,14 @@ class Orchestrator:
                                     ):
                                         parent["current_sub_id"] = None
                                 # Backup cleanup: if this is the result of a
-                                # Task tool use, purge any background_tasks
+                                # Task/Agent tool use, purge any background_tasks
                                 # entry bound to it. Covers the case where the
                                 # CLI doesn't emit a matching task_notification
                                 # (observed: bg[N] counter leaking across Task
-                                # calls).
-                                if active and active.get("name") == "Task":
+                                # calls — the CLI purges queued notifications
+                                # for an agent's shell tasks when the agent
+                                # exits).
+                                if active and active.get("name") in ("Task", "Agent"):
                                     leaked = [
                                         tid
                                         for tid, bg in self.state.background_tasks.items()
@@ -8064,6 +8202,7 @@ class Orchestrator:
         "tools":            "show_tools",
         "tasks":            "show_tasks",
         "bg":               "show_bg_tasks",
+        "bg-dismiss":       "dismiss_bg_tasks",
         "show":             "show_detail",
         "autocompact":      "set_autocompact",
         "max-context":      "set_max_context",
@@ -8115,21 +8254,31 @@ class Orchestrator:
                     break  # EOF (Ctrl+D)
                 if self.stop_event.is_set():
                     break
-                # Echo submitted text into scrollback.  Replaces the
-                # "> <text>" that prompt_toolkit's render-as-done used to
-                # leave behind when the Application exited per input.
-                # Goes through _ScrollProxy → appears above the prompt.
+                # Echo submitted text into scrollback.  For messages
+                # that go straight to run_turn (not busy), the echo is
+                # deferred — run_turn will batch it with "you:" into
+                # one _ScrollProxy flush so the renderer's timer can't
+                # inject a ghost blank line between them.
+                #
+                # For queued messages (busy) the gap is intentional and
+                # long, so "> echo" gives immediate feedback.
+                # For non-message input (slash commands, etc.) there is
+                # no "you:" counterpart, so we always echo.
                 if line.strip():
                     _echo_parts = line.split("\n")
                     _echo = _echo_parts[0]
                     for _ep in _echo_parts[1:]:
                         _echo += f"\n  {_ep}"
-                    print(f"{_C_CYAN}>{_C_RESET} {_echo}")
+                    _echo_line = f"{_C_CYAN}>{_C_RESET} {_echo}"
+                else:
+                    _echo_line = ""
                 # Intercept input as a permission response when the SDK's
                 # can_use_tool callback is waiting on us. The line won't
                 # be routed anywhere else — it resolves the Future and
                 # nothing more, regardless of its content.
                 if self._pending_permission is not None and not self._pending_permission.done():
+                    if _echo_line:
+                        print(_echo_line)
                     fut = self._pending_permission
                     low = line.strip().lower()
                     if low in ("y", "yes", "allow"):
@@ -8197,6 +8346,19 @@ class Orchestrator:
                 kind, payload = classify(line)
                 if kind == "empty":
                     continue
+
+                # Decide whether to print the "> echo" line now.
+                # For messages going straight to run_turn (not busy),
+                # defer the echo — run_turn will batch it with "you:"
+                # into one _ScrollProxy flush so no ghost blank line
+                # can appear between them.
+                # For /btw, ask_btw() prints its own "btw:" echo, so
+                # the input_loop's "> /btw ..." echo is redundant.
+                if kind == "message" and not self.state.busy and _echo_line:
+                    self._deferred_input_echo = _echo_line
+                elif kind != "btw" and _echo_line:
+                    print(_echo_line)
+
                 if kind == "interrupt":
                     self.interrupt_event.set()
                     if not self.state.busy:
@@ -8346,8 +8508,17 @@ class Orchestrator:
                 # on event_queue — append it to queued_prompts here
                 # so the worker's popleft() finds it. Dedupe with
                 # `in` so the common busy-case (where it's already
-                # queued) doesn't double-add.
-                if payload not in self.state.queued_prompts:
+                # queued) doesn't double-add. Also skip if this is
+                # the exact prompt we just sent — prevents re-queuing
+                # a stale event that is a duplicate of the just-
+                # completed turn's prompt.
+                if payload == self._last_sent_prompt:
+                    if self.state.debug:
+                        print(
+                            f"{_C_DIM}[debug] _drain: dropped duplicate of "
+                            f"last-sent prompt{_C_RESET}"
+                        )
+                elif payload not in self.state.queued_prompts:
                     self.state.queued_prompts.append(payload)
             elif kind == "compact":
                 print(f"{_C_MAGENTA}[orchestrator: compacting session]{_C_RESET}")
@@ -8566,6 +8737,7 @@ class Orchestrator:
                 _is_auto_turn = next_prompt in (
                     self.state.continue_prompt, "/compact",
                 )
+                self._last_sent_prompt = next_prompt
                 try:
                     text, interrupted = await self.run_turn(next_prompt)
                 except asyncio.CancelledError:
@@ -8601,6 +8773,7 @@ class Orchestrator:
                     continue
 
                 has_compact, reconnect_needed, quit_requested = await self._drain_between_turns()
+                self._last_sent_prompt = None  # one-shot guard; don't persist
                 if quit_requested:
                     self.stop_event.set()
                     break
