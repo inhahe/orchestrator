@@ -55,3 +55,9 @@ python orchestrator.py --resume
 | `run.cmd`          | Windows helper: opens in Windows Terminal.          |
 
 Session transcripts, settings, and custom-titles all live in Claude Code's existing directory — `~/.claude/projects/<sanitized-cwd>/<session-id>.jsonl` — so anything you do in this tool is visible to plain `claude --continue` and vice versa.
+
+
+## License
+
+MIT - see [LICENSE](LICENSE). Free to use, modify and redistribute; provided
+as-is, with no warranty.
