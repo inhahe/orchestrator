@@ -1700,6 +1700,68 @@ WAITING_SENTINEL = "[WAITING]"
 DONE_SENTINEL = "[DONE]"
 _DISPATCHER_DEAD = object()  # sentinel pushed on turn_msg_queue when dispatcher crashes
 
+# ---- graphify skill prompt ------------------------------------------------
+# Injected as a preamble when the user types /graphify <args>.  The message
+# is sent to Claude as a normal user turn so it can invoke the graphify
+# Python API through Bash / tool use.
+_GRAPHIFY_SKILL = """\
+# graphify — Knowledge Graph from Any Corpus
+
+**graphify** (PyPI: `graphifyy`) transforms folders of files (code, docs, \
+papers, images) into interactive knowledge graphs with community detection, \
+audit trails, and multiple output formats.
+
+## Primary Commands
+
+| Command | Purpose |
+|---------|---------|
+| `/graphify <path>` | Full pipeline: extract → build graph → cluster → generate outputs |
+| `/graphify <path> --update` | Incremental re-extraction for new/changed files only |
+| `/graphify <path> --mode deep` | Aggressive extraction mode |
+| `/graphify query "<question>"` | BFS traversal for broad context around a topic |
+| `/graphify query "<question>" --dfs` | DFS traversal to trace specific dependency chains |
+| `/graphify path "A" "B"` | Shortest path between two concepts |
+| `/graphify explain "Node"` | Full neighborhood explanation of a single concept |
+| `/graphify add <url>` | Fetch URL, ingest, and update graph |
+| `/graphify <path> --watch` | Auto-rebuild graph on file changes |
+| `/graphify <path> --wiki` | Build wiki from graph |
+
+## Python API
+
+```python
+from graphify import (
+    extract, collect_files,      # extraction
+    build_from_json,             # graph construction
+    cluster, score_all,          # community detection
+    god_nodes, surprising_connections, suggest_questions,  # analysis
+    generate,                    # reporting
+    to_json, to_html, to_svg, to_canvas, to_wiki,  # export
+)
+
+# Typical pipeline:
+from pathlib import Path
+files = collect_files([Path(".")])
+extraction = extract(files)
+import graphify; G = graphify.build_from_json(extraction)
+G = cluster(G)
+to_html(G, "graph.html")
+to_json(G, "graph.json")
+generate(G, "GRAPH_REPORT.md")
+```
+
+## Output (graphify-out/)
+- `graph.html` — interactive 2D force-directed visualization
+- `graph.json` — persistent graph data; queryable across sessions
+- `GRAPH_REPORT.md` — audit report with god nodes, surprising connections
+- `obsidian/` — Obsidian vault with graph view and canvas layout
+
+## Key Details
+- AST extraction for code is deterministic (no LLM cost, uses tree-sitter)
+- Semantic extraction for docs/papers/images uses Claude subagents in parallel
+- `--update` re-extracts only changed files; code-only changes skip LLM
+- Supports 25+ programming languages
+"""
+
 
 def _bg_waiting_msg(n: int) -> str:
     """Standard status line for when a turn has ended but background
@@ -1962,6 +2024,7 @@ SLASH_COMMANDS = [
     "/panel",
     "/todos",
     "/plan",
+    "/graphify",
     "/quit",
     "/exit",
     "/quit!",
@@ -2438,6 +2501,10 @@ def classify(line: str) -> tuple[str, str]:
         return "status", ""
     if cmd in ("connect", "reconnect"):
         return "connect", ""
+    if cmd == "graphify":
+        if not arg:
+            return "error", "usage: /graphify <path> [--update|--mode deep|query|path|explain|add|--watch|--wiki]"
+        return "message", f"{_GRAPHIFY_SKILL}\n---\nUser request: /graphify {arg}"
     # Unknown slash command — report an error instead of silently
     # forwarding to the SDK.
     return "error", f"unknown command /{cmd} (try /help)"
@@ -5829,6 +5896,7 @@ class Orchestrator:
         print("  /queue [N|drop N|clear]       view/manage prompts queued while Claude is busy")
         print("  /panel [tasks|bg|todos [on|off|toggle]]  show/toggle toolbar panel visibility")
         print("  /todos  /plan                   show Claude's current TodoWrite plan")
+        print("  /graphify <path> [opts]         build a knowledge graph from a folder (graphify skill)")
         print("  /quit  /exit                    graceful exit (waits up to ~10s for CLI flush)")
         print("  /quit! /exit!                   force exit immediately (may lose last message)")
         print("Input: Enter submits.  Shift-Enter / Ctrl-Enter / Ctrl-J inserts a newline.")
